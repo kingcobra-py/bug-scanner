@@ -2,17 +2,19 @@
 Joomla detection module (SAFE).
 
 Does NOT integrate Joomla RCE / webshell upload PoCs.
-Checks for Joomla presence, admin panel, JCE versions, and webshell indicators only.
+Detection + priority secret packs only: AWS, GitHub, Stripe, SendGrid, Brevo.
 """
 
 from __future__ import annotations
 
-from app.modules.base import body_extractions, finding_from_hit, save_evidence
+from app.extractors.priority_secrets import priority_extractions
+from app.modules.base import finding_from_hit, save_evidence
 from app.modules.vulnerability_intel import executable_upload_paths, jce_exposure, xml_version
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
 
 JOOMLA_PATHS = [
+    "/",
     "/administrator/",
     "/administrator/index.php",
     "/configuration.php",
@@ -29,7 +31,56 @@ JOOMLA_PATHS = [
     "/index.php?option=com_jce&task=cpanel.feed",
     "/images/",
     "/api/index.php/v1",
+    "/api/index.php/v1/content/articles",
+    "/api/index.php/v1/users",
 ]
+
+EXTRACT_PATHS = {
+    "/",
+    "/administrator/",
+    "/configuration.php",
+    "/configuration.php.bak",
+    "/configuration.php.old",
+    "/configuration.php~",
+    "/api/index.php/v1",
+    "/api/index.php/v1/content/articles",
+    "/api/index.php/v1/users",
+    "/index.php?option=com_jce&task=cpanel.feed",
+}
+
+
+def _emit_priority_secrets(
+    *,
+    findings: list[Finding],
+    target: TargetContext,
+    ctx: ScanContext,
+    url: str,
+    path: str,
+    body: str,
+    extracted: dict,
+) -> None:
+    secrets = extracted.get("secrets") or []
+    if not secrets:
+        return
+    raw_ref = save_evidence(ctx, f"joomla_priority_secrets_{path.strip('/') or 'home'}", body)
+    kinds = sorted({s.get("kind", "") for s in secrets if s.get("kind")})
+    findings.append(
+        finding_from_hit(
+            module="joomla",
+            ftype="js_secret",
+            severity="critical",
+            target=target,
+            url=url,
+            title="Priority secrets extracted from Joomla response",
+            evidence=", ".join(kinds),
+            confidence=0.9,
+            extracted=extracted,
+            raw_ref=raw_ref,
+            tags=["joomla", "priority-secrets", "aws", "github", "stripe", "sendgrid", "brevo"],
+            validated=True,
+        )
+    )
+    ctx.progress.add_hit(secrets=len(secrets), module="joomla")
 
 
 class JoomlaModule:
@@ -43,6 +94,7 @@ class JoomlaModule:
         http = ctx.http
         is_joomla = "joomla" in (target.tech or [])
         ctx.progress.module_set_total(self.name, len(JOOMLA_PATHS))
+        redact = ctx.config.redact_secrets
 
         for path in JOOMLA_PATHS:
             if ctx.stop_event.is_set():
@@ -54,33 +106,37 @@ class JoomlaModule:
             if resp.error or resp.soft404:
                 continue
             body = resp.text or ""
+            extracted = (
+                priority_extractions(body, source_url=resp.url or url, redact_values=redact)
+                if resp.status_code == 200 and body and path in EXTRACT_PATHS
+                else {"secrets": [], "apis": [], "smtp": [], "endpoints": [], "extractor": "priority_secrets"}
+            )
 
-            if "administrator" in path and resp.status_code in (200, 401, 403) and (
-                "joomla" in body.lower()
-                or "administrator" in (resp.url or "").lower()
-                or resp.status_code in (200, 403)
-            ):
-                if "joomla" in body.lower() or is_joomla or "com_login" in body.lower():
-                    is_joomla = True
-                    findings.append(
-                        finding_from_hit(
-                            module=self.name,
-                            ftype="other",
-                            severity="info",
-                            target=target,
-                            url=resp.url or url,
-                            title="Joomla administrator panel detected",
-                            evidence=body[:200],
-                            confidence=0.85,
-                            tags=["joomla", "fingerprint"],
+            if path in {"/", "/administrator/", "/administrator/index.php"} and resp.status_code in (200, 401, 403):
+                if "joomla" in body.lower() or is_joomla or "com_login" in body.lower() or path == "/":
+                    if "joomla" in body.lower() or "com_login" in body.lower() or "generator" in body.lower():
+                        is_joomla = True
+                    if "administrator" in path and (
+                        "joomla" in body.lower() or is_joomla or "com_login" in body.lower()
+                    ):
+                        findings.append(
+                            finding_from_hit(
+                                module=self.name,
+                                ftype="other",
+                                severity="info",
+                                target=target,
+                                url=resp.url or url,
+                                title="Joomla administrator panel detected",
+                                evidence=body[:200],
+                                confidence=0.85,
+                                tags=["joomla", "fingerprint"],
+                            )
                         )
-                    )
-                    ctx.progress.add_hit(module=self.name)
+                        ctx.progress.add_hit(module=self.name)
 
             if path.startswith("/configuration.php") and resp.status_code == 200 and (
-                "public $" in body or "JConfig" in body or "dbpassword" in body.lower()
+                "public $" in body or "JConfig" in body or "dbpassword" in body.lower() or "$password" in body
             ):
-                extracted = body_extractions(ctx, url, body)
                 raw_ref = save_evidence(ctx, f"joomla_config_{path}", body)
                 findings.append(
                     finding_from_hit(
@@ -94,7 +150,7 @@ class JoomlaModule:
                         confidence=0.95,
                         extracted=extracted,
                         raw_ref=raw_ref,
-                        tags=["joomla", "config"],
+                        tags=["joomla", "config", "priority-secrets"],
                         validated=True,
                     )
                 )
@@ -204,6 +260,34 @@ class JoomlaModule:
                         )
                     )
                     ctx.progress.add_hit(module=self.name)
+
+            if path.startswith("/api/index.php") and resp.status_code in (200, 401, 403) and body:
+                is_joomla = True
+                findings.append(
+                    finding_from_hit(
+                        module=self.name,
+                        ftype="other",
+                        severity="medium",
+                        target=target,
+                        url=resp.url or url,
+                        title="Joomla Web Services API endpoint reachable",
+                        evidence=body[:200],
+                        confidence=0.85,
+                        tags=["joomla", "api", "webservices", "detection-only"],
+                    )
+                )
+                ctx.progress.add_hit(module=self.name)
+
+            if resp.status_code == 200 and path in EXTRACT_PATHS:
+                _emit_priority_secrets(
+                    findings=findings,
+                    target=target,
+                    ctx=ctx,
+                    url=resp.url or url,
+                    path=path,
+                    body=body,
+                    extracted=extracted,
+                )
 
         if is_joomla and not any("Joomla" in f.title for f in findings):
             findings.append(
