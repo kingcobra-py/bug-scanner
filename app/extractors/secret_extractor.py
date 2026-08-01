@@ -44,15 +44,40 @@ def _parse_jsonish(text: str) -> dict[str, Any]:
     return {}
 
 
+# Common manifest/package/meta fields that read as long, high-entropy strings
+# but are public by design (site names, descriptions, PWA/app metadata, shader
+# code assignments picked up by the bare KEY=VALUE line parser).
+_NON_SECRET_KEYS = {
+    "name", "short_name", "description", "orientation", "start_url", "scope",
+    "display", "background_color", "theme_color", "lang", "dir", "id",
+    "categories", "icons", "screenshots", "related_applications",
+    "prefer_related_applications", "gcm_sender_id", "version", "author",
+    "homepage", "license", "keywords", "main", "module", "exports", "browser",
+    "style", "type", "sideeffects", "dependencies", "devdependencies",
+    "peerdependencies", "scripts", "engines", "repository", "title", "alt",
+    "label", "placeholder", "tooltip", "class", "classname", "role",
+}
+
+
+def _looks_like_sentence_or_code(value: str) -> bool:
+    """Reject natural-language text and JS/GLSL statements, not credentials."""
+    words = value.split()
+    if len(words) >= 3:
+        return True
+    return bool(re.search(r"[(){};]|=>|function\s*\(", value))
+
+
 def _interesting_kv(key: str, value: str) -> bool:
-    key_l = key.lower()
+    key_l = key.strip().lower()
+    if key_l in _NON_SECRET_KEYS or _looks_like_sentence_or_code(value):
+        return False
     markers = (
         "key", "token", "secret", "password", "passwd", "auth", "api",
         "smtp", "mail", "aws", "private", "credential", "bearer",
     )
-    if any(m in key_l for m in markers):
-        return looks_like_secret(value, min_len=6) or len(value) >= 8
-    return looks_like_secret(value)
+    # Bare KEY=VALUE / JSON fields only carry a credential when the key name
+    # itself signals one; unconstrained entropy checks flag ordinary strings.
+    return any(m in key_l for m in markers) and (looks_like_secret(value, min_len=6) or len(value) >= 8)
 
 
 def extract_secrets(text: str, source_url: str = "", redact_values: bool = True) -> list[dict[str, Any]]:

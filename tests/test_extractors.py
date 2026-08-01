@@ -63,3 +63,31 @@ def test_placeholder_and_redact():
 def test_false_positive_short_token():
     secrets = extract_secrets('api_key="short"', redact_values=False)
     assert secrets == [] or all(len(str(s.get("value", ""))) >= 8 for s in secrets)
+
+
+def test_manifest_and_js_statements_are_not_flagged_as_secrets():
+    # Verbatim false positives observed in production: PWA manifest fields,
+    # analytics snippets, and bare JS/GLSL statements that happen to be long
+    # and high-entropy but carry no credential.
+    manifest = (
+        '{"name": "Primi - \u041e\u043d\u043b\u0430\u0439\u043d QR-\u043c\u0435\u043d\u044e", '
+        '"short_name": "Sappito Tech", "orientation": "portrait-primary", '
+        '"start_url": "/?utm_source=rg.ru&utm_medium=pwa", '
+        '"description": "Some long enough marketing description text here"}'
+    )
+    js_body = (
+        "backToTop=function() {\n"
+        "body=await request.text();\n"
+        "vWorldDirection=transformDirection( position, modelMatrix );\n"
+    )
+    secrets = extract_secrets(manifest, redact_values=False) + extract_secrets(js_body, redact_values=False)
+    assert secrets == []
+
+
+def test_marker_keys_with_real_credentials_still_flagged():
+    text = "DB_PASSWORD=SuperSecretPassw0rd!\nAPI_KEY=abcdef0123456789ghijklmn\n"
+    secrets = extract_secrets(text, redact_values=False)
+    kinds = {s["kind"] for s in secrets}
+    values = " ".join(str(s.get("value")) for s in secrets)
+    assert "env" in kinds
+    assert "SuperSecretPassw0rd" in values or "abcdef0123456789" in values
