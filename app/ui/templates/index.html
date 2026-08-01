@@ -52,10 +52,15 @@
               <input id="uploadFile" type="file" accept=".txt,.lst,.csv,text/plain" hidden />
               <div class="upload-glyph">⇧</div>
               <b>Drop a text file here</b>
-              <span>or click to choose · maximum 25 MB</span>
+              <span>or click to choose · up to 5 GB · parallel chunk upload</span>
               <em id="chosenFile">No file selected</em>
             </label>
             <button id="uploadBtn" class="btn-primary w-full mt-4">Upload file</button>
+            <div id="uploadProgress" class="upload-progress hidden" aria-live="polite">
+              <div class="upload-progress-head"><span id="uploadProgressLabel">Preparing…</span><b id="uploadProgressPercent">0%</b></div>
+              <div class="progress-track"><div id="uploadProgressBar" class="progress-fill" style="width:0%"></div></div>
+              <div id="uploadProgressBytes" class="upload-progress-bytes">0 B / 0 B</div>
+            </div>
             <div id="uploadMessage" class="text-xs text-slate-400 mt-3 min-h-5"></div>
           </div>
           <div class="panel lg:col-span-7 p-6">

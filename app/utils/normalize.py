@@ -66,13 +66,15 @@ def host_key(url: str) -> str:
 
 
 def origin_variants(url: str) -> list[str]:
-    """Return http and https variants of a host."""
+    """Return both origin schemes, honoring an explicitly supplied scheme first."""
     base = normalize_target(url)
     if not base:
         return []
     parsed = urlparse(base)
     host = parsed.netloc
-    return [f"https://{host}", f"http://{host}"]
+    preferred = parsed.scheme if parsed.scheme in {"http", "https"} else "https"
+    other = "http" if preferred == "https" else "https"
+    return [f"{preferred}://{host}", f"{other}://{host}"]
 
 
 def strip_url_to_host(url: str) -> str:

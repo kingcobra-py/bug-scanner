@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from app.api import server
 from app.api.server import create_app
+from app.core import uploads
 from app.core.providers import provider_for_kind, provider_metadata
 from app.core.wordlists import parse_target_lines, save_uploaded_targets
 
@@ -82,6 +83,65 @@ def test_persistent_upload_library_and_job_reference(tmp_path, monkeypatch):
     deleted = client.delete(f"/api/uploads/{record['id']}")
     assert deleted.status_code == 200
     assert not Path(record["stored_path"]).exists()
+
+
+def test_chunked_upload_progress_resume_and_download(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(uploads, "CHUNK_SIZE", 4)
+    client = TestClient(create_app())
+    content = b"http://one.example\nhttps://two.example\n"
+
+    init = client.post(
+        "/api/uploads/chunks/init",
+        json={"filename": "large targets.txt", "kind": "targets", "total_size": len(content)},
+    )
+    assert init.status_code == 200
+    session = init.json()
+    assert session["chunk_size"] == 4
+    upload_id = session["id"]
+
+    # Upload out of order to exercise parallel/resumable chunks.
+    chunks = [content[i : i + 4] for i in range(0, len(content), 4)]
+    last = len(chunks) - 1
+    for index in [last, *range(last)]:
+        response = client.put(
+            f"/api/uploads/chunks/{upload_id}/{index}",
+            content=chunks[index],
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert response.status_code == 200
+
+    status = client.get(f"/api/uploads/chunks/{upload_id}")
+    assert status.status_code == 200
+    assert status.json()["received_bytes"] == len(content)
+    assert len(status.json()["received_chunks"]) == len(chunks)
+
+    complete = client.post(f"/api/uploads/chunks/{upload_id}/complete")
+    assert complete.status_code == 200
+    record = complete.json()
+    assert record["original_name"] == "large_targets.txt"
+    assert record["size_bytes"] == len(content)
+    assert record["item_count"] == 2
+
+    download = client.get(f"/api/uploads/{upload_id}/download")
+    assert download.status_code == 200
+    assert download.content == content
+    assert "large_targets.txt" in download.headers["content-disposition"]
+
+
+def test_chunk_upload_rejects_over_5gb(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
+    client = TestClient(create_app())
+    response = client.post(
+        "/api/uploads/chunks/init",
+        json={
+            "filename": "too-large.txt",
+            "kind": "targets",
+            "total_size": uploads.MAX_UPLOAD_BYTES + 1,
+        },
+    )
+    assert response.status_code == 400
+    assert "5 GB" in response.json()["detail"]
 
 
 def test_provider_kind_mapping():

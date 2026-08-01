@@ -9,14 +9,25 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.core.engine import ScanEngine
 from app.core.providers import provider_for_kind, provider_metadata
-from app.core.uploads import create_upload, delete_upload_file, read_upload_items
+from app.core.uploads import (
+    DIRECT_UPLOAD_BYTES,
+    complete_chunk_upload,
+    create_upload,
+    delete_upload_file,
+    get_chunk_upload_status,
+    init_chunk_upload,
+    preview_upload_items,
+    read_upload_items,
+    safe_download_path,
+    write_upload_chunk,
+)
 from app.core.vuln_artifacts import classify_finding, detection_method, host_from_finding, is_vuln_worthy, write_vuln_artifacts
 from app.storage.db import ScanStore
 from app.storage.models import ScanConfig
@@ -126,6 +137,12 @@ class ScanCreate(BaseModel):
     redact_secrets: bool = True
     method_test_trace: bool = False
     verbose: bool = False
+
+
+class ChunkUploadInit(BaseModel):
+    filename: str
+    kind: str = "targets"
+    total_size: int
 
 
 def create_app() -> FastAPI:
@@ -306,7 +323,17 @@ def create_app() -> FastAPI:
         return {"deleted": True, "archived": True, "results_preserved": True, "id": scan_id}
 
     async def _save_upload(file: UploadFile, kind: str) -> dict[str, Any]:
-        content = await file.read()
+        if file.size is not None and file.size > DIRECT_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="files over 32 MB must use the chunked upload API",
+            )
+        content = await file.read(DIRECT_UPLOAD_BYTES + 1)
+        if len(content) > DIRECT_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="files over 32 MB must use the chunked upload API",
+            )
         try:
             return create_upload(
                 store,
@@ -325,6 +352,57 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         return await _save_upload(file, kind)
 
+    @app.post("/api/uploads/chunks/init")
+    async def init_upload(body: ChunkUploadInit) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                init_chunk_upload,
+                UPLOAD_DIR,
+                kind=body.kind,
+                filename=body.filename,
+                total_size=body.total_size,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/uploads/chunks/{upload_id}")
+    async def chunk_upload_status(upload_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(get_chunk_upload_status, UPLOAD_DIR, upload_id)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/uploads/chunks/{upload_id}/{chunk_index}")
+    async def upload_chunk(upload_id: str, chunk_index: int, request: Request) -> dict[str, Any]:
+        # Browser chunks are 8 MiB, keeping request memory bounded even for 5GB files.
+        content = await request.body()
+        try:
+            return await asyncio.to_thread(
+                write_upload_chunk,
+                UPLOAD_DIR,
+                upload_id,
+                chunk_index,
+                content,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/uploads/chunks/{upload_id}/complete")
+    async def complete_upload(upload_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                complete_chunk_upload,
+                store,
+                UPLOAD_DIR,
+                upload_id,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/api/uploads")
     async def list_uploads(kind: Optional[str] = None) -> list[dict[str, Any]]:
         if kind and kind not in {"targets", "wordlist"}:
@@ -340,10 +418,25 @@ def create_app() -> FastAPI:
         if not row:
             raise HTTPException(status_code=404, detail="upload not found")
         try:
-            items = read_upload_items(row)
+            items = await asyncio.to_thread(preview_upload_items, row, 50)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=410, detail=str(exc)) from exc
-        return {**row, "preview": items[:50], "exists": True}
+        return {**row, "preview": items, "exists": True}
+
+    @app.get("/api/uploads/{upload_id}/download")
+    async def download_upload(upload_id: str) -> FileResponse:
+        row = store.get_upload(upload_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="upload not found")
+        try:
+            path = safe_download_path(row, UPLOAD_DIR)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=410, detail=str(exc)) from exc
+        return FileResponse(
+            path,
+            filename=row.get("original_name") or path.name,
+            media_type="application/octet-stream",
+        )
 
     @app.delete("/api/uploads/{upload_id}")
     async def delete_upload(upload_id: str) -> dict[str, Any]:

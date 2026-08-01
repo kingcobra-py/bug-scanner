@@ -52,7 +52,8 @@ function formatBytes(bytes) {
   const size = Number(bytes || 0);
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  if (size < 1024 * 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  return `${(size / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 function formatEta(seconds) {
@@ -139,20 +140,130 @@ function setupUploadDropzone() {
   });
 }
 
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
+const UPLOAD_CONCURRENCY = 4;
+
+function setUploadProgress(sent, total, label = "Uploading chunks…") {
+  const pct = total ? Math.min(100, (sent / total) * 100) : 0;
+  $("uploadProgress").classList.remove("hidden");
+  $("uploadProgressLabel").textContent = label;
+  $("uploadProgressPercent").textContent = `${pct.toFixed(1)}%`;
+  $("uploadProgressBar").style.width = `${pct}%`;
+  $("uploadProgressBytes").textContent = `${formatBytes(sent)} / ${formatBytes(total)}`;
+}
+
+function uploadChunk(uploadId, index, blob, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", `/api/uploads/chunks/${encodeURIComponent(uploadId)}/${index}`);
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress(event.loaded);
+    };
+    xhr.onerror = () => reject(new Error(`Network error uploading chunk ${index + 1}`));
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText || "{}"); } catch (_) {}
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(new Error(data.detail || `Chunk ${index + 1} failed (${xhr.status})`));
+    };
+    xhr.send(blob);
+  });
+}
+
+async function uploadFileInChunks(file, kind) {
+  const resumeKey = `bb-upload:${kind}:${file.name}:${file.size}:${file.lastModified}`;
+  let session = null;
+  const savedId = sessionStorage.getItem(resumeKey);
+  if (savedId) {
+    try {
+      session = await api(`/api/uploads/chunks/${encodeURIComponent(savedId)}`);
+    } catch (_) {
+      sessionStorage.removeItem(resumeKey);
+    }
+  }
+  if (!session || Number(session.total_size) !== file.size) {
+    session = await api("/api/uploads/chunks/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: file.name, kind, total_size: file.size }),
+    });
+    sessionStorage.setItem(resumeKey, session.id);
+  }
+
+  const chunkSize = Number(session.chunk_size);
+  const totalChunks = Number(session.total_chunks);
+  const complete = new Set((session.received_chunks || []).map(Number));
+  const uploaded = new Map();
+  for (const index of complete) {
+    uploaded.set(index, Math.min(chunkSize, file.size - index * chunkSize));
+  }
+  const active = new Map();
+  const update = () => {
+    const sent = [...uploaded.values()].reduce((sum, value) => sum + value, 0)
+      + [...active.values()].reduce((sum, value) => sum + value, 0);
+    setUploadProgress(sent, file.size);
+  };
+  update();
+
+  const pending = Array.from({ length: totalChunks }, (_, index) => index)
+    .filter((index) => !complete.has(index));
+  let cursor = 0;
+  async function worker() {
+    while (cursor < pending.length) {
+      const index = pending[cursor++];
+      const start = index * chunkSize;
+      const blob = file.slice(start, Math.min(file.size, start + chunkSize));
+      let lastError = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          active.set(index, 0);
+          await uploadChunk(session.id, index, blob, (loaded) => {
+            active.set(index, loaded);
+            update();
+          });
+          active.delete(index);
+          uploaded.set(index, blob.size);
+          update();
+          lastError = null;
+          break;
+        } catch (error) {
+          active.delete(index);
+          lastError = error;
+          if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 750));
+        }
+      }
+      if (lastError) throw lastError;
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(UPLOAD_CONCURRENCY, pending.length || 1) }, () => worker())
+  );
+  setUploadProgress(file.size, file.size, "Processing target file…");
+  const record = await api(`/api/uploads/chunks/${encodeURIComponent(session.id)}/complete`, {
+    method: "POST",
+  });
+  sessionStorage.removeItem(resumeKey);
+  return record;
+}
+
 async function uploadFile() {
   const file = $("uploadFile").files[0];
   if (!file) {
     $("uploadMessage").innerHTML = '<span class="text-amber-300">Choose a file first.</span>';
     return;
   }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    $("uploadMessage").innerHTML = '<span class="text-red-300">File exceeds the 5 GB upload limit.</span>';
+    return;
+  }
   const button = $("uploadBtn");
   button.disabled = true;
   button.textContent = "Uploading…";
-  const body = new FormData();
-  body.append("file", file);
-  body.append("kind", state.uploadKind);
+  $("uploadMessage").textContent = "";
+  setUploadProgress(0, file.size, "Preparing chunks…");
   try {
-    const record = await api("/api/uploads", { method: "POST", body });
+    const record = await uploadFileInChunks(file, state.uploadKind);
     $("uploadMessage").innerHTML = `<span class="text-emerald-300">Saved ${esc(record.original_name)} · ${formatNumber(record.item_count)} entries</span>`;
     $("uploadFile").value = "";
     $("chosenFile").textContent = "No file selected";
@@ -189,8 +300,14 @@ function renderUploads() {
         <div class="meta">${formatNumber(file.item_count)} entries · ${formatBytes(file.size_bytes)} · ${esc((file.created_at || "").replace("T", " ").slice(0, 16))}</div>
       </div>
       <span class="pill">${file.kind === "targets" ? "Targets" : "Wordlist"}</span>
+      <button class="btn-ghost download-upload" data-id="${esc(file.id)}">Download</button>
       <button class="btn-ghost delete-upload" data-id="${esc(file.id)}">Delete</button>
     </div>`).join("");
+  list.querySelectorAll(".download-upload").forEach((button) => {
+    button.onclick = () => {
+      window.location.href = `/api/uploads/${encodeURIComponent(button.dataset.id)}/download`;
+    };
+  });
   list.querySelectorAll(".delete-upload").forEach((button) => {
     button.onclick = async () => {
       if (!confirm("Delete this uploaded file from the server? Existing jobs keep their copied target configuration.")) return;
