@@ -46,6 +46,11 @@ def test_persistent_upload_library_and_job_reference(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
     started = []
     monkeypatch.setattr(server.engine, "start_async", lambda config: started.append(config))
+    monkeypatch.setattr(
+        server,
+        "read_upload_items",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("job creation must not parse upload")),
+    )
     client = TestClient(create_app())
 
     uploaded = client.post(
@@ -74,7 +79,11 @@ def test_persistent_upload_library_and_job_reference(tmp_path, monkeypatch):
     body = created.json()
     assert body["id"]
     assert started
-    assert started[0].targets == ["a.example", "b.example"]
+    # Upload-backed jobs start immediately by file reference; the 500MB file
+    # is streamed later by the engine instead of parsed inside POST /api/scans.
+    assert started[0].targets == []
+    assert Path(started[0].targets_path).is_file()
+    assert started[0].target_count == 2
     assert started[0].job_name == "Uploaded scope"
     assert started[0].targets_upload_id == record["id"]
     pending = client.get("/api/scans", params={"compact": True}).json()

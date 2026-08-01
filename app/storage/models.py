@@ -90,6 +90,8 @@ class ProgressSnapshot:
 @dataclass
 class ScanConfig:
     targets: list[str]
+    targets_path: str = ""
+    target_count: int = 0
     job_name: str = ""
     targets_upload_id: str = ""
     wordlist_upload_id: str = ""
@@ -103,6 +105,8 @@ class ScanConfig:
     ])
     paths_mode: str = "merge"
     custom_paths: list[str] = field(default_factory=list)
+    wordlist_path: str = ""
+    custom_path_count: int = 0
     output_dir: str = "output/scans"
     formats: list[str] = field(default_factory=lambda: ["json", "md", "csv"])
     verify_tls: bool = False

@@ -182,30 +182,26 @@ def create_app() -> FastAPI:
         targets = list(body.targets)
         if body.targets_text:
             targets.extend([ln.strip() for ln in body.targets_text.splitlines() if ln.strip()])
+        targets = list(dict.fromkeys(targets))
+        targets_upload: Optional[dict[str, Any]] = None
         if body.targets_upload_id:
-            upload = store.get_upload(body.targets_upload_id)
-            if not upload or upload.get("kind") != "targets":
+            targets_upload = store.get_upload(body.targets_upload_id)
+            if not targets_upload or targets_upload.get("kind") != "targets":
                 raise HTTPException(status_code=404, detail="target upload not found")
-            try:
-                # Large target files must not block the asyncio loop — under an
-                # active scan that stalls accept() and the browser shows
-                # "Failed to fetch".
-                targets.extend(await asyncio.to_thread(read_upload_items, upload))
-            except (ValueError, FileNotFoundError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if not targets:
+            if not Path(targets_upload.get("stored_path") or "").is_file():
+                raise HTTPException(status_code=410, detail="target upload no longer exists")
+        target_count = len(targets) + int((targets_upload or {}).get("item_count") or 0)
+        if not target_count:
             raise HTTPException(status_code=400, detail="no targets provided")
-        custom_paths = list(body.custom_paths)
+        custom_paths = list(dict.fromkeys(body.custom_paths))
+        wordlist_upload: Optional[dict[str, Any]] = None
         if body.wordlist_upload_id:
-            upload = store.get_upload(body.wordlist_upload_id)
-            if not upload or upload.get("kind") != "wordlist":
+            wordlist_upload = store.get_upload(body.wordlist_upload_id)
+            if not wordlist_upload or wordlist_upload.get("kind") != "wordlist":
                 raise HTTPException(status_code=404, detail="wordlist upload not found")
-            try:
-                custom_paths.extend(await asyncio.to_thread(read_upload_items, upload))
-            except (ValueError, FileNotFoundError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
         cfg = ScanConfig(
-            targets=list(dict.fromkeys(targets)),
+            targets=targets,
+            target_count=target_count,
             job_name=body.job_name.strip()[:120],
             targets_upload_id=body.targets_upload_id,
             wordlist_upload_id=body.wordlist_upload_id,
@@ -215,7 +211,8 @@ def create_app() -> FastAPI:
             rate_limit_per_host=max(1.0, float(body.rate_limit_per_host or 50.0)),
             modules=body.modules,
             paths_mode=body.paths_mode,
-            custom_paths=list(dict.fromkeys(custom_paths)),
+            custom_paths=custom_paths,
+            custom_path_count=len(custom_paths) + int((wordlist_upload or {}).get("item_count") or 0),
             scope_notes=body.scope_notes,
             redact_secrets=body.redact_secrets,
             verify_tls=body.verify_tls,
@@ -225,6 +222,25 @@ def create_app() -> FastAPI:
         )
         out_dir = Path(cfg.output_dir) / cfg.scan_id
         out_dir.mkdir(parents=True, exist_ok=True)
+        # Hard-link large uploads into the scan directory in O(1). The job no
+        # longer waits for a 500MB parse/copy, and deleting the library item
+        # cannot remove the scan's source file.
+        if targets_upload:
+            source = Path(targets_upload["stored_path"])
+            snapshot = out_dir / "targets.txt"
+            try:
+                snapshot.hardlink_to(source)
+                cfg.targets_path = str(snapshot)
+            except OSError:
+                cfg.targets_path = str(source)
+        if wordlist_upload:
+            source = Path(wordlist_upload["stored_path"])
+            snapshot = out_dir / "custom_paths.txt"
+            try:
+                snapshot.hardlink_to(source)
+                cfg.wordlist_path = str(snapshot)
+            except OSError:
+                cfg.wordlist_path = str(source)
         # Register the job immediately with a slim config so the Jobs tab can
         # refresh even if the worker thread is still starting.
         store.create_scan(
@@ -246,8 +262,8 @@ def create_app() -> FastAPI:
                 "verbose": cfg.verbose,
                 "output_dir": cfg.output_dir,
                 "scan_id": cfg.scan_id,
-                "target_count": len(cfg.targets),
-                "custom_path_count": len(cfg.custom_paths),
+                "target_count": cfg.target_count,
+                "custom_path_count": cfg.custom_path_count,
             },
             str(out_dir),
         )

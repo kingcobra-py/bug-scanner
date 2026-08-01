@@ -7,16 +7,17 @@ import json
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from app.core.fingerprint import fingerprint_target
 from app.core.http_client import HttpClient
 from app.core.progress import ProgressManager
 from app.core.vuln_artifacts import write_vuln_artifacts
+from app.core.wordlists import iter_target_lines, load_wordlist
 from app.modules.config_env import ConfigEnvModule
 from app.modules.base import stream_findings
 from app.modules.git_exposure import GitExposureModule
@@ -28,7 +29,7 @@ from app.modules.react2shell import ReactModule
 from app.modules.wordpress import WordPressModule
 from app.storage.db import ScanStore
 from app.storage.models import Finding, ScanConfig, ScanContext, TargetContext
-from app.utils.dedupe import dedupe_findings, dedupe_strings
+from app.utils.dedupe import dedupe_findings
 from app.utils.logger import get_scan_logger, add_log_subscriber, remove_log_subscriber
 from app.utils.normalize import normalize_target, origin_variants
 
@@ -165,21 +166,29 @@ class ScanEngine:
         # Keep the huge target/path arrays on disk only. Persisting them inside
         # config_json makes every Jobs poll parse ~175KB+ per scan and holds the
         # SQLite write lock long enough for dashboard fetch() calls to fail.
-        (out_dir / "targets.txt").write_text(
-            "\n".join(config.targets) + ("\n" if config.targets else ""),
-            encoding="utf-8",
-        )
-        if config.custom_paths:
+        if not config.targets_path:
+            (out_dir / "targets.txt").write_text(
+                "\n".join(config.targets) + ("\n" if config.targets else ""),
+                encoding="utf-8",
+            )
+        if config.custom_paths and not config.wordlist_path:
             (out_dir / "custom_paths.txt").write_text(
                 "\n".join(config.custom_paths) + "\n",
                 encoding="utf-8",
             )
         cfg_dict = asdict(config)
-        cfg_dict["target_count"] = len(cfg_dict.pop("targets", []) or [])
-        cfg_dict["custom_path_count"] = len(cfg_dict.pop("custom_paths", []) or [])
+        cfg_dict.pop("targets_path", None)
+        cfg_dict.pop("wordlist_path", None)
+        cfg_dict["target_count"] = config.target_count or len(cfg_dict.pop("targets", []) or [])
+        cfg_dict["custom_path_count"] = config.custom_path_count or len(cfg_dict.pop("custom_paths", []) or [])
         self.store.create_scan(scan_id, cfg_dict, str(out_dir))
         self.store.update_status(scan_id, "stopping" if stop_event.is_set() else "running")
-        logger.info("scan start id=%s targets=%d threads=%d", scan_id, len(config.targets), config.threads)
+        logger.info(
+            "scan start id=%s targets=%d threads=%d",
+            scan_id,
+            config.target_count or len(config.targets),
+            config.threads,
+        )
 
         persisted_ids: set[str] = set()
 
@@ -197,91 +206,65 @@ class ScanEngine:
         )
 
         try:
-            targets = self._ingest_targets(config)
-            logger.info("normalized targets=%d", len(targets))
-            # estimate tasks loosely
-            est = max(len(targets) * max(len(config.modules), 1) * 10, 1)
+            target_count = config.target_count or len(config.targets)
+            logger.info("streaming targets=%d", target_count)
+            est = max(target_count * max(len(config.modules), 1) * 10, 1)
             progress.start(est)
-
-            live_targets: list[TargetContext] = []
-            probe_workers = max(1, min(int(config.threads), len(targets) or 1))
-            logger.info(
-                "probe phase workers=%d rate_limit_per_host=%.1f",
-                probe_workers,
-                float(getattr(config, "rate_limit_per_host", 50.0) or 50.0),
-            )
-            probe_pool = ThreadPoolExecutor(max_workers=probe_workers)
-            with self._lock:
-                self._executors.setdefault(scan_id, []).append(probe_pool)
-            try:
-                futs = {
-                    probe_pool.submit(self._prepare_target, http, turl, config, progress, logger): turl
-                    for turl in targets
-                }
-                for fut in as_completed(futs):
-                    if stop_event.is_set():
-                        break
-                    turl = futs[fut]
-                    try:
-                        chosen = fut.result()
-                    except Exception as e:
-                        logger.error("probe failed %s: %s", turl, e)
-                        progress.tick(success=False, module="probe")
-                        continue
-                    if not chosen:
-                        continue
-                    live_targets.extend(chosen)
-            finally:
-                probe_pool.shutdown(wait=not stop_event.is_set(), cancel_futures=stop_event.is_set())
-                with self._lock:
-                    if probe_pool in self._executors.get(scan_id, []):
-                        self._executors[scan_id].remove(probe_pool)
-
+            if config.wordlist_path:
+                config.custom_paths = list(dict.fromkeys([
+                    *config.custom_paths,
+                    *load_wordlist(config.wordlist_path),
+                ]))
             modules = self._build_modules(config)
-            # refine total
-            progress.set_total(max(len(live_targets) * len(modules) * 8, progress.snapshot().total))
-
-            all_findings: list[Finding] = []
             pool = ThreadPoolExecutor(max_workers=max(1, config.threads))
             with self._lock:
                 self._executors.setdefault(scan_id, []).append(pool)
             try:
-                # Target-level parallelism; persist/broadcast findings as each target finishes.
-                futs = {
-                    pool.submit(self._scan_target, tgt, modules, ctx, _live_finding): tgt
-                    for tgt in live_targets
-                }
-                for fut in as_completed(futs):
-                    if stop_event.is_set():
-                        break
-                    tgt = futs[fut]
-                    try:
-                        findings = fut.result()
-                        all_findings.extend(findings)
-                        self._persist_findings_live(
-                            scan_id,
-                            findings,
-                            out_dir,
-                            persisted_ids,
+                # Keep only a small window of futures. A 500MB target file can
+                # contain millions of lines; submitting them all freezes/OOMs.
+                max_inflight = max(config.threads * 3, config.threads)
+                source = iter(self._ingest_targets(config))
+                inflight: dict[Future, str] = {}
+                exhausted = False
+                while (inflight or not exhausted) and not stop_event.is_set():
+                    while len(inflight) < max_inflight and not exhausted:
+                        try:
+                            turl = next(source)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        future = pool.submit(
+                            self._run_target_pipeline,
+                            turl,
+                            modules,
+                            ctx,
+                            _live_finding,
+                            logger,
                         )
-                    except Exception as e:
-                        logger.error("target failed %s: %s", tgt.url, e)
-                        logger.debug(traceback.format_exc())
+                        inflight[future] = turl
+                    if not inflight:
+                        continue
+                    done, _ = wait(inflight, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        turl = inflight.pop(future)
+                        try:
+                            findings = future.result()
+                            self._persist_findings_live(
+                                scan_id,
+                                findings,
+                                out_dir,
+                                persisted_ids,
+                            )
+                        except Exception as e:
+                            logger.error("target failed %s: %s", turl, e)
+                            logger.debug(traceback.format_exc())
             finally:
                 pool.shutdown(wait=not stop_event.is_set(), cancel_futures=stop_event.is_set())
                 with self._lock:
                     if pool in self._executors.get(scan_id, []):
                         self._executors[scan_id].remove(pool)
 
-            # global extraction pass on collected bodies
-            progress.set_current(module="extract")
-            for url, body in list(ctx.bodies):
-                if stop_event.is_set():
-                    break
-                # already extracted in modules; skip heavy rework
-                progress.tick(success=True, module="extract")
-
-            findings_dicts = dedupe_findings([f.to_dict() for f in all_findings + ctx.findings])
+            findings_dicts = dedupe_findings(self.store.get_findings(scan_id))
             # Persist any leftovers not already streamed (dedupe / race edge).
             for fd in findings_dicts:
                 fid = fd.get("id") or ""
@@ -322,14 +305,38 @@ class ScanEngine:
                 self._clients.pop(scan_id, None)
                 self._last_artifact_write.pop(scan_id, None)
 
-    def _ingest_targets(self, config: ScanConfig) -> list[str]:
-        raw = []
-        for t in config.targets:
-            t = (t or "").strip()
-            if not t or t.startswith("#"):
-                continue
-            raw.append(normalize_target(t))
-        return dedupe_strings([t for t in raw if t])
+    def _ingest_targets(self, config: ScanConfig) -> Iterator[str]:
+        """Yield normalized targets lazily; memory stays flat for huge uploads."""
+        for target in config.targets:
+            normalized = normalize_target((target or "").strip())
+            if normalized:
+                yield normalized
+        if config.targets_path:
+            for target in iter_target_lines(config.targets_path):
+                normalized = normalize_target(target)
+                if normalized:
+                    yield normalized
+
+    def _run_target_pipeline(
+        self,
+        turl: str,
+        modules: list[Any],
+        ctx: ScanContext,
+        on_finding: Optional[Callable[[Finding], None]],
+        logger,
+    ) -> list[Finding]:
+        findings: list[Finding] = []
+        for target in self._prepare_target(
+            ctx.http,
+            turl,
+            ctx.config,
+            ctx.progress,
+            logger,
+        ):
+            if ctx.stop_event.is_set():
+                break
+            findings.extend(self._scan_target(target, modules, ctx, on_finding))
+        return findings
 
     def _prepare_target(
         self,
@@ -501,10 +508,6 @@ class ScanEngine:
             except Exception as e:
                 mlog.error("module error: %s", e)
                 mlog.debug(traceback.format_exc())
-        # merge bodies for global extract
-        with self._lock:
-            ctx.bodies.extend(local_ctx.bodies)
-            ctx.findings.extend(out)
         log.info("target end %s findings=%d", target.url, len(out))
         return out
 
@@ -513,7 +516,7 @@ class ScanEngine:
             "scan_id": config.scan_id,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             # Persist counts only — full target arrays bloat Jobs API polls.
-            "target_count": len(config.targets),
+            "target_count": config.target_count or len(config.targets),
             "modules": config.modules,
             "finding_count": len(findings),
             "by_severity": {},
@@ -523,10 +526,17 @@ class ScanEngine:
             sev = f.get("severity", "info")
             summary["by_severity"][sev] = summary["by_severity"].get(sev, 0) + 1
 
+        report_config = asdict(config)
+        report_config.pop("targets", None)
+        report_config.pop("custom_paths", None)
+        report_config.pop("targets_path", None)
+        report_config.pop("wordlist_path", None)
+        report_config["target_count"] = config.target_count or len(config.targets)
+        report_config["custom_path_count"] = config.custom_path_count or len(config.custom_paths)
         report = {
             "summary": summary,
             "findings": findings,
-            "config": asdict(config),
+            "config": report_config,
         }
         if "json" in config.formats:
             (out_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

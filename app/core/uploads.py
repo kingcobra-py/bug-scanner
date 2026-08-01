@@ -88,6 +88,7 @@ def init_chunk_upload(
         "chunk_size": CHUNK_SIZE,
         "total_chunks": total_chunks,
         "received_chunks": [],
+        "chunk_lines": {},
     }
     # A sparse destination avoids holding chunks in RAM or doubling disk use.
     with _part_path(upload_dir, upload_id).open("wb") as fh:
@@ -124,6 +125,7 @@ def write_upload_chunk(
         received = {int(value) for value in session.get("received_chunks", [])}
         received.add(chunk_index)
         session["received_chunks"] = sorted(received)
+        session.setdefault("chunk_lines", {})[str(chunk_index)] = content.count(b"\n")
         _write_session(upload_dir, upload_id, session)
         received_bytes = sum(
             min(chunk_size, total_size - (index * chunk_size))
@@ -193,8 +195,20 @@ def complete_chunk_upload(
         if not part.is_file() or part.stat().st_size != int(session["total_size"]):
             raise ValueError("partial upload size mismatch")
         kind: UploadKind = session["kind"]
-        item_count, preview, sha256 = _inspect_text_upload(part, kind)
-        if not item_count:
+        # Count line breaks while chunks arrive. Completion remains O(1), so a
+        # 500MB upload appears in the library immediately instead of being
+        # re-read and hashed before the response returns.
+        item_count = sum(int(value) for value in session.get("chunk_lines", {}).values())
+        if int(session["total_size"]) > 0:
+            with part.open("rb") as fh:
+                fh.seek(-1, 2)
+                if fh.read(1) != b"\n":
+                    item_count += 1
+        preview = preview_upload_items(
+            {"stored_path": str(part), "kind": kind},
+            limit=20,
+        )
+        if not preview:
             raise ValueError(f"no valid {kind} entries found")
         final = (upload_dir.resolve() / f"{upload_id}_{session['original_name']}").resolve()
         if final.parent != upload_dir.resolve():
@@ -207,7 +221,9 @@ def complete_chunk_upload(
             "stored_path": str(final),
             "item_count": item_count,
             "size_bytes": final.stat().st_size,
-            "sha256": sha256,
+            # Full-file hashing is intentionally deferred/omitted for chunked
+            # uploads; it doubled finalization time and is not used for scans.
+            "sha256": "",
         }
         store.add_upload(record)
         _session_path(upload_dir, upload_id).unlink(missing_ok=True)

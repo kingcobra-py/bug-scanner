@@ -20,10 +20,48 @@ body {
 }
 
 .bg-grid {
-  background-image:
-    linear-gradient(rgba(34, 211, 238, 0.05) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(34, 211, 238, 0.05) 1px, transparent 1px);
-  background-size: 28px 28px;
+  position: relative;
+  isolation: isolate;
+}
+.bg-grid > header, .bg-grid > nav, .bg-grid > main { position: relative; z-index: 1; }
+.ash-layer { position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
+.ash-layer i {
+  --x: 10vw;
+  --drift: 22px;
+  --duration: 30s;
+  --delay: -5s;
+  position: absolute;
+  top: -8px;
+  left: var(--x);
+  width: 2px;
+  height: 2px;
+  border-radius: 50%;
+  background: rgba(255,255,255,.75);
+  box-shadow: 0 0 4px rgba(255,255,255,.25);
+  opacity: 0;
+  animation: ashFall var(--duration) linear var(--delay) infinite;
+}
+.ash-layer i:nth-child(2)  { --x: 18vw; --drift: -18px; --duration: 36s; --delay: -21s; width: 1px; height: 1px; }
+.ash-layer i:nth-child(3)  { --x: 27vw; --drift: 30px; --duration: 42s; --delay: -11s; }
+.ash-layer i:nth-child(4)  { --x: 35vw; --drift: -25px; --duration: 33s; --delay: -27s; width: 1px; height: 1px; }
+.ash-layer i:nth-child(5)  { --x: 43vw; --drift: 14px; --duration: 39s; --delay: -3s; }
+.ash-layer i:nth-child(6)  { --x: 52vw; --drift: -32px; --duration: 46s; --delay: -30s; width: 1px; height: 1px; }
+.ash-layer i:nth-child(7)  { --x: 60vw; --drift: 24px; --duration: 35s; --delay: -16s; }
+.ash-layer i:nth-child(8)  { --x: 68vw; --drift: -15px; --duration: 43s; --delay: -35s; }
+.ash-layer i:nth-child(9)  { --x: 76vw; --drift: 35px; --duration: 38s; --delay: -9s; width: 1px; height: 1px; }
+.ash-layer i:nth-child(10) { --x: 84vw; --drift: -27px; --duration: 48s; --delay: -39s; }
+.ash-layer i:nth-child(11) { --x: 92vw; --drift: 18px; --duration: 34s; --delay: -19s; width: 1px; height: 1px; }
+.ash-layer i:nth-child(12) { --x: 6vw; --drift: -20px; --duration: 45s; --delay: -33s; }
+.ash-layer i:nth-child(13) { --x: 48vw; --drift: 28px; --duration: 41s; --delay: -25s; width: 1px; height: 1px; }
+.ash-layer i:nth-child(14) { --x: 72vw; --drift: -22px; --duration: 37s; --delay: -14s; }
+@keyframes ashFall {
+  0% { transform: translate3d(0, -2vh, 0); opacity: 0; }
+  8% { opacity: .42; }
+  86% { opacity: .28; }
+  100% { transform: translate3d(var(--drift), 105vh, 0); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ash-layer { display: none; }
 }
 
 .panel {

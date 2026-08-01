@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Iterable, Iterator, Literal
 
 from app.utils.normalize import normalize_path
 
@@ -86,6 +86,19 @@ def parse_target_lines(content: str | bytes) -> list[str]:
         seen.add(item)
         out.append(item)
     return out
+
+
+def iter_target_lines(path: Path | str) -> Iterator[str]:
+    """Stream target lines from very large files without materializing them."""
+    with Path(path).open("rb") as fh:
+        for raw in fh:
+            item = raw.decode("utf-8", errors="ignore").strip()
+            if not item or item.startswith("#"):
+                continue
+            if " #" in item:
+                item = item.split(" #", 1)[0].strip()
+            if item:
+                yield item
 
 
 def save_uploaded_targets(content: str | bytes, dest: Path) -> list[str]:
