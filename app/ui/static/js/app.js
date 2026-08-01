@@ -14,6 +14,10 @@ const state = {
   pingTimer: null,
   jobsRefreshPending: false,
   resultsRefreshPending: false,
+  resultsRequestScan: null,
+  resultsController: null,
+  resultsCache: new Map(),
+  findingDetails: new Map(),
   logsRefreshPending: false,
   resultReloadTimer: null,
 };
@@ -28,6 +32,7 @@ async function api(url, options = {}) {
   try {
     response = await fetch(url, options);
   } catch (error) {
+    if (error?.name === "AbortError") throw error;
     const reason = error?.message || "Failed to fetch";
     throw new Error(
       `Cannot reach the scanner API (${url}). ${reason}. ` +
@@ -407,7 +412,9 @@ async function refreshJobs() {
   try {
     state.allScans = await api("/api/scans?compact=true&limit=100&include_archived=true");
     state.jobs = state.allScans.filter((job) => !job.archived);
-    if (!state.scanId && state.allScans.length) state.scanId = state.allScans[0].id;
+    if (!state.allScans.some((job) => job.id === state.scanId)) {
+      state.scanId = state.allScans[0]?.id || null;
+    }
     renderJobs();
     syncScanSelectors();
   } catch (error) {
@@ -527,6 +534,11 @@ function syncScanSelectors() {
 }
 
 function selectScan(id, connect = true) {
+  if (state.scanId !== id && state.resultsController) {
+    state.resultsController.abort();
+    state.resultsController = null;
+    state.resultsRefreshPending = false;
+  }
   state.scanId = id;
   state.provider = "";
   syncScanSelectors();
@@ -583,34 +595,55 @@ function scheduleResultsReload() {
   state.resultReloadTimer = setTimeout(reloadResults, 500);
 }
 
-async function reloadResults() {
+function applyResultsPayload(results) {
+  state.results = results;
+  const seen = new Set();
+  state.findings = (results.findings || []).filter((finding) => {
+    const key = finding.id || `${finding.type}|${finding.url}|${finding.title}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).map(withSearchText).sort((a, b) => String(b.timestamp || "").localeCompare(String(a.timestamp || "")));
+  renderResults();
+  renderFindings();
+}
+
+async function reloadResults(force = false) {
   if (!state.scanId) {
     $("resultSummary").innerHTML = '<div class="text-slate-500 text-sm">Select a job first.</div>';
     return;
   }
-  if (state.resultsRefreshPending) return;
+  const scanId = state.scanId;
+  const cached = state.resultsCache.get(scanId);
+  if (cached) applyResultsPayload(cached);
+  const job = state.allScans.find((item) => item.id === scanId);
+  const active = ["running", "pending", "stopping"].includes(job?.status);
+  if (cached && !force && !active) return;
+  if (state.resultsRefreshPending && state.resultsRequestScan === scanId) return;
+  if (state.resultsController) state.resultsController.abort();
+  const controller = new AbortController();
+  state.resultsController = controller;
+  state.resultsRequestScan = scanId;
   state.resultsRefreshPending = true;
   try {
-    // Provider filtering happens client-side against the cached secret list,
-    // so chip clicks never round-trip to the server.
-    const [results, findings] = await Promise.all([
-      api(`/api/scans/${encodeURIComponent(state.scanId)}/results`),
-      api(`/api/scans/${encodeURIComponent(state.scanId)}/findings`),
-    ]);
-    state.results = results;
-    const seen = new Set();
-    state.findings = findings.filter((finding) => {
-      const key = finding.id || `${finding.type}|${finding.target}|${finding.url}|${finding.title}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    }).map(withSearchText).sort((a, b) => String(b.timestamp || "").localeCompare(String(a.timestamp || "")));
-    renderResults();
-    renderFindings();
+    // One compact response replaces the old /results + /findings pair.
+    const results = await api(
+      `/api/scans/${encodeURIComponent(scanId)}/results?include_findings=true`,
+      { signal: controller.signal },
+    );
+    if (state.scanId !== scanId) return;
+    state.resultsCache.set(scanId, results);
+    applyResultsPayload(results);
   } catch (error) {
-    $("resultSummary").innerHTML = `<div class="text-red-300">${esc(error.message)}</div>`;
+    if (error?.name !== "AbortError" && state.scanId === scanId && !cached) {
+      $("resultSummary").innerHTML = `<div class="text-red-300">${esc(error.message)}</div>`;
+    }
   } finally {
-    state.resultsRefreshPending = false;
+    if (state.resultsController === controller) {
+      state.resultsController = null;
+      state.resultsRequestScan = null;
+      state.resultsRefreshPending = false;
+    }
   }
 }
 
@@ -721,13 +754,28 @@ function renderFindings() {
 
 // Delegated once: works for every re-render without re-attaching per-row
 // listeners, which matters once result sets grow into the hundreds.
-$("findingsBody").addEventListener("click", (event) => {
+$("findingsBody").addEventListener("click", async (event) => {
   const row = event.target.closest(".finding-row");
   if (!row) return;
   const finding = state._findingsRows?.[Number(row.dataset.index)];
   if (!finding) return;
   $("evidence").classList.remove("hidden");
-  $("evidence").textContent = JSON.stringify(finding, null, 2);
+  const key = `${state.scanId}:${finding.id}`;
+  const cached = state.findingDetails.get(key);
+  if (cached) {
+    $("evidence").textContent = JSON.stringify(cached, null, 2);
+    return;
+  }
+  $("evidence").textContent = "Loading full finding details…";
+  try {
+    const detail = await api(
+      `/api/scans/${encodeURIComponent(state.scanId)}/findings/${encodeURIComponent(finding.id)}`
+    );
+    state.findingDetails.set(key, detail);
+    $("evidence").textContent = JSON.stringify(detail, null, 2);
+  } catch (error) {
+    $("evidence").textContent = error.message;
+  }
 });
 
 $("vulnHostsBody").addEventListener("click", (event) => {
@@ -783,6 +831,37 @@ function exportFormat(format) {
   if (state.scanId) window.open(`/api/scans/${encodeURIComponent(state.scanId)}/export/${format}`, "_blank");
 }
 
+async function purgeSelectedJob() {
+  const scanId = state.scanId;
+  if (!scanId) return;
+  const job = state.allScans.find((item) => item.id === scanId);
+  const name = job?.config?.job_name || `Scan ${scanId}`;
+  if (!confirm(
+    `Permanently delete "${name}" and ALL of its findings, logs, reports, and saved response files?\n\nThis cannot be undone.`
+  )) return;
+  const button = $("purgeResults");
+  button.disabled = true;
+  button.textContent = "Deleting…";
+  try {
+    await api(`/api/scans/${encodeURIComponent(scanId)}/purge`, { method: "DELETE" });
+    state.resultsCache.delete(scanId);
+    for (const key of [...state.findingDetails.keys()]) {
+      if (key.startsWith(`${scanId}:`)) state.findingDetails.delete(key);
+    }
+    state.results = null;
+    state.findings = [];
+    state.scanId = null;
+    await refreshJobs();
+    syncScanSelectors();
+    await reloadResults();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Delete job + results";
+  }
+}
+
 function bindEvents() {
   document.querySelectorAll(".nav-tab").forEach((button) => button.onclick = () => showTab(button.dataset.tab));
   $("uploadBtn").onclick = uploadFile;
@@ -796,7 +875,8 @@ function bindEvents() {
   $("jobModal").onclick = (event) => { if (event.target === $("jobModal")) closeJobModal(); };
   $("resultScanSelect").onchange = () => { selectScan($("resultScanSelect").value); reloadResults(); };
   $("logScanSelect").onchange = () => { selectScan($("logScanSelect").value); reloadLogs(); };
-  $("refreshResults").onclick = reloadResults;
+  $("refreshResults").onclick = () => reloadResults(true);
+  $("purgeResults").onclick = purgeSelectedJob;
   $("sevFilter").onchange = renderFindings;
   $("modFilter").onchange = renderFindings;
   $("findQ").oninput = () => {

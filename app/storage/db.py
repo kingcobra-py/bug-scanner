@@ -312,6 +312,13 @@ class ScanStore:
             out.sort(key=lambda item: item.get("timestamp") or "", reverse=True)
             return out
 
+    def get_finding(self, scan_id: str, finding_id: str) -> Optional[dict[str, Any]]:
+        with Session(self.engine) as s:
+            row = s.get(FindingRow, finding_id)
+            if not row or row.scan_id != scan_id:
+                return None
+            return self._finding_dict(row)
+
     def get_logs(self, scan_id: str, level: Optional[str] = None, module: Optional[str] = None, limit: int = 500) -> list[dict[str, Any]]:
         with Session(self.engine) as s:
             rows = s.scalars(

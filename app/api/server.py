@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shutil
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -298,6 +299,13 @@ def create_app() -> FastAPI:
     ) -> list[dict[str, Any]]:
         return store.get_findings(scan_id, severity=severity, ftype=type, module=module, q=q)
 
+    @app.get("/api/scans/{scan_id}/findings/{finding_id}")
+    async def get_finding(scan_id: str, finding_id: str) -> dict[str, Any]:
+        finding = store.get_finding(scan_id, finding_id)
+        if not finding:
+            raise HTTPException(status_code=404, detail="finding not found")
+        return finding
+
     @app.get("/api/scans/{scan_id}/logs")
     async def get_logs(
         scan_id: str,
@@ -337,6 +345,20 @@ def create_app() -> FastAPI:
         # reports, and artifacts remain queryable from Results.
         store.archive_scan(scan_id)
         return {"deleted": True, "archived": True, "results_preserved": True, "id": scan_id}
+
+    @app.delete("/api/scans/{scan_id}/purge")
+    async def purge_scan(scan_id: str) -> dict[str, Any]:
+        row = store.get_scan(scan_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="scan not found")
+        if engine.is_active(scan_id) or row.get("status") in {"pending", "running", "stopping"}:
+            raise HTTPException(status_code=409, detail="stop the running job before deleting its results")
+        out_dir = Path(row.get("output_dir") or "").resolve()
+        scans_root = (ROOT / "output" / "scans").resolve()
+        if out_dir.parent == scans_root and out_dir.name == scan_id and out_dir.is_dir():
+            await asyncio.to_thread(shutil.rmtree, out_dir, True)
+        store.delete_scan(scan_id)
+        return {"deleted": True, "purged": True, "id": scan_id}
 
     async def _save_upload(file: UploadFile, kind: str) -> dict[str, Any]:
         if file.size is not None and file.size > DIRECT_UPLOAD_BYTES:
@@ -575,7 +597,9 @@ def create_app() -> FastAPI:
                     "modules": sorted(bucket["modules"]),
                     "severities": sorted(bucket["severities"]),
                     "finding_count": bucket["finding_count"],
-                    "findings": bucket["findings"],
+                    # Keep the job-switch payload small. Full finding details
+                    # are available on demand from /findings/{finding_id}.
+                    "recent_findings": bucket["findings"][:5],
                 }
             )
 
@@ -612,7 +636,19 @@ def create_app() -> FastAPI:
         # Findings are loaded via /findings (newest-first). Including them here
         # duplicated ~0.5MB+ on every Results poll and contributed to fetch failures.
         if include_findings:
-            payload["findings"] = findings
+            payload["findings"] = [
+                {
+                    "id": finding.get("id"),
+                    "type": finding.get("type"),
+                    "severity": finding.get("severity"),
+                    "module": finding.get("module"),
+                    "title": finding.get("title"),
+                    "url": finding.get("url"),
+                    "timestamp": finding.get("timestamp"),
+                    "validated": finding.get("validated"),
+                }
+                for finding in findings
+            ]
         return payload
 
     @app.get("/api/scans/{scan_id}/vulns")

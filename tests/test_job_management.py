@@ -184,4 +184,49 @@ def test_get_results_does_not_rewrite_vuln_artifacts(tmp_path, monkeypatch):
     assert response.status_code == 200
     data = response.json()
     assert data["finding_count"] == 1
+    assert "findings" not in data
     assert not (out_dir / "vulns").exists()
+
+    compact = client.get(
+        f"/api/scans/{scan_id}/results",
+        params={"include_findings": True},
+    ).json()
+    assert compact["findings"][0]["id"] == "f1"
+    assert "evidence" not in compact["findings"][0]
+    assert "extracted" not in compact["findings"][0]
+
+    detail = client.get(f"/api/scans/{scan_id}/findings/f1")
+    assert detail.status_code == 200
+    assert detail.json()["extracted"]["secrets"][0]["kind"] == "github_token"
+    server.store.delete_scan(scan_id)
+
+
+def test_purge_job_deletes_database_results_and_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    client = TestClient(create_app())
+    scan_id = "purge-results-test"
+    out_dir = tmp_path / "output" / "scans" / scan_id
+    out_dir.mkdir(parents=True)
+    (out_dir / "report.json").write_text("{}", encoding="utf-8")
+    server.store.create_scan(scan_id, {"targets": ["a.example"]}, str(out_dir))
+    server.store.update_status(scan_id, "stopped")
+    server.store.add_finding(
+        scan_id,
+        {
+            "id": "purge-finding",
+            "type": "path",
+            "severity": "high",
+            "target": "https://a.example",
+            "url": "https://a.example/.env",
+            "title": "Purge me",
+        },
+    )
+    server.store.add_log(scan_id, {"message": "purge me"})
+
+    response = client.delete(f"/api/scans/{scan_id}/purge")
+    assert response.status_code == 200
+    assert response.json()["purged"] is True
+    assert server.store.get_scan(scan_id) is None
+    assert server.store.get_findings(scan_id) == []
+    assert server.store.get_logs(scan_id) == []
+    assert not out_dir.exists()
