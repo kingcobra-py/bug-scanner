@@ -128,3 +128,25 @@ def test_403_marked():
     assert resp.forbidden_but_exists is True
     client.close()
     httpd.shutdown()
+
+
+def test_shared_client_counts_real_requests_across_threads():
+    httpd = run_server()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    count = 0
+    lock = threading.Lock()
+
+    def recorded():
+        nonlocal count
+        with lock:
+            count += 1
+
+    client = HttpClient(timeout=2.0, retries=0, on_request=recorded)
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        responses = list(pool.map(lambda _: client.get(f"{base}/ok"), range(40)))
+    assert all(response.status_code == 200 for response in responses)
+    assert count == 40
+    # Every worker uses one thread-safe connection pool, not one client each.
+    assert client._shared_client is not None
+    client.close()
+    httpd.shutdown()

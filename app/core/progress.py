@@ -103,12 +103,6 @@ class ProgressManager:
     def tick(self, success: bool = True, timeout: bool = False, module: str = "") -> None:
         now = time.monotonic()
         with self._lock:
-            self._snap.requests += 1
-            self._request_times.append(now)
-            # keep last 5s window
-            cutoff = now - 5.0
-            self._request_times = [t for t in self._request_times if t >= cutoff]
-            self._snap.rps = len(self._request_times) / 5.0
             if timeout:
                 self._snap.timeouts += 1
             if success:
@@ -132,6 +126,18 @@ class ProgressManager:
                     mp = self._snap.module_progress[mod]
                     self._progress.update(self._module_task, completed=mp["done"], total=max(mp["total"], 1))
         self._notify()
+
+    def record_request(self) -> None:
+        """Record one real HTTP attempt for accurate wire-level RPS."""
+        now = time.monotonic()
+        with self._lock:
+            self._snap.requests += 1
+            self._request_times.append(now)
+            cutoff = now - 5.0
+            # Prune periodically in one pass; the list is bounded to the
+            # request count in the last five seconds.
+            self._request_times = [value for value in self._request_times if value >= cutoff]
+            self._snap.rps = len(self._request_times) / 5.0
 
     def add_hit(self, secrets: int = 0, module: str = "") -> None:
         with self._lock:

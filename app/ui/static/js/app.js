@@ -502,7 +502,7 @@ function jobCard(job) {
       <div class="flex justify-between text-[11px] text-slate-500 mt-4 mb-1.5"><span>${pct.toFixed(1)}%</span><span>ETA ${formatEta(progress.eta_seconds)}</span></div>
       <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
       <div class="job-stats">
-        <div>RPS<b>${Number(progress.rps || 0).toFixed(1)}</b></div>
+        <div title="Actual completed HTTP attempts per second (including probes, retries, and redirects)">HTTP RPS<b>${Number(progress.rps || 0).toFixed(1)}</b></div>
         <div>Done<b>${formatNumber(progress.done)}</b></div>
         <div>Failed<b>${formatNumber(progress.failed)}</b></div>
         <div>Hits<b>${formatNumber(progress.hits ?? job.summary?.finding_count)}</b></div>

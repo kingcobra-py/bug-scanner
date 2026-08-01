@@ -119,6 +119,7 @@ class ScanEngine:
             headers=config.headers,
             max_body_bytes=config.max_body_bytes,
             rate_limit_per_host=max(float(getattr(config, "rate_limit_per_host", 50.0) or 50.0), 1.0),
+            on_request=progress.record_request,
         )
         with self._lock:
             self._clients[scan_id] = http
@@ -177,10 +178,12 @@ class ScanEngine:
                 encoding="utf-8",
             )
         cfg_dict = asdict(config)
+        inline_targets = cfg_dict.pop("targets", []) or []
+        inline_paths = cfg_dict.pop("custom_paths", []) or []
         cfg_dict.pop("targets_path", None)
         cfg_dict.pop("wordlist_path", None)
-        cfg_dict["target_count"] = config.target_count or len(cfg_dict.pop("targets", []) or [])
-        cfg_dict["custom_path_count"] = config.custom_path_count or len(cfg_dict.pop("custom_paths", []) or [])
+        cfg_dict["target_count"] = config.target_count or len(inline_targets)
+        cfg_dict["custom_path_count"] = config.custom_path_count or len(inline_paths)
         self.store.create_scan(scan_id, cfg_dict, str(out_dir))
         self.store.update_status(scan_id, "stopping" if stop_event.is_set() else "running")
         logger.info(

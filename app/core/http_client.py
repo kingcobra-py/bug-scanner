@@ -8,7 +8,7 @@ import string
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 import httpx
@@ -72,6 +72,7 @@ class HttpClient:
         max_redirects: int = 5,
         rate_limit_per_host: float = 50.0,
         user_agent: str = DEFAULT_UA,
+        on_request: Optional[Callable[[], None]] = None,
     ) -> None:
         self.timeout = httpx.Timeout(timeout, connect=connect_timeout)
         self.retries = retries
@@ -82,31 +83,34 @@ class HttpClient:
         self.max_body_bytes = max_body_bytes
         self.max_redirects = max_redirects
         self.limiter = HostRateLimiter(rate_limit_per_host)
-        self._local = threading.local()
+        self.on_request = on_request
         self._soft404: dict[str, dict[str, Any]] = {}
         self._soft404_lock = threading.Lock()
-
-    def _client(self) -> httpx.Client:
-        if not getattr(self._local, "client", None):
-            kwargs: dict[str, Any] = {
-                "timeout": self.timeout,
-                "verify": self.verify_tls,
-                "follow_redirects": False,
-                "headers": self.base_headers,
-                # One client per worker thread; keep pools tiny so large thread
-                # counts cannot exhaust the process file-descriptor limit.
-                "limits": httpx.Limits(max_connections=2, max_keepalive_connections=1),
-            }
-            if self.proxy:
-                kwargs["proxy"] = self.proxy
-            self._local.client = httpx.Client(**kwargs)
-        return self._local.client
+        kwargs: dict[str, Any] = {
+            "timeout": self.timeout,
+            "verify": self.verify_tls,
+            "follow_redirects": False,
+            "headers": self.base_headers,
+            # httpx.Client is thread-safe. One shared pool avoids creating 300
+            # TLS contexts/pools (~29GB observed with 300 per-thread clients).
+            "limits": httpx.Limits(max_connections=512, max_keepalive_connections=64),
+        }
+        if self.proxy:
+            kwargs["proxy"] = self.proxy
+        self._shared_client = httpx.Client(**kwargs)
 
     def close(self) -> None:
-        client = getattr(self._local, "client", None)
-        if client:
-            client.close()
-            self._local.client = None
+        self._shared_client.close()
+
+    def _send(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        try:
+            return self._shared_client.request(method, url, **kwargs)
+        finally:
+            if self.on_request:
+                try:
+                    self.on_request()
+                except Exception:
+                    pass
 
     def request(
         self,
@@ -130,7 +134,7 @@ class HttpClient:
         for attempt in range(self.retries + 1):
             try:
                 t0 = time.monotonic()
-                resp = self._client().request(
+                resp = self._send(
                     method_u,
                     current,
                     headers=hdrs,
@@ -147,7 +151,7 @@ class HttpClient:
                     current = str(httpx.URL(current).join(loc))
                     hops += 1
                     self.limiter.wait(httpx.URL(current).host or "")
-                    resp = self._client().request(method_u, current, headers=hdrs)
+                    resp = self._send(method_u, current, headers=hdrs)
                 elapsed = time.monotonic() - t0
                 body = resp.content[: self.max_body_bytes]
                 try:
@@ -206,7 +210,7 @@ class HttpClient:
         for hdr in variants:
             try:
                 self.limiter.wait(httpx.URL(url).host or "")
-                resp = self._client().request(method, url, headers=hdr)
+                resp = self._send(method, url, headers=hdr)
                 if resp.status_code != 403:
                     body = resp.content[: self.max_body_bytes]
                     text = body.decode("utf-8", errors="replace")
@@ -225,7 +229,7 @@ class HttpClient:
         for alt_url in self._path_variants(url):
             try:
                 self.limiter.wait(httpx.URL(alt_url).host or "")
-                resp = self._client().request(method, alt_url, headers=headers)
+                resp = self._send(method, alt_url, headers=headers)
                 if resp.status_code not in (403, 404, 0):
                     body = resp.content[: self.max_body_bytes]
                     return HttpResponse(
@@ -245,7 +249,7 @@ class HttpClient:
         for alt_url in self._path_variants(url):
             try:
                 self.limiter.wait(httpx.URL(alt_url).host or "")
-                resp = self._client().request(method, alt_url, headers=headers)
+                resp = self._send(method, alt_url, headers=headers)
                 if resp.status_code not in (404, 0):
                     body = resp.content[: self.max_body_bytes]
                     return HttpResponse(
