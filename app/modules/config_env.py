@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from app.core.wordlists import load_wordlist, WORDLIST_DIR
-from app.modules.base import body_extractions, finding_from_hit, save_evidence
+from app.modules.base import body_extractions, finding_from_hit, save_http_response
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
 
@@ -64,6 +64,7 @@ class ConfigEnvModule:
             if resp.error or resp.soft404:
                 continue
             if resp.status_code == 403 and resp.forbidden_but_exists:
+                raw_ref = save_http_response(ctx, f"config_{path}", resp)
                 findings.append(
                     finding_from_hit(
                         module=self.name,
@@ -74,6 +75,7 @@ class ConfigEnvModule:
                         title=f"Config path forbidden-but-exists {path}",
                         evidence="HTTP 403 with body",
                         confidence=0.55,
+                        raw_ref=raw_ref,
                         tags=["config", "forbidden"],
                     )
                 )
@@ -85,7 +87,7 @@ class ConfigEnvModule:
                 continue
 
             extracted = body_extractions(ctx, resp.url or url, resp.text)
-            raw_ref = save_evidence(ctx, f"config_{path}", resp.text)
+            raw_ref = save_http_response(ctx, f"config_{path}", resp)
             sev = "critical" if extracted.get("secrets") or extracted.get("smtp") else "high"
             f = finding_from_hit(
                 module=self.name,

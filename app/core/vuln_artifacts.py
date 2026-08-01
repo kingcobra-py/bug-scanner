@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -165,15 +166,13 @@ def write_vuln_artifacts(out_dir: Path | str, findings: list[dict[str, Any]]) ->
             (cat_dir / fname).write_text(json.dumps(record, indent=2), encoding="utf-8")
             with (cat_dir / "index.jsonl").open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record) + "\n")
-            # Keep raw body copy nearby when evidence file exists.
+            # Keep full HTTP debug artifacts nearby when evidence exists.
             raw_ref = finding.get("raw_ref") or ""
-            if raw_ref and Path(raw_ref).exists():
-                dest = cat_dir / (safe_filename(f"{host}__body__{Path(raw_ref).stem}") + Path(raw_ref).suffix)
-                if not dest.exists():
-                    try:
-                        dest.write_bytes(Path(raw_ref).read_bytes())
-                    except Exception:
-                        pass
+            if raw_ref:
+                try:
+                    _copy_debug_artifact(Path(raw_ref), cat_dir, host)
+                except Exception:
+                    pass
 
     hosts = sorted(by_target.keys())
     summary = {
@@ -247,3 +246,32 @@ def write_vuln_artifacts(out_dir: Path | str, findings: list[dict[str, Any]]) ->
             for host, rows in sorted(by_target.items())
         ],
     }
+
+
+def _copy_debug_artifact(src: Path, cat_dir: Path, host: str) -> None:
+    """Copy a .http/.txt body or a methods bundle into the vulns category folder."""
+    if not src.exists():
+        return
+    # Method bundles: SUMMARY.txt plus per-method *.http files.
+    if src.is_file() and src.name == "SUMMARY.txt" and any(src.parent.glob("*.http")):
+        dest_dir = cat_dir / safe_filename(f"{host}__methods__{src.parent.name}")
+        if not dest_dir.exists():
+            shutil.copytree(src.parent, dest_dir)
+        return
+    if src.is_dir() and any(src.glob("*.http")):
+        dest_dir = cat_dir / safe_filename(f"{host}__methods__{src.name}")
+        if not dest_dir.exists():
+            shutil.copytree(src, dest_dir)
+        return
+    if not src.is_file():
+        return
+    dest = cat_dir / (safe_filename(f"{host}__body__{src.stem}") + src.suffix)
+    if not dest.exists():
+        dest.write_bytes(src.read_bytes())
+    # Also copy companion .txt/.bin/.http siblings written by save_http_response.
+    for sibling in src.parent.glob(src.stem + ".*"):
+        if sibling == src:
+            continue
+        sib_dest = cat_dir / (safe_filename(f"{host}__body__{sibling.stem}") + sibling.suffix)
+        if not sib_dest.exists():
+            sib_dest.write_bytes(sibling.read_bytes())

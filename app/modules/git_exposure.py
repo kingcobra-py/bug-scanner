@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from app.core.wordlists import load_wordlist, WORDLIST_DIR
 from app.extractors.patterns import GIT_CONFIG, GIT_HEAD
-from app.modules.base import body_extractions, finding_from_hit, save_evidence
+from app.modules.base import body_extractions, finding_from_hit, save_http_response
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
 
@@ -72,7 +72,7 @@ class GitExposureModule:
             if not interesting:
                 continue
 
-            raw_ref = save_evidence(ctx, f"git_{path}", resp.content if resp.content else resp.text, ext="bin" if path.endswith("index") else "txt")
+            raw_ref = save_http_response(ctx, f"git_{path}", resp)
             extracted = body_extractions(ctx, url, resp.text or "")
             f = finding_from_hit(
                 module=self.name,
@@ -100,7 +100,7 @@ class GitExposureModule:
                 resp = http.get(url)
                 if resp.status_code == 200 and resp.text and not resp.soft404:
                     extracted = body_extractions(ctx, url, resp.text)
-                    raw_ref = save_evidence(ctx, f"git_deep{extra}", resp.text)
+                    raw_ref = save_http_response(ctx, f"git_deep{extra}", resp)
                     findings.append(
                         finding_from_hit(
                             module=self.name,

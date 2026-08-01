@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from app.core.wordlists import load_wordlist, WORDLIST_DIR, merge_paths
-from app.modules.base import body_extractions, finding_from_hit, save_evidence
+from app.modules.base import body_extractions, finding_from_hit, save_http_response
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
 
@@ -54,8 +54,8 @@ class PathBruteforceModule:
                 if not (has_signal or high_value or resp.status_code in (401, 403)):
                     continue
                 raw_ref = ""
-                if resp.status_code == 200 and resp.text:
-                    raw_ref = save_evidence(ctx, f"path_{path}", resp.text)
+                if resp.status_code in (200, 401, 403):
+                    raw_ref = save_http_response(ctx, f"path_{path}", resp)
                 sev = "high" if has_signal or "backup" in low or "wp-config" in low else "medium"
                 if resp.status_code in (401, 403) and not has_signal:
                     sev = "info"
