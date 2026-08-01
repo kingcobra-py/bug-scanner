@@ -104,3 +104,19 @@ body {
 .log-DEBUG { color: #94a3b8; }
 
 tr.find-row:hover { background: rgba(34, 211, 238, 0.06); cursor: pointer; }
+
+.secret-row {
+  display: grid;
+  grid-template-columns: 140px minmax(120px, 1fr) minmax(120px, 1.2fr);
+  gap: 0.5rem;
+  padding: 0.35rem 0.45rem;
+  border: 1px solid rgba(51, 65, 85, 0.7);
+  border-radius: 0.4rem;
+  background: rgba(2, 6, 23, 0.55);
+}
+
+@media (max-width: 768px) {
+  .secret-row {
+    grid-template-columns: 1fr;
+  }
+}

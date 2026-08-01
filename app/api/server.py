@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.core.engine import ScanEngine
-from app.core.wordlists import save_uploaded_wordlist
+from app.core.wordlists import save_uploaded_targets, save_uploaded_wordlist
 from app.storage.db import ScanStore
 from app.storage.models import ScanConfig
 
@@ -179,6 +179,55 @@ def create_app() -> FastAPI:
         content = await file.read()
         paths = save_uploaded_wordlist(content, dest)
         return {"path": str(dest), "count": len(paths), "mode": mode, "paths_preview": paths[:50]}
+
+    @app.post("/api/targets/upload")
+    async def upload_targets(file: UploadFile = File(...)) -> dict[str, Any]:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        dest = UPLOAD_DIR / (file.filename or "targets.txt")
+        content = await file.read()
+        targets = save_uploaded_targets(content, dest)
+        return {
+            "path": str(dest),
+            "count": len(targets),
+            "targets": targets,
+            "targets_text": "\n".join(targets),
+            "preview": targets[:50],
+        }
+
+    @app.get("/api/scans/{scan_id}/results")
+    async def get_results(scan_id: str) -> dict[str, Any]:
+        row = store.get_scan(scan_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="scan not found")
+        findings = store.get_findings(scan_id)
+        by_severity: dict[str, int] = {}
+        by_module: dict[str, int] = {}
+        secrets: list[dict[str, Any]] = []
+        for f in findings:
+            sev = f.get("severity") or "info"
+            mod = f.get("module") or "unknown"
+            by_severity[sev] = by_severity.get(sev, 0) + 1
+            by_module[mod] = by_module.get(mod, 0) + 1
+            extracted = f.get("extracted") or {}
+            for secret in extracted.get("secrets") or []:
+                secrets.append(
+                    {
+                        "kind": secret.get("kind"),
+                        "value": secret.get("value"),
+                        "source_url": secret.get("source_url") or f.get("url"),
+                        "module": mod,
+                        "title": f.get("title"),
+                        "finding_id": f.get("id"),
+                    }
+                )
+        return {
+            "scan": row,
+            "finding_count": len(findings),
+            "by_severity": by_severity,
+            "by_module": by_module,
+            "secrets": secrets,
+            "findings": findings,
+        }
 
     @app.get("/api/scans/{scan_id}/export/{fmt}")
     async def export_report(scan_id: str, fmt: str) -> FileResponse:

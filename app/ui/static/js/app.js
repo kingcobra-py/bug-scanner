@@ -4,6 +4,8 @@ let ws = null;
 let customPaths = [];
 let findingsCache = [];
 let logsCache = [];
+let uploadedTargets = [];
+let pingTimer = null;
 
 function $(id) { return document.getElementById(id); }
 
@@ -17,10 +19,49 @@ function initModules() {
     label.innerHTML = `<input type="checkbox" id="${id}" checked class="accent-cyan-400" /> ${m}`;
     box.appendChild(label);
   });
+  const modFilter = $("modFilter");
+  MODULES.forEach((m) => {
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = m;
+    modFilter.appendChild(opt);
+  });
 }
 
 function selectedModules() {
   return MODULES.filter((m) => $(`mod_${m}`)?.checked);
+}
+
+function countTargetsInBox() {
+  const lines = $("targets").value.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+  $("targetsCount").textContent = `${lines.length} target${lines.length === 1 ? "" : "s"}`;
+  return lines;
+}
+
+async function uploadTargetsFile(mode) {
+  const file = $("targetsFile").files[0];
+  if (!file) {
+    alert("Choose a domains/IPs .txt file first");
+    return;
+  }
+  const fd = new FormData();
+  fd.append("file", file);
+  const up = await fetch("/api/targets/upload", { method: "POST", body: fd }).then((r) => r.json());
+  if (up.error) {
+    alert(up.error);
+    return;
+  }
+  uploadedTargets = up.targets || [];
+  const text = up.targets_text || uploadedTargets.join("\n");
+  if (mode === "merge") {
+    const existing = new Set(countTargetsInBox());
+    uploadedTargets.forEach((t) => existing.add(t));
+    $("targets").value = Array.from(existing).join("\n");
+  } else {
+    $("targets").value = text;
+  }
+  countTargetsInBox();
+  $("targetsInfo").textContent = `loaded ${up.count} targets from ${file.name}`;
 }
 
 async function refreshHistory() {
@@ -30,7 +71,8 @@ async function refreshHistory() {
   rows.slice(0, 30).forEach((s) => {
     const div = document.createElement("button");
     div.className = "w-full text-left px-2 py-2 rounded border border-slate-800 hover:border-cyan-700";
-    div.innerHTML = `<div class="text-cyan-200">${s.id}</div><div class="text-xs text-slate-400">${s.status} · ${(s.summary?.finding_count ?? s.progress?.hits ?? 0)} hits</div>`;
+    const hits = s.summary?.finding_count ?? s.progress?.hits ?? 0;
+    div.innerHTML = `<div class="text-cyan-200">${s.id}</div><div class="text-xs text-slate-400">${s.status} · ${hits} findings</div>`;
     div.onclick = () => selectScan(s.id);
     el.appendChild(div);
   });
@@ -43,12 +85,17 @@ async function selectScan(id) {
   const scan = await fetch(`/api/scans/${id}`).then((r) => r.json());
   if (scan.progress) renderProgress(scan.progress);
   await reloadFindings();
+  await reloadResults();
   await reloadLogs();
 }
 
 function connectWs(id) {
   if (ws) {
     try { ws.close(); } catch (_) {}
+  }
+  if (pingTimer) {
+    clearInterval(pingTimer);
+    pingTimer = null;
   }
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws/scans/${id}`);
@@ -61,6 +108,7 @@ function connectWs(id) {
     if (msg.type === "finding") {
       findingsCache.unshift(msg.data);
       renderFindings();
+      reloadResults();
     }
     if (msg.type === "log") {
       logsCache.push(msg.data);
@@ -68,7 +116,7 @@ function connectWs(id) {
       renderLogs();
     }
   };
-  setInterval(() => {
+  pingTimer = setInterval(() => {
     if (ws && ws.readyState === 1) ws.send("ping");
   }, 15000);
 }
@@ -101,21 +149,54 @@ async function reloadFindings() {
   if (!currentScanId) return;
   const q = $("findQ").value.trim();
   const sev = $("sevFilter").value;
+  const mod = $("modFilter").value;
   const params = new URLSearchParams();
   if (q) params.set("q", q);
   if (sev) params.set("severity", sev);
+  if (mod) params.set("module", mod);
   findingsCache = await fetch(`/api/scans/${currentScanId}/findings?${params}`).then((r) => r.json());
   renderFindings();
+}
+
+async function reloadResults() {
+  if (!currentScanId) return;
+  const data = await fetch(`/api/scans/${currentScanId}/results`).then((r) => r.json());
+  const box = $("resultSummary");
+  const sev = data.by_severity || {};
+  box.innerHTML = `
+    <div class="stat">Findings <b>${data.finding_count || 0}</b></div>
+    <div class="stat">Critical <b class="sev-critical">${sev.critical || 0}</b></div>
+    <div class="stat">High <b class="sev-high">${sev.high || 0}</b></div>
+    <div class="stat">Secrets <b>${(data.secrets || []).length}</b></div>
+  `;
+  const secretsEl = $("secretsBox");
+  const secrets = data.secrets || [];
+  if (!secrets.length) {
+    secretsEl.innerHTML = `<div class="text-slate-500">No secrets extracted yet.</div>`;
+    return;
+  }
+  secretsEl.innerHTML = secrets.map((s) =>
+    `<div class="secret-row">
+      <span class="text-amber-300">${escapeHtml(s.kind || "secret")}</span>
+      <span class="text-emerald-300 font-mono">${escapeHtml(s.value || "")}</span>
+      <span class="text-slate-500 truncate" title="${escapeHtml(s.source_url || "")}">${escapeHtml(s.source_url || "")}</span>
+    </div>`
+  ).join("");
 }
 
 function renderFindings() {
   const body = $("findingsBody");
   body.innerHTML = "";
+  if (!findingsCache.length) {
+    body.innerHTML = `<tr><td colspan="6" class="py-4 text-slate-500">No findings yet.</td></tr>`;
+    return;
+  }
   findingsCache.forEach((f) => {
     const tr = document.createElement("tr");
     tr.className = "find-row border-t border-slate-800";
     tr.innerHTML = `<td class="py-2 pr-2 sev-${f.severity}">${f.severity}</td>
-      <td class="py-2 pr-2">${f.type}</td>
+      <td class="py-2 pr-2">${escapeHtml(f.module || "")}</td>
+      <td class="py-2 pr-2">${escapeHtml(f.type || "")}</td>
       <td class="py-2 pr-2">${escapeHtml(f.title || "")}</td>
       <td class="py-2 pr-2 truncate max-w-[220px]" title="${escapeHtml(f.url || "")}">${escapeHtml(f.url || "")}</td>
       <td class="py-2">${(f.confidence ?? 0).toFixed(2)}</td>`;
@@ -141,7 +222,6 @@ function renderLogs() {
   const level = $("logLevel").value;
   const el = $("logs");
   const items = level ? logsCache.filter((l) => l.level === level) : logsCache;
-  // virtualize-ish: only last 300
   const view = items.slice(-300);
   el.innerHTML = view.map((l) =>
     `<div class="log-${l.level}">[${l.timestamp || ""}] [${l.level}] [${l.module}] ${escapeHtml(l.message || "")}</div>`
@@ -158,10 +238,9 @@ function escapeHtml(s) {
 async function startScan() {
   const targets_text = $("targets").value;
   if (!targets_text.trim()) {
-    alert("Add at least one target");
+    alert("Add or upload at least one domain/IP target");
     return;
   }
-  // upload wordlist first if selected
   const file = $("wordlist").files[0];
   if (file) {
     const fd = new FormData();
@@ -170,7 +249,6 @@ async function startScan() {
     const up = await fetch("/api/wordlists/upload", { method: "POST", body: fd }).then((r) => r.json());
     customPaths = up.paths_preview || [];
     $("wordlistInfo").textContent = `uploaded ${up.count} paths`;
-    // reload full list from file content client-side
     const text = await file.text();
     customPaths = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
   }
@@ -213,7 +291,15 @@ $("stopBtn").onclick = stopScan;
 $("exportJson").onclick = () => exportFmt("json");
 $("exportCsv").onclick = () => exportFmt("csv");
 $("exportMd").onclick = () => exportFmt("md");
+$("refreshResults").onclick = () => { reloadFindings(); reloadResults(); };
+$("targetsReplaceBtn").onclick = () => uploadTargetsFile("replace");
+$("targetsMergeBtn").onclick = () => uploadTargetsFile("merge");
+$("targets").addEventListener("input", countTargetsInBox);
+$("targetsFile").addEventListener("change", () => {
+  if ($("targetsFile").files[0]) uploadTargetsFile("replace");
+});
 $("sevFilter").onchange = reloadFindings;
+$("modFilter").onchange = reloadFindings;
 $("findQ").oninput = () => {
   clearTimeout(window.__fq);
   window.__fq = setTimeout(reloadFindings, 250);
@@ -221,5 +307,6 @@ $("findQ").oninput = () => {
 $("logLevel").onchange = reloadLogs;
 
 initModules();
+countTargetsInBox();
 refreshHistory();
 setInterval(refreshHistory, 10000);
