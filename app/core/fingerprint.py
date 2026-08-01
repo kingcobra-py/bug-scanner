@@ -58,6 +58,13 @@ def fingerprint_response(resp: HttpResponse) -> dict[str, Any]:
     if any(p.search(blob) for p in NEXT_MARKERS) or "next.js" in (resp.headers.get("x-powered-by", "").lower()):
         tech.append("nextjs")
         tech.append("react")
+        powered = resp.headers.get("x-powered-by", "")
+        m = re.search(r"Next\.js\s*v?([0-9.]+)", powered, re.I)
+        if m:
+            meta["nextjs_version"] = m.group(1)
+        if any(h in (resp.headers or {}) for h in ("rsc", "next-router-state-tree", "x-nextjs-cache")):
+            tech.append("rsc")
+            meta["rsc_headers"] = True
 
     if "react" not in tech and any(p.search(blob) for p in REACT_MARKERS):
         tech.append("react")
