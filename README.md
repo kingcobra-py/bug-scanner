@@ -4,7 +4,7 @@ Production-oriented **authorized** bug-bounty recon scanner in Python.
 
 It discovers exposed git/config/env/JS paths, fingerprints WordPress / Joomla / React-Next, extracts APIs · tokens · SMTP credentials, tests HTTP methods, and streams progress to a FastAPI dashboard.
 
-> **Safety:** Weaponized RCE exploit PoCs (React2Shell command execution, wp2shell RCE, Joomla webshell upload) are **not** integrated. CMS/framework modules perform **safe detection + sensitive exposure checks + extraction only**. See `app/exploits/README.md`.
+> **Safety:** Weaponized RCE exploit PoCs (React2Shell command execution, wp2shell RCE, Joomla webshell upload) are **not** executed. CMS/framework modules integrate those surfaces as **safe detection only**: version scoring, endpoint reachability, and webshell path indicators. See `app/exploits/README.md`.
 
 ## Features
 

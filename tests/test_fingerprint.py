@@ -31,6 +31,24 @@ def test_next_fingerprint():
 
 
 def test_joomla_fingerprint():
-    html = '<meta name="generator" content="Joomla! 4.4" /><script src="/media/system/js/core.js"></script>'
+    html = (FIX / "joomla_home.html").read_text()
     fp = fingerprint_response(_resp(html))
     assert "joomla" in fp["tech"]
+    assert fp["meta"].get("joomla_version") == "4.4.2"
+
+
+def test_next_powered_by_and_rsc_headers():
+    html = (FIX / "next_home.html").read_text()
+    fp = fingerprint_response(
+        _resp(
+            html,
+            headers={
+                "x-powered-by": "Next.js 15.0.3",
+                "rsc": "1",
+                "next-router-state-tree": "1",
+            },
+        )
+    )
+    assert "nextjs" in fp["tech"]
+    assert "rsc" in fp["tech"]
+    assert fp["meta"].get("nextjs_version") == "15.0.3"
