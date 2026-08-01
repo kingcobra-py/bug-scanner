@@ -428,17 +428,22 @@ def create_app() -> FastAPI:
                 }
             )
 
-        # Ensure on-disk vulns/ tree exists for older scans / live debugging.
+        # Report the on-disk vulns/ tree if one already exists, without
+        # rewriting it here. This endpoint is polled on every filter click,
+        # and regenerating dozens of per-category files on each read made
+        # filtering feel slow; artifact generation belongs to the live
+        # scan persistence path and the explicit /vulns endpoint instead.
         out_dir = Path(row.get("output_dir") or (ROOT / "output" / "scans" / scan_id))
-        vuln_files = {}
-        try:
-            bundle = write_vuln_artifacts(out_dir, findings)
-            vuln_files = {
-                "dir": bundle.get("dir"),
-                "summary": bundle.get("summary"),
-            }
-        except Exception:
-            vuln_files = {}
+        vuln_files: dict[str, Any] = {}
+        summary_path = out_dir / "vulns" / "summary.json"
+        if summary_path.is_file():
+            try:
+                vuln_files = {
+                    "dir": str(out_dir / "vulns"),
+                    "summary": json.loads(summary_path.read_text(encoding="utf-8")),
+                }
+            except Exception:
+                vuln_files = {}
 
         return {
             "scan": row,

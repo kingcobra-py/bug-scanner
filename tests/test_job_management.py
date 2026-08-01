@@ -1,3 +1,7 @@
+from fastapi.testclient import TestClient
+
+from app.api import server
+from app.api.server import create_app
 from app.core.engine import ScanEngine
 from app.storage.db import ScanStore
 
@@ -79,3 +83,32 @@ def test_archive_job_hides_card_but_preserves_results(tmp_path):
     archived = store.list_scans(include_archived=True)
     assert archived[0]["archived"] is True
     assert store.get_findings("scan-4")[0]["id"] == "finding-4"
+
+
+def test_get_results_does_not_rewrite_vuln_artifacts(tmp_path, monkeypatch):
+    # Results is polled on every provider-filter click; regenerating the
+    # on-disk vulns/ tree there made filtering feel slow.
+    monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
+    client = TestClient(create_app())
+    scan_id = "results-perf-test"
+    out_dir = tmp_path / "scan-out"
+    server.store.create_scan(scan_id, {"targets": ["a.example"]}, str(out_dir))
+    server.store.add_finding(
+        scan_id,
+        {
+            "id": "f1",
+            "type": "js_secret",
+            "severity": "high",
+            "target": "https://a.example",
+            "url": "https://a.example/app.js",
+            "title": "Secret in JS",
+            "module": "js",
+            "extracted": {"secrets": [{"kind": "github_token", "value": "ghp_x"}]},
+        },
+    )
+
+    response = client.get(f"/api/scans/{scan_id}/results")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["finding_count"] == 1
+    assert not (out_dir / "vulns").exists()

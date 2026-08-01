@@ -89,7 +89,7 @@
         <div id="resultSummary" class="grid grid-cols-2 lg:grid-cols-5 gap-3"></div>
         <div class="panel p-5 mt-5">
           <div class="flex items-center justify-between gap-3 flex-wrap">
-            <div><div class="eyebrow">API PROVIDERS</div><div class="text-sm text-slate-400 mt-1">Filter unique credentials by provider</div></div>
+            <div><div class="eyebrow">DEDUPLICATED API KEYS &amp; SECRETS</div><div class="text-sm text-slate-400 mt-1">Unique credential values with occurrence counts, filterable by provider</div></div>
             <div class="flex gap-2">
               <button id="exportJson" class="btn-ghost">JSON</button>
               <button id="exportCsv" class="btn-ghost">CSV</button>
@@ -110,7 +110,7 @@
           </div>
           <div class="panel p-5">
             <div class="flex justify-between items-center gap-2">
-              <div class="eyebrow">DEDUPLICATED FINDINGS</div>
+              <div><div class="eyebrow">ALL FINDINGS</div><div id="findingsCount" class="text-xs text-slate-500 mt-0.5"></div></div>
               <div class="flex gap-2">
                 <input id="findQ" class="input input-sm w-36" placeholder="Search" />
                 <select id="sevFilter" class="input input-sm w-28"><option value="">All severity</option><option>critical</option><option>high</option><option>medium</option><option>low</option><option>info</option></select>
@@ -141,7 +141,7 @@
     </main>
   </div>
 
-  <div id="jobModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+  <div id="jobModal" class="modal-backdrop" role="dialog" aria-modal="true">
     <div class="modal-card">
       <div class="modal-head">
         <div><div class="eyebrow">NEW SCAN</div><h2>Create job</h2><p>Select a server upload and configure execution.</p></div>

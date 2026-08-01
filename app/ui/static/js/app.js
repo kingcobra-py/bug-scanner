@@ -50,9 +50,27 @@ function formatEta(seconds) {
   return `${(value / 3600).toFixed(1)}h`;
 }
 
+function withSearchText(finding) {
+  return {
+    ...finding,
+    _search: [finding.severity, finding.module, finding.type, finding.title, finding.url]
+      .join(" ")
+      .toLowerCase(),
+  };
+}
+
 function showTab(name) {
   state.tab = name;
-  document.querySelectorAll(".tab-view").forEach((el) => el.classList.toggle("hidden", el.id !== `tab-${name}`));
+  document.querySelectorAll(".tab-view").forEach((el) => {
+    const isActive = el.id === `tab-${name}`;
+    el.classList.toggle("hidden", !isActive);
+    if (isActive) {
+      el.classList.remove("tab-anim");
+      // Re-trigger the fade-in keyframe each time this tab becomes active.
+      void el.offsetWidth;
+      el.classList.add("tab-anim");
+    }
+  });
   document.querySelectorAll(".nav-tab").forEach((el) => el.classList.toggle("active", el.dataset.tab === name));
   if (name === "uploads") refreshUploads();
   if (name === "jobs") refreshJobs();
@@ -187,11 +205,11 @@ async function openJobModal() {
     return;
   }
   $("jobError").textContent = "";
-  $("jobModal").classList.remove("hidden");
+  $("jobModal").classList.add("open");
 }
 
 function closeJobModal() {
-  $("jobModal").classList.add("hidden");
+  $("jobModal").classList.remove("open");
 }
 
 async function startJob() {
@@ -401,7 +419,7 @@ function connectWs(id) {
       if (state.tab === "jobs") renderJobs();
     }
     if (message.type === "finding") {
-      state.findings.unshift(message.data);
+      state.findings.unshift(withSearchText(message.data));
       if (state.tab === "results") scheduleResultsReload();
     }
     if (message.type === "log") {
@@ -428,9 +446,10 @@ async function reloadResults() {
   if (state.resultsRefreshPending) return;
   state.resultsRefreshPending = true;
   try {
-    const providerQuery = state.provider ? `?provider=${encodeURIComponent(state.provider)}` : "";
+    // Provider filtering happens client-side against the cached secret list,
+    // so chip clicks never round-trip to the server.
     const [results, findings] = await Promise.all([
-      api(`/api/scans/${encodeURIComponent(state.scanId)}/results${providerQuery}`),
+      api(`/api/scans/${encodeURIComponent(state.scanId)}/results`),
       api(`/api/scans/${encodeURIComponent(state.scanId)}/findings`),
     ]);
     state.results = results;
@@ -440,7 +459,7 @@ async function reloadResults() {
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
-    });
+    }).map(withSearchText);
     renderResults();
     renderFindings();
   } catch (error) {
@@ -461,8 +480,10 @@ function renderResults() {
     <div class="stat-card"><span>High</span><b class="sev-high">${formatNumber(severity.high)}</b></div>
     <div class="stat-card"><span>Unique secrets</span><b>${formatNumber((data.secrets || []).length)}</b></div>`;
   renderProviderFilters(data.providers || []);
-  renderSecrets(data.secrets || []);
+  const filteredSecrets = (data.secrets || []).filter((s) => !state.provider || s.provider === state.provider);
+  renderSecrets(filteredSecrets);
   const hostBody = $("vulnHostsBody");
+  state._vulnHosts = hosts;
   hostBody.innerHTML = hosts.length ? hosts.map((host, index) => `
     <tr class="find-row vuln-row" data-index="${index}">
       <td class="text-cyan-200 font-mono">${esc(host.host)}</td>
@@ -470,12 +491,6 @@ function renderResults() {
       <td>${esc((host.severities || []).join(", "))}</td>
       <td>${formatNumber(host.finding_count)}</td>
     </tr>`).join("") : '<tr><td colspan="4" class="text-slate-500">No vulnerable hosts yet.</td></tr>';
-  hostBody.querySelectorAll(".vuln-row").forEach((row) => {
-    row.onclick = () => {
-      $("vulnHostDetail").classList.remove("hidden");
-      $("vulnHostDetail").textContent = JSON.stringify(hosts[Number(row.dataset.index)], null, 2);
-    };
-  });
 }
 
 function renderProviderFilters(providers) {
@@ -490,14 +505,18 @@ function renderProviderFilters(providers) {
     </button>`)].join("");
   $("providerFilters").querySelectorAll(".provider-chip").forEach((button) => {
     button.onclick = () => {
+      // Cached secrets already hold every provider; re-render instantly
+      // instead of asking the server to recompute and rewrite results.
       state.provider = button.dataset.provider;
-      reloadResults();
+      renderProviderFilters(providers);
+      renderSecrets((state.results?.secrets || []).filter((s) => !state.provider || s.provider === state.provider));
     };
   });
 }
 
 function renderSecrets(secrets) {
   const providers = new Map((state.results?.providers || []).map((item) => [item.id, item]));
+  state._secrets = secrets;
   $("secretsBox").innerHTML = secrets.length ? secrets.map((secret, index) => {
     const provider = providers.get(secret.provider) || {};
     return `
@@ -508,13 +527,6 @@ function renderSecrets(secrets) {
       <span class="secret-actions"><span class="pill">${formatNumber(secret.occurrences)} occurrence${secret.occurrences === 1 ? "" : "s"}</span><button class="btn-ghost copy-secret" data-index="${index}">Copy full value</button></span>
     </div>`;
   }).join("") : '<div class="py-8 text-center text-sm text-slate-500">No extracted secrets for this filter.</div>';
-  $("secretsBox").querySelectorAll(".copy-secret").forEach((button) => {
-    button.onclick = async () => {
-      await copyText(String(secrets[Number(button.dataset.index)]?.value || ""));
-      button.textContent = "Copied";
-      setTimeout(() => { button.textContent = "Copy full value"; }, 1200);
-    };
-  });
 }
 
 async function copyText(value) {
@@ -532,15 +544,20 @@ async function copyText(value) {
   input.remove();
 }
 
+const FINDINGS_RENDER_CAP = 400;
+
 function renderFindings() {
   const query = $("findQ").value.trim().toLowerCase();
   const severity = $("sevFilter").value;
   const moduleName = $("modFilter").value;
-  const rows = state.findings.filter((finding) => {
+  const matches = state.findings.filter((finding) => {
     if (severity && finding.severity !== severity) return false;
     if (moduleName && finding.module !== moduleName) return false;
-    return !query || JSON.stringify(finding).toLowerCase().includes(query);
+    // _search is precomputed once per finding in reloadResults, so typing
+    // in the search box no longer re-serializes every row on each keystroke.
+    return !query || finding._search.includes(query);
   });
+  const rows = matches.slice(0, FINDINGS_RENDER_CAP);
   $("findingsBody").innerHTML = rows.length ? rows.map((finding, index) => `
     <tr class="find-row finding-row" data-index="${index}">
       <td class="sev-${esc(finding.severity)}">${esc(finding.severity)}</td>
@@ -548,13 +565,41 @@ function renderFindings() {
       <td class="max-w-[190px] truncate" title="${esc(finding.title)}">${esc(finding.title)}</td>
       <td class="max-w-[210px] truncate font-mono text-cyan-200" title="${esc(finding.url)}">${esc(finding.url)}</td>
     </tr>`).join("") : '<tr><td colspan="4" class="text-slate-500">No findings for this filter.</td></tr>';
-  $("findingsBody").querySelectorAll(".finding-row").forEach((row) => {
-    row.onclick = () => {
-      $("evidence").classList.remove("hidden");
-      $("evidence").textContent = JSON.stringify(rows[Number(row.dataset.index)], null, 2);
-    };
-  });
+  $("findingsCount").textContent = matches.length > FINDINGS_RENDER_CAP
+    ? `Showing first ${FINDINGS_RENDER_CAP.toLocaleString()} of ${matches.length.toLocaleString()} — refine your search`
+    : `${matches.length.toLocaleString()} finding${matches.length === 1 ? "" : "s"}`;
+  state._findingsRows = rows;
 }
+
+// Delegated once: works for every re-render without re-attaching per-row
+// listeners, which matters once result sets grow into the hundreds.
+$("findingsBody").addEventListener("click", (event) => {
+  const row = event.target.closest(".finding-row");
+  if (!row) return;
+  const finding = state._findingsRows?.[Number(row.dataset.index)];
+  if (!finding) return;
+  $("evidence").classList.remove("hidden");
+  $("evidence").textContent = JSON.stringify(finding, null, 2);
+});
+
+$("vulnHostsBody").addEventListener("click", (event) => {
+  const row = event.target.closest(".vuln-row");
+  if (!row) return;
+  const host = state._vulnHosts?.[Number(row.dataset.index)];
+  if (!host) return;
+  $("vulnHostDetail").classList.remove("hidden");
+  $("vulnHostDetail").textContent = JSON.stringify(host, null, 2);
+});
+
+$("secretsBox").addEventListener("click", async (event) => {
+  const button = event.target.closest(".copy-secret");
+  if (!button) return;
+  const secret = state._secrets?.[Number(button.dataset.index)];
+  if (!secret) return;
+  await copyText(String(secret.value || ""));
+  button.textContent = "Copied";
+  setTimeout(() => { button.textContent = "Copy full value"; }, 1200);
+});
 
 async function reloadLogs() {
   if (!state.scanId) {
@@ -605,7 +650,10 @@ function bindEvents() {
   $("refreshResults").onclick = reloadResults;
   $("sevFilter").onchange = renderFindings;
   $("modFilter").onchange = renderFindings;
-  $("findQ").oninput = renderFindings;
+  $("findQ").oninput = () => {
+    clearTimeout(state._searchDebounce);
+    state._searchDebounce = setTimeout(renderFindings, 180);
+  };
   $("logLevel").onchange = reloadLogs;
   $("clearLogs").onclick = () => { $("logs").innerHTML = ""; };
   $("exportJson").onclick = () => exportFormat("json");
