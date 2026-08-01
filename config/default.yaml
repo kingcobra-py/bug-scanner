@@ -1,0 +1,60 @@
+scanner:
+  threads: 20
+  timeout: 8.0
+  connect_timeout: 5.0
+  retries: 2
+  retry_backoff: 0.5
+  max_redirects: 5
+  verify_tls: false
+  max_body_bytes: 2097152
+  rate_limit_per_host: 10
+  user_agent: "BB-Scanner/1.0 (+authorized-security-assessment)"
+
+modules:
+  git: true
+  js: true
+  config: true
+  path: true
+  methods: true
+  wordpress: true
+  joomla: true
+  react: true
+  crawl: true
+
+paths:
+  mode: merge  # merge | custom_only | builtin_only
+  custom_file: null
+
+http:
+  probe_both_schemes: true
+  soft404_random_path: true
+  method_test_trace: false
+  methods:
+    - GET
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    - OPTIONS
+    - HEAD
+
+output:
+  dir: output/scans
+  formats:
+    - json
+    - md
+    - csv
+  redact_secrets: true
+  show_last_chars: 4
+
+logging:
+  level: INFO
+  console: true
+  file: true
+
+dashboard:
+  host: 0.0.0.0
+  port: 8080
+
+proxy: null
+headers: {}

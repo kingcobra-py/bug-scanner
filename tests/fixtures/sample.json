@@ -1,0 +1,9 @@
+{
+  "smtp": {
+    "host": "email-smtp.us-east-1.amazonaws.com",
+    "port": 587,
+    "user": "smtp-user-example",
+    "pass": "smtpSecretValueWithEntropy01"
+  },
+  "notes": "example.com should not dominate"
+}
