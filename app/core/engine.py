@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
@@ -17,6 +18,7 @@ from app.core.http_client import HttpClient
 from app.core.progress import ProgressManager
 from app.core.vuln_artifacts import write_vuln_artifacts
 from app.modules.config_env import ConfigEnvModule
+from app.modules.base import stream_findings
 from app.modules.git_exposure import GitExposureModule
 from app.modules.joomla import JoomlaModule
 from app.modules.js_secrets import JsSecretsModule
@@ -62,6 +64,8 @@ class ScanEngine:
         self._executors: dict[str, list[ThreadPoolExecutor]] = {}
         self._clients: dict[str, HttpClient] = {}
         self._lock = threading.Lock()
+        self._artifact_lock = threading.Lock()
+        self._last_artifact_write: dict[str, float] = {}
 
     def stop(self, scan_id: str) -> bool:
         ev = self._stop_events.get(scan_id)
@@ -120,9 +124,8 @@ class ScanEngine:
         logger = get_scan_logger(scan_id, out_dir, module="engine", level="DEBUG" if config.verbose else "INFO")
 
         def _log_cb(event: dict) -> None:
-            if event.get("scan_id") not in (scan_id, "-"):
-                # adapter always sets scan_id
-                pass
+            if event.get("scan_id") != scan_id:
+                return
             try:
                 self.store.add_log(scan_id, event)
             except Exception:
@@ -153,6 +156,11 @@ class ScanEngine:
         self.store.create_scan(scan_id, cfg_dict, str(out_dir))
         self.store.update_status(scan_id, "stopping" if stop_event.is_set() else "running")
         logger.info("scan start id=%s targets=%d threads=%d", scan_id, len(config.targets), config.threads)
+
+        persisted_ids: set[str] = set()
+
+        def _live_finding(finding: Finding) -> None:
+            self._persist_findings_live(scan_id, [finding], out_dir, persisted_ids)
 
         ctx = ScanContext(
             config=config,
@@ -210,14 +218,13 @@ class ScanEngine:
             progress.set_total(max(len(live_targets) * len(modules) * 8, progress.snapshot().total))
 
             all_findings: list[Finding] = []
-            persisted_ids: set[str] = set()
             pool = ThreadPoolExecutor(max_workers=max(1, config.threads))
             with self._lock:
                 self._executors.setdefault(scan_id, []).append(pool)
             try:
                 # Target-level parallelism; persist/broadcast findings as each target finishes.
                 futs = {
-                    pool.submit(self._scan_target, tgt, modules, ctx): tgt
+                    pool.submit(self._scan_target, tgt, modules, ctx, _live_finding): tgt
                     for tgt in live_targets
                 }
                 for fut in as_completed(futs):
@@ -284,6 +291,7 @@ class ScanEngine:
                 self._threads.pop(scan_id, None)
                 self._executors.pop(scan_id, None)
                 self._clients.pop(scan_id, None)
+                self._last_artifact_write.pop(scan_id, None)
 
     def _ingest_targets(self, config: ScanConfig) -> list[str]:
         raw = []
@@ -380,13 +388,15 @@ class ScanEngine:
         if not findings:
             return
         batch = []
-        for finding in findings:
-            fd = finding.to_dict()
-            fid = fd.get("id") or ""
-            if not fid or fid in persisted_ids:
-                continue
-            persisted_ids.add(fid)
-            batch.append(fd)
+        with self._lock:
+            for finding in findings:
+                fd = finding.to_dict()
+                fid = fd.get("id") or ""
+                if not fid or fid in persisted_ids:
+                    continue
+                persisted_ids.add(fid)
+                batch.append(fd)
+        for fd in batch:
             try:
                 self.store.add_finding(scan_id, fd)
             except Exception:
@@ -398,19 +408,29 @@ class ScanEngine:
                     pass
         if not batch:
             return
-        # Append live hits log + refresh vuln artifact tree for dashboard mid-scan.
-        hits_path = Path(out_dir) / "hits.jsonl"
-        with hits_path.open("a", encoding="utf-8") as fh:
-            for fd in batch:
-                fh.write(json.dumps(fd, ensure_ascii=False) + "\n")
-        try:
-            # Rebuild from DB so dashboard/results stay current while scan runs.
-            existing = self.store.get_findings(scan_id)
-            write_vuln_artifacts(out_dir, existing)
-        except Exception:
-            pass
+        # Serialize artifact writes across worker threads. Rebuild the heavier
+        # vuln tree at most every two seconds; SQLite and WebSocket are immediate.
+        with self._artifact_lock:
+            hits_path = Path(out_dir) / "hits.jsonl"
+            with hits_path.open("a", encoding="utf-8") as fh:
+                for fd in batch:
+                    fh.write(json.dumps(fd, ensure_ascii=False) + "\n")
+            now = time.monotonic()
+            if now - self._last_artifact_write.get(scan_id, 0.0) >= 2.0:
+                try:
+                    existing = self.store.get_findings(scan_id)
+                    write_vuln_artifacts(out_dir, existing)
+                    self._last_artifact_write[scan_id] = now
+                except Exception:
+                    pass
 
-    def _scan_target(self, target: TargetContext, modules: list[Any], ctx: ScanContext) -> list[Finding]:
+    def _scan_target(
+        self,
+        target: TargetContext,
+        modules: list[Any],
+        ctx: ScanContext,
+        on_finding: Optional[Callable[[Finding], None]] = None,
+    ) -> list[Finding]:
         # per-target shallow copy of mutable lists to avoid cross-talk; findings go to local then merge
         local_ctx = ScanContext(
             config=ctx.config,
@@ -437,7 +457,8 @@ class ScanEngine:
             local_ctx.logger = mlog
             mlog.info("module start on %s", target.url)
             try:
-                findings = mod.run(target, local_ctx) or []
+                with stream_findings(on_finding):
+                    findings = mod.run(target, local_ctx) or []
                 out.extend(findings)
                 # share findings for later modules (method tester uses endpoints)
                 local_ctx.findings.extend(findings)

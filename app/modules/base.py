@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Callable, Iterator, Protocol, runtime_checkable
 
 from app.extractors import extract_all
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import safe_filename
+
+_finding_stream = threading.local()
 
 
 @runtime_checkable
@@ -18,6 +22,17 @@ class ScanModule(Protocol):
     def match(self, target: TargetContext) -> bool: ...
 
     def run(self, target: TargetContext, ctx: ScanContext) -> list[Finding]: ...
+
+
+@contextmanager
+def stream_findings(callback: Callable[[Finding], None] | None) -> Iterator[None]:
+    """Stream findings created in one worker thread to live persistence."""
+    previous = getattr(_finding_stream, "callback", None)
+    _finding_stream.callback = callback
+    try:
+        yield
+    finally:
+        _finding_stream.callback = previous
 
 
 def save_evidence(ctx: ScanContext, name: str, content: str | bytes, ext: str = "txt") -> str:
@@ -55,7 +70,7 @@ def finding_from_hit(
     tags: list[str] | None = None,
     validated: bool = False,
 ) -> Finding:
-    return Finding(
+    finding = Finding(
         type=ftype,
         severity=severity,
         target=target.url,
@@ -69,3 +84,11 @@ def finding_from_hit(
         validated=validated,
         tags=tags or [],
     )
+    callback = getattr(_finding_stream, "callback", None)
+    if callback:
+        try:
+            callback(finding)
+        except Exception:
+            # Live reporting must never interrupt the scanner module.
+            pass
+    return finding

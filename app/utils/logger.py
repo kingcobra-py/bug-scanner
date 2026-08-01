@@ -48,18 +48,29 @@ class ScanLogAdapter(logging.LoggerAdapter):
     def hit(self, url: str, conf: float = 0.0, **kwargs) -> None:
         self.info("HIT %s conf=%.2f", url, conf, **kwargs)
 
+    def log(self, level, msg, *args, **kwargs) -> None:
+        if not self.isEnabledFor(level):
+            return
+        event_fields = kwargs.pop("_event_fields", {})
+        super().log(level, msg, *args, **kwargs)
+        try:
+            message = msg % args if args else str(msg)
+        except Exception:
+            message = str(msg)
+        _emit_event(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "level": logging.getLevelName(level),
+                "module": self.extra.get("module", "engine"),
+                "scan_id": self.extra.get("scan_id", "-"),
+                "message": message,
+                **event_fields,
+            }
+        )
+
     def event(self, level: str, message: str, **fields) -> None:
         lvl = getattr(logging, level.upper(), logging.INFO)
-        self.log(lvl, message)
-        payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": level.upper(),
-            "module": self.extra.get("module", "engine"),
-            "scan_id": self.extra.get("scan_id", "-"),
-            "message": message,
-            **fields,
-        }
-        _emit_event(payload)
+        self.log(lvl, message, _event_fields=fields)
 
 
 def setup_root_logger(level: str = "INFO") -> None:

@@ -13,6 +13,9 @@ const state = {
   ws: null,
   pingTimer: null,
   jobsRefreshPending: false,
+  resultsRefreshPending: false,
+  logsRefreshPending: false,
+  resultReloadTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -383,6 +386,11 @@ function connectWs(id) {
   state.ws.onclose = () => {
     $("connState").textContent = "Live channel offline";
     $("connDot").classList.add("offline");
+    if (state.scanId === id) {
+      setTimeout(() => {
+        if (state.scanId === id && (!state.ws || state.ws.readyState === WebSocket.CLOSED)) connectWs(id);
+      }, 2000);
+    }
   };
   state.ws.onmessage = (event) => {
     const message = JSON.parse(event.data);
@@ -394,7 +402,7 @@ function connectWs(id) {
     }
     if (message.type === "finding") {
       state.findings.unshift(message.data);
-      if (state.tab === "results") reloadResults();
+      if (state.tab === "results") scheduleResultsReload();
     }
     if (message.type === "log") {
       state.logs.push(message.data);
@@ -407,11 +415,18 @@ function connectWs(id) {
   }, 15000);
 }
 
+function scheduleResultsReload() {
+  if (state.resultReloadTimer) clearTimeout(state.resultReloadTimer);
+  state.resultReloadTimer = setTimeout(reloadResults, 500);
+}
+
 async function reloadResults() {
   if (!state.scanId) {
     $("resultSummary").innerHTML = '<div class="text-slate-500 text-sm">Select a job first.</div>';
     return;
   }
+  if (state.resultsRefreshPending) return;
+  state.resultsRefreshPending = true;
   try {
     const providerQuery = state.provider ? `?provider=${encodeURIComponent(state.provider)}` : "";
     const [results, findings] = await Promise.all([
@@ -430,6 +445,8 @@ async function reloadResults() {
     renderFindings();
   } catch (error) {
     $("resultSummary").innerHTML = `<div class="text-red-300">${esc(error.message)}</div>`;
+  } finally {
+    state.resultsRefreshPending = false;
   }
 }
 
@@ -544,6 +561,8 @@ async function reloadLogs() {
     $("logs").innerHTML = '<div class="text-slate-500">Select a job first.</div>';
     return;
   }
+  if (state.logsRefreshPending) return;
+  state.logsRefreshPending = true;
   try {
     const params = new URLSearchParams({ limit: "800" });
     if ($("logLevel").value) params.set("level", $("logLevel").value);
@@ -551,6 +570,8 @@ async function reloadLogs() {
     renderLogs();
   } catch (error) {
     $("logs").innerHTML = `<div class="text-red-300">${esc(error.message)}</div>`;
+  } finally {
+    state.logsRefreshPending = false;
   }
 }
 
@@ -600,6 +621,10 @@ async function init() {
   await Promise.all([refreshUploads(), refreshJobs()]);
   if (state.scanId) connectWs(state.scanId);
   setInterval(refreshJobs, 4000);
+  setInterval(() => {
+    if (state.tab === "logs") reloadLogs();
+    if (state.tab === "results") reloadResults();
+  }, 3000);
 }
 
 init();
