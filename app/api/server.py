@@ -130,6 +130,7 @@ class ScanCreate(BaseModel):
     )
     threads: int = 20
     timeout: float = 8.0
+    connect_timeout: float = 0.0
     retries: int = 2
     rate_limit_per_host: float = 50.0
     paths_mode: str = "merge"
@@ -208,8 +209,13 @@ def create_app() -> FastAPI:
             job_name=body.job_name.strip()[:120],
             targets_upload_id=body.targets_upload_id,
             wordlist_upload_id=body.wordlist_upload_id,
-            threads=max(1, min(int(body.threads or 20), 2000)),
+            threads=max(1, min(int(body.threads or 20), 500)),
             timeout=body.timeout,
+            # Dead/filtered hosts dominate large recon lists; failing to
+            # connect quickly (rather than waiting the full read timeout)
+            # is a bigger speed lever than raw thread count. Defaults to
+            # min(timeout, 5s) unless the caller sets it explicitly.
+            connect_timeout=body.connect_timeout or min(body.timeout or 8.0, 5.0),
             retries=body.retries,
             rate_limit_per_host=max(1.0, float(body.rate_limit_per_host or 50.0)),
             modules=body.modules,
@@ -254,6 +260,7 @@ def create_app() -> FastAPI:
                 "wordlist_upload_id": cfg.wordlist_upload_id,
                 "threads": cfg.threads,
                 "timeout": cfg.timeout,
+                "connect_timeout": cfg.connect_timeout,
                 "retries": cfg.retries,
                 "rate_limit_per_host": cfg.rate_limit_per_host,
                 "modules": cfg.modules,

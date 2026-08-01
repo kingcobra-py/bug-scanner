@@ -160,3 +160,36 @@ def test_provider_kind_mapping():
     assert provider_for_kind("unknown_vendor_key") == "generic"
     assert provider_metadata("twilio")["logo"] == "/static/img/providers/twilio.svg"
     assert provider_metadata("sendgrid")["logo"] == "/static/img/providers/sendgrid.png"
+
+
+def test_connect_timeout_defaults_to_fast_dead_host_detection(tmp_path, monkeypatch):
+    # Unreachable/filtered hosts dominate large recon lists. Without this,
+    # every one of them waited a hardcoded 5s to connect regardless of the
+    # user's "Timeout" setting, which only ever bounded the read timeout.
+    monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
+    started = []
+    monkeypatch.setattr(server.engine, "start_async", lambda config: started.append(config))
+    client = TestClient(create_app())
+
+    client.post("/api/scans", json={"targets": ["a.example"], "timeout": 3.0})
+    assert started[-1].connect_timeout == 3.0
+
+    client.post("/api/scans", json={"targets": ["b.example"], "timeout": 20.0})
+    assert started[-1].connect_timeout == 5.0
+
+    client.post("/api/scans", json={"targets": ["c.example"], "timeout": 8.0, "connect_timeout": 1.5})
+    assert started[-1].connect_timeout == 1.5
+
+
+def test_thread_cap_matches_measured_safe_ceiling(tmp_path, monkeypatch):
+    # Live A/B testing showed 800 threads gave *lower* throughput than 300
+    # in this single-process architecture (Python's GIL), and once even made
+    # the dashboard's /stop endpoint hang for 10+ seconds. Threads must stay
+    # capped at a value that keeps the API responsive.
+    monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
+    started = []
+    monkeypatch.setattr(server.engine, "start_async", lambda config: started.append(config))
+    client = TestClient(create_app())
+
+    client.post("/api/scans", json={"targets": ["a.example"], "threads": 5000})
+    assert started[-1].threads == 500
