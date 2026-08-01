@@ -59,19 +59,40 @@ class ScanEngine:
         self.enable_cli_progress = enable_cli_progress
         self._stop_events: dict[str, threading.Event] = {}
         self._threads: dict[str, threading.Thread] = {}
+        self._executors: dict[str, list[ThreadPoolExecutor]] = {}
+        self._clients: dict[str, HttpClient] = {}
         self._lock = threading.Lock()
 
     def stop(self, scan_id: str) -> bool:
         ev = self._stop_events.get(scan_id)
         if not ev:
+            # A server restart can leave a persisted "running" row with no
+            # worker behind it. Mark that orphan stopped instead of leaving an
+            # unresponsive Stop button in the dashboard.
+            row = self.store.get_scan(scan_id)
+            if row and row.get("status") in {"pending", "running", "stopping"}:
+                self.store.update_status(scan_id, "stopped")
+                return True
             return False
         ev.set()
         self.store.update_status(scan_id, "stopping")
+        with self._lock:
+            executors = list(self._executors.get(scan_id, []))
+            client = self._clients.get(scan_id)
+        for executor in executors:
+            executor.shutdown(wait=False, cancel_futures=True)
+        if client:
+            client.close()
         return True
+
+    def is_active(self, scan_id: str) -> bool:
+        thread = self._threads.get(scan_id)
+        return bool(thread and thread.is_alive() and scan_id in self._stop_events)
 
     def start_async(self, config: ScanConfig) -> str:
         t = threading.Thread(target=self.run, args=(config,), daemon=True, name=f"scan-{config.scan_id}")
         with self._lock:
+            self._stop_events[config.scan_id] = threading.Event()
             self._threads[config.scan_id] = t
         t.start()
         return config.scan_id
@@ -80,7 +101,7 @@ class ScanEngine:
         scan_id = config.scan_id
         out_dir = Path(config.output_dir) / scan_id
         out_dir.mkdir(parents=True, exist_ok=True)
-        stop_event = threading.Event()
+        stop_event = self._stop_events.get(scan_id) or threading.Event()
         self._stop_events[scan_id] = stop_event
 
         progress = ProgressManager(enable_cli=self.enable_cli_progress)
@@ -94,6 +115,8 @@ class ScanEngine:
             max_body_bytes=config.max_body_bytes,
             rate_limit_per_host=max(float(getattr(config, "rate_limit_per_host", 50.0) or 50.0), 1.0),
         )
+        with self._lock:
+            self._clients[scan_id] = http
         logger = get_scan_logger(scan_id, out_dir, module="engine", level="DEBUG" if config.verbose else "INFO")
 
         def _log_cb(event: dict) -> None:
@@ -128,7 +151,7 @@ class ScanEngine:
 
         cfg_dict = asdict(config)
         self.store.create_scan(scan_id, cfg_dict, str(out_dir))
-        self.store.update_status(scan_id, "running")
+        self.store.update_status(scan_id, "stopping" if stop_event.is_set() else "running")
         logger.info("scan start id=%s targets=%d threads=%d", scan_id, len(config.targets), config.threads)
 
         ctx = ScanContext(
@@ -155,7 +178,10 @@ class ScanEngine:
                 probe_workers,
                 float(getattr(config, "rate_limit_per_host", 50.0) or 50.0),
             )
-            with ThreadPoolExecutor(max_workers=probe_workers) as probe_pool:
+            probe_pool = ThreadPoolExecutor(max_workers=probe_workers)
+            with self._lock:
+                self._executors.setdefault(scan_id, []).append(probe_pool)
+            try:
                 futs = {
                     probe_pool.submit(self._prepare_target, http, turl, config, progress, logger): turl
                     for turl in targets
@@ -173,6 +199,11 @@ class ScanEngine:
                     if not chosen or not chosen.live:
                         continue
                     live_targets.append(chosen)
+            finally:
+                probe_pool.shutdown(wait=not stop_event.is_set(), cancel_futures=stop_event.is_set())
+                with self._lock:
+                    if probe_pool in self._executors.get(scan_id, []):
+                        self._executors[scan_id].remove(probe_pool)
 
             modules = self._build_modules(config)
             # refine total
@@ -180,7 +211,10 @@ class ScanEngine:
 
             all_findings: list[Finding] = []
             persisted_ids: set[str] = set()
-            with ThreadPoolExecutor(max_workers=max(1, config.threads)) as pool:
+            pool = ThreadPoolExecutor(max_workers=max(1, config.threads))
+            with self._lock:
+                self._executors.setdefault(scan_id, []).append(pool)
+            try:
                 # Target-level parallelism; persist/broadcast findings as each target finishes.
                 futs = {
                     pool.submit(self._scan_target, tgt, modules, ctx): tgt
@@ -202,6 +236,11 @@ class ScanEngine:
                     except Exception as e:
                         logger.error("target failed %s: %s", tgt.url, e)
                         logger.debug(traceback.format_exc())
+            finally:
+                pool.shutdown(wait=not stop_event.is_set(), cancel_futures=stop_event.is_set())
+                with self._lock:
+                    if pool in self._executors.get(scan_id, []):
+                        self._executors[scan_id].remove(pool)
 
             # global extraction pass on collected bodies
             progress.set_current(module="extract")
@@ -240,7 +279,11 @@ class ScanEngine:
             progress.stop()
             remove_log_subscriber(_log_cb)
             http.close()
-            self._stop_events.pop(scan_id, None)
+            with self._lock:
+                self._stop_events.pop(scan_id, None)
+                self._threads.pop(scan_id, None)
+                self._executors.pop(scan_id, None)
+                self._clients.pop(scan_id, None)
 
     def _ingest_targets(self, config: ScanConfig) -> list[str]:
         raw = []

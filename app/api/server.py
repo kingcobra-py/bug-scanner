@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -109,6 +110,11 @@ def create_app() -> FastAPI:
     async def _startup() -> None:
         global _loop
         _loop = asyncio.get_running_loop()
+        # Worker threads do not survive a service restart. Reconcile stale
+        # persisted rows so they can be deleted and never look unstoppable.
+        for scan in store.list_scans(limit=1000, compact=True):
+            if scan.get("status") in {"pending", "running", "stopping"} and not engine.is_active(scan["id"]):
+                store.update_status(scan["id"], "stopped")
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -165,8 +171,8 @@ def create_app() -> FastAPI:
         return {"id": cfg.scan_id, "status": "running"}
 
     @app.get("/api/scans")
-    async def list_scans() -> list[dict[str, Any]]:
-        return store.list_scans()
+    async def list_scans(limit: int = 100, compact: bool = False) -> list[dict[str, Any]]:
+        return store.list_scans(limit=limit, compact=compact)
 
     @app.get("/api/scans/{scan_id}")
     async def get_scan(scan_id: str) -> dict[str, Any]:
@@ -195,7 +201,26 @@ def create_app() -> FastAPI:
     @app.post("/api/scans/{scan_id}/stop")
     async def stop_scan(scan_id: str) -> dict[str, Any]:
         ok = engine.stop(scan_id)
-        return {"stopped": ok, "id": scan_id}
+        if not store.get_scan(scan_id):
+            raise HTTPException(status_code=404, detail="scan not found")
+        return {"stopped": ok, "id": scan_id, "status": store.get_scan(scan_id).get("status")}
+
+    @app.delete("/api/scans/{scan_id}")
+    async def delete_scan(scan_id: str) -> dict[str, Any]:
+        row = store.get_scan(scan_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="scan not found")
+        if engine.is_active(scan_id) or row.get("status") in {"pending", "running", "stopping"}:
+            raise HTTPException(status_code=409, detail="stop the running job before deleting it")
+
+        output_dir = Path(row.get("output_dir") or (ROOT / "output" / "scans" / scan_id)).resolve()
+        scans_root = (ROOT / "output" / "scans").resolve()
+        if output_dir.parent != scans_root or output_dir.name != scan_id:
+            raise HTTPException(status_code=400, detail="invalid scan output path")
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        store.delete_scan(scan_id)
+        return {"deleted": True, "id": scan_id}
 
     async def _save_upload(file: UploadFile, kind: str) -> dict[str, Any]:
         content = await file.read()

@@ -16,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    delete,
     select,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -197,15 +198,28 @@ class ScanStore:
             s.commit()
             return result
 
-    def list_scans(self) -> list[dict[str, Any]]:
+    def list_scans(self, limit: int = 100, compact: bool = False) -> list[dict[str, Any]]:
         with Session(self.engine) as s:
-            rows = s.scalars(select(ScanRow).order_by(ScanRow.created_at.desc())).all()
-            return [self._scan_dict(r) for r in rows]
+            rows = s.scalars(
+                select(ScanRow).order_by(ScanRow.created_at.desc()).limit(max(1, min(limit, 1000)))
+            ).all()
+            return [self._scan_dict(r, compact=compact) for r in rows]
 
     def get_scan(self, scan_id: str) -> Optional[dict[str, Any]]:
         with Session(self.engine) as s:
             row = s.get(ScanRow, scan_id)
             return self._scan_dict(row) if row else None
+
+    def delete_scan(self, scan_id: str) -> bool:
+        with self._lock, Session(self.engine) as s:
+            row = s.get(ScanRow, scan_id)
+            if not row:
+                return False
+            s.execute(delete(FindingRow).where(FindingRow.scan_id == scan_id))
+            s.execute(delete(LogRow).where(LogRow.scan_id == scan_id))
+            s.delete(row)
+            s.commit()
+            return True
 
     def get_findings(
         self,
@@ -257,13 +271,19 @@ class ScanStore:
             return out
 
     @staticmethod
-    def _scan_dict(row: ScanRow) -> dict[str, Any]:
+    def _scan_dict(row: ScanRow, compact: bool = False) -> dict[str, Any]:
+        config = json.loads(row.config_json or "{}")
+        if compact:
+            targets = config.pop("targets", [])
+            custom_paths = config.pop("custom_paths", [])
+            config["target_count"] = len(targets)
+            config["custom_path_count"] = len(custom_paths)
         return {
             "id": row.id,
             "status": row.status,
             "created_at": row.created_at.isoformat() if row.created_at else "",
             "updated_at": row.updated_at.isoformat() if row.updated_at else "",
-            "config": json.loads(row.config_json or "{}"),
+            "config": config,
             "progress": json.loads(row.progress_json or "{}"),
             "summary": json.loads(row.summary_json or "{}"),
             "output_dir": row.output_dir,

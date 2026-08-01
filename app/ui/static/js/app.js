@@ -11,6 +11,7 @@ const state = {
   logs: [],
   ws: null,
   pingTimer: null,
+  jobsRefreshPending: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -235,13 +236,17 @@ async function startJob() {
 }
 
 async function refreshJobs() {
+  if (state.jobsRefreshPending) return;
+  state.jobsRefreshPending = true;
   try {
-    state.jobs = await api("/api/scans");
+    state.jobs = await api("/api/scans?compact=true&limit=100");
     if (!state.scanId && state.jobs.length) state.scanId = state.jobs[0].id;
     renderJobs();
     syncScanSelectors();
   } catch (error) {
     $("jobsGrid").innerHTML = `<div class="text-red-300">${esc(error.message)}</div>`;
+  } finally {
+    state.jobsRefreshPending = false;
   }
 }
 
@@ -270,11 +275,37 @@ function renderJobs() {
       showTab("logs");
     };
   });
-  $("jobsGrid").querySelectorAll(".stop-job").forEach((button) => {
+  $("jobsGrid").querySelectorAll(".job-action").forEach((button) => {
     button.onclick = async () => {
-      if (!confirm("Stop this scan job?")) return;
-      await api(`/api/scans/${encodeURIComponent(button.dataset.id)}/stop`, { method: "POST" });
-      await refreshJobs();
+      const id = button.dataset.id;
+      const action = button.dataset.action;
+      if (action === "stop") {
+        if (!confirm("Stop this job and cancel its server-side scan?")) return;
+        button.disabled = true;
+        button.textContent = "Stopping…";
+        try {
+          const response = await api(`/api/scans/${encodeURIComponent(id)}/stop`, { method: "POST" });
+          if (!response.stopped) throw new Error("The server could not find an active worker for this job.");
+          const job = state.jobs.find((item) => item.id === id);
+          if (job) job.status = response.status || "stopping";
+          renderJobs();
+        } catch (error) {
+          alert(error.message);
+        }
+      } else {
+        if (!confirm("Permanently delete this job, its findings, logs, and files?")) return;
+        button.disabled = true;
+        button.textContent = "Deleting…";
+        try {
+          await api(`/api/scans/${encodeURIComponent(id)}`, { method: "DELETE" });
+          if (state.scanId === id) state.scanId = null;
+          await refreshJobs();
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = "Delete";
+          alert(error.message);
+        }
+      }
     };
   });
 }
@@ -286,10 +317,11 @@ function jobCard(job) {
   const name = config.job_name || `Scan ${job.id}`;
   const modules = config.modules || [];
   const canStop = ["running", "pending"].includes(job.status);
+  const isStopping = job.status === "stopping";
   return `
     <article class="job-card ${esc(job.status)}">
       <div class="job-card-head">
-        <div class="min-w-0"><div class="job-title truncate">${esc(name)}</div><div class="job-id">${esc(job.id)} · ${formatNumber((config.targets || []).length)} targets</div></div>
+        <div class="min-w-0"><div class="job-title truncate">${esc(name)}</div><div class="job-id">${esc(job.id)} · ${formatNumber(config.target_count ?? (config.targets || []).length)} targets</div></div>
         <span class="status-badge ${esc(job.status)}">${esc(job.status)}</span>
       </div>
       <div class="flex justify-between text-[11px] text-slate-500 mt-4 mb-1.5"><span>${pct.toFixed(1)}%</span><span>ETA ${formatEta(progress.eta_seconds)}</span></div>
@@ -304,7 +336,9 @@ function jobCard(job) {
       <div class="text-[11px] text-slate-500 truncate mt-3">${esc(progress.current_module || "idle")} ${progress.current_target ? `@ ${esc(progress.current_target)}` : ""}</div>
       <div class="module-pills">${modules.map((name) => `<span>${esc(name)}</span>`).join("")}</div>
       <div class="flex gap-2 justify-end mt-4">
-        ${canStop ? `<button class="btn-ghost stop-job" data-id="${esc(job.id)}">Stop</button>` : ""}
+        ${isStopping
+          ? '<button class="btn-ghost" disabled>Stopping…</button>'
+          : `<button class="btn-destructive job-action" data-id="${esc(job.id)}" data-action="${canStop ? "stop" : "delete"}">${canStop ? "Stop" : "Delete"}</button>`}
         <button class="btn-ghost view-logs" data-id="${esc(job.id)}">Logs</button>
         <button class="btn-ghost view-results" data-id="${esc(job.id)}">Results →</button>
       </div>
