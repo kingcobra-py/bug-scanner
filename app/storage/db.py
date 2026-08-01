@@ -84,13 +84,21 @@ class ScanStore:
     def __init__(self, db_path: Path | str = "output/scans/scanner.db") -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.engine = create_engine(f"sqlite:///{self.db_path}", future=True)
+        # check_same_thread=False: scan worker threads and the API share this engine.
+        # timeout + WAL keep progress writers from stalling create-job / list APIs.
+        self.engine = create_engine(
+            f"sqlite:///{self.db_path}",
+            future=True,
+            connect_args={"check_same_thread": False, "timeout": 30},
+        )
         Base.metadata.create_all(self.engine)
         # create_all does not add columns to an existing SQLite table.
         with self.engine.begin() as conn:
             columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(scans)")}
             if "archived" not in columns:
                 conn.exec_driver_sql("ALTER TABLE scans ADD COLUMN archived INTEGER DEFAULT 0")
+            conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+            conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         self._lock = threading.Lock()
 
@@ -296,10 +304,12 @@ class ScanStore:
     def _scan_dict(row: ScanRow, compact: bool = False) -> dict[str, Any]:
         config = json.loads(row.config_json or "{}")
         if compact:
-            targets = config.pop("targets", [])
-            custom_paths = config.pop("custom_paths", [])
-            config["target_count"] = len(targets)
-            config["custom_path_count"] = len(custom_paths)
+            targets = config.pop("targets", None)
+            custom_paths = config.pop("custom_paths", None)
+            if targets is not None or "target_count" not in config:
+                config["target_count"] = len(targets or [])
+            if custom_paths is not None or "custom_path_count" not in config:
+                config["custom_path_count"] = len(custom_paths or [])
         return {
             "id": row.id,
             "status": row.status,

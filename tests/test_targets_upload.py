@@ -70,10 +70,14 @@ def test_persistent_upload_library_and_job_reference(tmp_path, monkeypatch):
         },
     )
     assert created.status_code == 200
+    body = created.json()
+    assert body["id"]
     assert started
     assert started[0].targets == ["a.example", "b.example"]
     assert started[0].job_name == "Uploaded scope"
     assert started[0].targets_upload_id == record["id"]
+    pending = client.get("/api/scans", params={"compact": True}).json()
+    assert any(row["id"] == body["id"] and row["config"]["target_count"] == 2 for row in pending)
 
     deleted = client.delete(f"/api/uploads/{record['id']}")
     assert deleted.status_code == 200

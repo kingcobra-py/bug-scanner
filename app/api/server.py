@@ -164,18 +164,21 @@ def create_app() -> FastAPI:
             if not upload or upload.get("kind") != "targets":
                 raise HTTPException(status_code=404, detail="target upload not found")
             try:
-                targets.extend(read_upload_items(upload))
+                # Large target files must not block the asyncio loop — under an
+                # active scan that stalls accept() and the browser shows
+                # "Failed to fetch".
+                targets.extend(await asyncio.to_thread(read_upload_items, upload))
             except (ValueError, FileNotFoundError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not targets:
-            return {"error": "no targets provided"}
+            raise HTTPException(status_code=400, detail="no targets provided")
         custom_paths = list(body.custom_paths)
         if body.wordlist_upload_id:
             upload = store.get_upload(body.wordlist_upload_id)
             if not upload or upload.get("kind") != "wordlist":
                 raise HTTPException(status_code=404, detail="wordlist upload not found")
             try:
-                custom_paths.extend(read_upload_items(upload))
+                custom_paths.extend(await asyncio.to_thread(read_upload_items, upload))
             except (ValueError, FileNotFoundError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         cfg = ScanConfig(
@@ -197,6 +200,35 @@ def create_app() -> FastAPI:
             verbose=body.verbose,
             output_dir=str(ROOT / "output" / "scans"),
         )
+        out_dir = Path(cfg.output_dir) / cfg.scan_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Register the job immediately with a slim config so the Jobs tab can
+        # refresh even if the worker thread is still starting.
+        store.create_scan(
+            cfg.scan_id,
+            {
+                "job_name": cfg.job_name,
+                "targets_upload_id": cfg.targets_upload_id,
+                "wordlist_upload_id": cfg.wordlist_upload_id,
+                "threads": cfg.threads,
+                "timeout": cfg.timeout,
+                "retries": cfg.retries,
+                "rate_limit_per_host": cfg.rate_limit_per_host,
+                "modules": cfg.modules,
+                "paths_mode": cfg.paths_mode,
+                "scope_notes": cfg.scope_notes,
+                "redact_secrets": cfg.redact_secrets,
+                "verify_tls": cfg.verify_tls,
+                "method_test_trace": cfg.method_test_trace,
+                "verbose": cfg.verbose,
+                "output_dir": cfg.output_dir,
+                "scan_id": cfg.scan_id,
+                "target_count": len(cfg.targets),
+                "custom_path_count": len(cfg.custom_paths),
+            },
+            str(out_dir),
+        )
+        store.update_status(cfg.scan_id, "pending")
         engine.start_async(cfg)
         return {"id": cfg.scan_id, "status": "running"}
 

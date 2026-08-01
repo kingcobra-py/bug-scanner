@@ -24,10 +24,23 @@ const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
 })[char]);
 
 async function api(url, options = {}) {
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    const reason = error?.message || "Failed to fetch";
+    throw new Error(
+      `Cannot reach the scanner API (${url}). ${reason}. ` +
+      "Usually the service is restarting or saturated by a large running scan — wait a moment and retry."
+    );
+  }
   let data = null;
   try { data = await response.json(); } catch (_) { data = {}; }
-  if (!response.ok) throw new Error(data.detail || data.error || `Request failed (${response.status})`);
+  const detail = data.detail;
+  const detailText = Array.isArray(detail)
+    ? detail.map((item) => item.msg || JSON.stringify(item)).join("; ")
+    : detail;
+  if (!response.ok) throw new Error(detailText || data.error || `Request failed (${response.status})`);
   return data;
 }
 
@@ -212,7 +225,8 @@ function closeJobModal() {
   $("jobModal").classList.remove("open");
 }
 
-async function startJob() {
+async function startJob(event) {
+  if (event?.preventDefault) event.preventDefault();
   const targetsUploadId = $("jobTargetsUpload").value;
   if (!targetsUploadId) {
     $("jobError").textContent = "Select an uploaded targets file.";
@@ -239,12 +253,14 @@ async function startJob() {
   const button = $("startBtn");
   button.disabled = true;
   button.textContent = "Starting…";
+  $("jobError").textContent = "";
   try {
     const response = await api("/api/scans", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    if (!response?.id) throw new Error("Scanner did not return a job id.");
     state.scanId = response.id;
     closeJobModal();
     showTab("jobs");
@@ -644,6 +660,7 @@ function bindEvents() {
   $("closeJobModal").onclick = closeJobModal;
   $("cancelJob").onclick = closeJobModal;
   $("startBtn").onclick = startJob;
+  $("jobForm").onsubmit = startJob;
   $("jobModal").onclick = (event) => { if (event.target === $("jobModal")) closeJobModal(); };
   $("resultScanSelect").onchange = () => { selectScan($("resultScanSelect").value); reloadResults(); };
   $("logScanSelect").onchange = () => { selectScan($("logScanSelect").value); reloadLogs(); };

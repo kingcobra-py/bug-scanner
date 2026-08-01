@@ -152,7 +152,21 @@ class ScanEngine:
 
         progress.subscribe(_prog_cb)
 
+        # Keep the huge target/path arrays on disk only. Persisting them inside
+        # config_json makes every Jobs poll parse ~175KB+ per scan and holds the
+        # SQLite write lock long enough for dashboard fetch() calls to fail.
+        (out_dir / "targets.txt").write_text(
+            "\n".join(config.targets) + ("\n" if config.targets else ""),
+            encoding="utf-8",
+        )
+        if config.custom_paths:
+            (out_dir / "custom_paths.txt").write_text(
+                "\n".join(config.custom_paths) + "\n",
+                encoding="utf-8",
+            )
         cfg_dict = asdict(config)
+        cfg_dict["target_count"] = len(cfg_dict.pop("targets", []) or [])
+        cfg_dict["custom_path_count"] = len(cfg_dict.pop("custom_paths", []) or [])
         self.store.create_scan(scan_id, cfg_dict, str(out_dir))
         self.store.update_status(scan_id, "stopping" if stop_event.is_set() else "running")
         logger.info("scan start id=%s targets=%d threads=%d", scan_id, len(config.targets), config.threads)

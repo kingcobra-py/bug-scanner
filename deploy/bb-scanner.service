@@ -1,0 +1,19 @@
+[Unit]
+Description=BB Scanner Dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/bb-scanner
+Environment=PATH=/opt/bb-scanner/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/opt/bb-scanner/.venv/bin/python main.py serve --host 0.0.0.0 --port 8080
+Restart=always
+RestartSec=3
+User=root
+# Heavy scans open one HTTP client per worker thread. The default soft
+# limit of 1024 causes accept()/connect() failures that show up in the
+# dashboard as "Failed to fetch" when starting or polling jobs.
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

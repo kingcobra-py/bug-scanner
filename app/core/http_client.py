@@ -93,6 +93,9 @@ class HttpClient:
                 "verify": self.verify_tls,
                 "follow_redirects": False,
                 "headers": self.base_headers,
+                # One client per worker thread; keep pools tiny so large thread
+                # counts cannot exhaust the process file-descriptor limit.
+                "limits": httpx.Limits(max_connections=2, max_keepalive_connections=1),
             }
             if self.proxy:
                 kwargs["proxy"] = self.proxy

@@ -29,6 +29,25 @@ def test_compact_scan_list_omits_large_arrays(tmp_path):
     assert compact["config"]["custom_path_count"] == 2
 
 
+def test_compact_scan_list_keeps_precomputed_counts(tmp_path):
+    store = ScanStore(tmp_path / "scanner.db")
+    store.create_scan(
+        "scan-slim",
+        {
+            "job_name": "Slim job",
+            "modules": ["git"],
+            "target_count": 6343,
+            "custom_path_count": 12,
+        },
+        str(tmp_path / "scan-slim"),
+    )
+
+    compact = store.list_scans(compact=True)[0]
+    assert "targets" not in compact["config"]
+    assert compact["config"]["target_count"] == 6343
+    assert compact["config"]["custom_path_count"] == 12
+
+
 def test_orphaned_running_job_can_be_stopped_and_deleted(tmp_path):
     store = ScanStore(tmp_path / "scanner.db")
     store.create_scan("scan-2", {"targets": ["a.example"]}, str(tmp_path / "scan-2"))
