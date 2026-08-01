@@ -15,6 +15,7 @@ from typing import Any, Callable, Optional
 from app.core.fingerprint import fingerprint_target
 from app.core.http_client import HttpClient
 from app.core.progress import ProgressManager
+from app.core.vuln_artifacts import write_vuln_artifacts
 from app.modules.config_env import ConfigEnvModule
 from app.modules.git_exposure import GitExposureModule
 from app.modules.joomla import JoomlaModule
@@ -363,6 +364,12 @@ class ScanEngine:
                 w.writeheader()
                 for item in findings:
                     w.writerow({k: item.get(k, "") for k in w.fieldnames})
+        vuln_bundle = write_vuln_artifacts(out_dir, findings)
+        summary["vulnerable_host_count"] = vuln_bundle.get("summary", {}).get("vulnerable_host_count", 0)
+        summary["vuln_finding_count"] = vuln_bundle.get("summary", {}).get("vuln_finding_count", 0)
+        summary["vuln_dir"] = vuln_bundle.get("dir", "")
+        report["vulnerable_hosts"] = vuln_bundle.get("vulnerable_hosts", [])
+        report["vulns"] = vuln_bundle.get("summary", {})
         return report
 
     @staticmethod

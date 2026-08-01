@@ -163,12 +163,44 @@ async function reloadResults() {
   const data = await fetch(`/api/scans/${currentScanId}/results`).then((r) => r.json());
   const box = $("resultSummary");
   const sev = data.by_severity || {};
+  const hosts = data.vulnerable_hosts || [];
   box.innerHTML = `
     <div class="stat">Findings <b>${data.finding_count || 0}</b></div>
+    <div class="stat">Vuln hosts <b>${hosts.length}</b></div>
     <div class="stat">Critical <b class="sev-critical">${sev.critical || 0}</b></div>
     <div class="stat">High <b class="sev-high">${sev.high || 0}</b></div>
     <div class="stat">Secrets <b>${(data.secrets || []).length}</b></div>
   `;
+
+  const vulnBody = $("vulnHostsBody");
+  if (!hosts.length) {
+    vulnBody.innerHTML = `<tr><td colspan="5" class="py-3 text-slate-500">No vulnerable hosts yet.</td></tr>`;
+    $("vulnHostDetail").classList.add("hidden");
+  } else {
+    vulnBody.innerHTML = "";
+    hosts.forEach((h) => {
+      const tr = document.createElement("tr");
+      tr.className = "find-row border-t border-slate-800";
+      tr.innerHTML = `
+        <td class="py-2 pr-2 text-cyan-200 font-mono">${escapeHtml(h.host || "")}</td>
+        <td class="py-2 pr-2">${escapeHtml((h.methods || []).join(", "))}</td>
+        <td class="py-2 pr-2">${escapeHtml((h.modules || []).join(", "))}</td>
+        <td class="py-2 pr-2">${escapeHtml((h.severities || []).join(", "))}</td>
+        <td class="py-2">${h.finding_count || 0}</td>`;
+      tr.onclick = () => {
+        const detail = $("vulnHostDetail");
+        detail.classList.remove("hidden");
+        detail.textContent = JSON.stringify(h, null, 2);
+      };
+      vulnBody.appendChild(tr);
+    });
+  }
+
+  const files = data.vuln_files || {};
+  $("vulnFilesInfo").textContent = files.dir
+    ? `Saved under ${files.dir} · env/git/js/wordpress/joomla/react2shell/methods`
+    : "Vuln artifact files will appear after findings land.";
+
   const secretsEl = $("secretsBox");
   const secrets = data.secrets || [];
   if (!secrets.length) {
@@ -291,6 +323,8 @@ $("stopBtn").onclick = stopScan;
 $("exportJson").onclick = () => exportFmt("json");
 $("exportCsv").onclick = () => exportFmt("csv");
 $("exportMd").onclick = () => exportFmt("md");
+$("exportVulns").onclick = () => exportFmt("vulns_csv");
+$("exportHosts").onclick = () => exportFmt("hosts");
 $("refreshResults").onclick = () => { reloadFindings(); reloadResults(); };
 $("targetsReplaceBtn").onclick = () => uploadTargetsFile("replace");
 $("targetsMergeBtn").onclick = () => uploadTargetsFile("merge");

@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.core.engine import ScanEngine
+from app.core.vuln_artifacts import classify_finding, detection_method, host_from_finding, is_vuln_worthy, write_vuln_artifacts
 from app.core.wordlists import save_uploaded_targets, save_uploaded_wordlist
 from app.storage.db import ScanStore
 from app.storage.models import ScanConfig
@@ -203,6 +204,7 @@ def create_app() -> FastAPI:
         by_severity: dict[str, int] = {}
         by_module: dict[str, int] = {}
         secrets: list[dict[str, Any]] = []
+        host_map: dict[str, dict[str, Any]] = {}
         for f in findings:
             sev = f.get("severity") or "info"
             mod = f.get("module") or "unknown"
@@ -220,14 +222,90 @@ def create_app() -> FastAPI:
                         "finding_id": f.get("id"),
                     }
                 )
+            if not is_vuln_worthy(f):
+                continue
+            cats = classify_finding(f)
+            host = host_from_finding(f)
+            method = detection_method(f, cats)
+            bucket = host_map.setdefault(
+                host,
+                {
+                    "host": host,
+                    "methods": set(),
+                    "modules": set(),
+                    "severities": set(),
+                    "finding_count": 0,
+                    "findings": [],
+                },
+            )
+            bucket["methods"].add(method)
+            bucket["modules"].add(mod)
+            bucket["severities"].add(sev)
+            bucket["finding_count"] += 1
+            bucket["findings"].append(
+                {
+                    "method": method,
+                    "module": mod,
+                    "severity": sev,
+                    "title": f.get("title"),
+                    "url": f.get("url"),
+                    "categories": cats,
+                    "confidence": f.get("confidence"),
+                    "id": f.get("id"),
+                }
+            )
+
+        vulnerable_hosts = []
+        for host, bucket in sorted(host_map.items()):
+            vulnerable_hosts.append(
+                {
+                    "host": host,
+                    "methods": sorted(bucket["methods"]),
+                    "modules": sorted(bucket["modules"]),
+                    "severities": sorted(bucket["severities"]),
+                    "finding_count": bucket["finding_count"],
+                    "findings": bucket["findings"],
+                }
+            )
+
+        # Ensure on-disk vulns/ tree exists for older scans / live debugging.
+        out_dir = Path(row.get("output_dir") or (ROOT / "output" / "scans" / scan_id))
+        vuln_files = {}
+        try:
+            bundle = write_vuln_artifacts(out_dir, findings)
+            vuln_files = {
+                "dir": bundle.get("dir"),
+                "summary": bundle.get("summary"),
+            }
+        except Exception:
+            vuln_files = {}
+
         return {
             "scan": row,
             "finding_count": len(findings),
             "by_severity": by_severity,
             "by_module": by_module,
             "secrets": secrets,
+            "vulnerable_hosts": vulnerable_hosts,
+            "vuln_files": vuln_files,
             "findings": findings,
         }
+
+    @app.get("/api/scans/{scan_id}/vulns")
+    async def list_vuln_files(scan_id: str) -> dict[str, Any]:
+        row = store.get_scan(scan_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="scan not found")
+        base = Path(row.get("output_dir") or (ROOT / "output" / "scans" / scan_id)) / "vulns"
+        if not base.exists():
+            findings = store.get_findings(scan_id)
+            write_vuln_artifacts(base.parent, findings)
+        files = []
+        if base.exists():
+            for path in sorted(base.rglob("*")):
+                if path.is_file():
+                    files.append(str(path.relative_to(base)))
+        return {"scan_id": scan_id, "dir": str(base), "files": files}
 
     @app.get("/api/scans/{scan_id}/export/{fmt}")
     async def export_report(scan_id: str, fmt: str) -> FileResponse:
@@ -236,6 +314,10 @@ def create_app() -> FastAPI:
             "json": base / "report.json",
             "md": base / "report.md",
             "csv": base / "findings.csv",
+            "vulns_csv": base / "vulns" / "by_target.csv",
+            "vulns_md": base / "vulns" / "by_target.md",
+            "vulns_json": base / "vulns" / "by_target.json",
+            "hosts": base / "vulns" / "hosts.txt",
         }
         path = mapping.get(fmt)
         if not path or not path.exists():
