@@ -1,0 +1,26 @@
+# Git exposure paths
+/.git/HEAD
+/.git/config
+/.git/index
+/.git/logs/HEAD
+/.git/logs/refs/heads/master
+/.git/logs/refs/heads/main
+/.git/refs/heads/master
+/.git/refs/heads/main
+/.git/COMMIT_EDITMSG
+/.git/description
+/.git/info/exclude
+/.git/objects/
+/.git/
+/git/HEAD
+/git/config
+/.git.bak/HEAD
+/.git.bak/config
+/.gitignore
+/.git.tar
+/.git.tar.gz
+/.git.zip
+/.git.tgz
+/backup.git/HEAD
+/repo.git/HEAD
+/.git/packed-refs

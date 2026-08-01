@@ -1,0 +1,10 @@
+services:
+  bb-scanner:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./output:/app/output
+      - ./config:/app/config
+      - ./wordlists:/app/wordlists
+    command: ["python", "main.py", "serve", "--host", "0.0.0.0", "--port", "8080"]
