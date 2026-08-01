@@ -225,10 +225,10 @@ class ScanStore:
             rows = s.scalars(stmt.limit(max(1, min(limit, 1000)))).all()
             return [self._scan_dict(r, compact=compact) for r in rows]
 
-    def get_scan(self, scan_id: str) -> Optional[dict[str, Any]]:
+    def get_scan(self, scan_id: str, compact: bool = False) -> Optional[dict[str, Any]]:
         with Session(self.engine) as s:
             row = s.get(ScanRow, scan_id)
-            return self._scan_dict(row) if row else None
+            return self._scan_dict(row, compact=compact) if row else None
 
     def delete_scan(self, scan_id: str) -> bool:
         with self._lock, Session(self.engine) as s:
@@ -250,6 +250,37 @@ class ScanStore:
             row.updated_at = datetime.now(timezone.utc)
             s.commit()
             return True
+
+    def slim_stored_summaries(self) -> int:
+        """Rewrite fat legacy summaries that embed full target arrays."""
+        changed = 0
+        with self._lock, Session(self.engine) as s:
+            rows = s.scalars(select(ScanRow)).all()
+            for row in rows:
+                summary = json.loads(row.summary_json or "{}")
+                if "targets" not in summary and "custom_paths" not in summary:
+                    # Still drop oversized progress blobs copied into summary.
+                    if "progress" not in summary and len(row.summary_json or "") < 4096:
+                        continue
+                slim = self._slim_summary(summary)
+                # Keep a compact progress snapshot if present.
+                progress = summary.get("progress")
+                if isinstance(progress, dict):
+                    slim["progress"] = {
+                        key: progress.get(key)
+                        for key in (
+                            "total", "done", "failed", "queued", "hits", "secrets",
+                            "requests", "rps", "percent", "eta_seconds",
+                        )
+                        if key in progress
+                    }
+                new_json = json.dumps(slim)
+                if new_json != (row.summary_json or "{}"):
+                    row.summary_json = new_json
+                    changed += 1
+            if changed:
+                s.commit()
+        return changed
 
     def get_findings(
         self,
@@ -277,6 +308,8 @@ class ScanStore:
                     if q.lower() not in blob:
                         continue
                 out.append(item)
+            # Newest hits first for the Results dashboard.
+            out.sort(key=lambda item: item.get("timestamp") or "", reverse=True)
             return out
 
     def get_logs(self, scan_id: str, level: Optional[str] = None, module: Optional[str] = None, limit: int = 500) -> list[dict[str, Any]]:
@@ -301,8 +334,26 @@ class ScanStore:
             return out
 
     @staticmethod
+    def _slim_summary(summary: dict[str, Any]) -> dict[str, Any]:
+        """Drop bulky fields (full target lists) from dashboard payloads."""
+        slim = {
+            "scan_id": summary.get("scan_id"),
+            "generated_at": summary.get("generated_at"),
+            "finding_count": summary.get("finding_count"),
+            "vuln_finding_count": summary.get("vuln_finding_count"),
+            "by_severity": summary.get("by_severity") or {},
+            "modules": summary.get("modules") or [],
+        }
+        if "target_count" in summary:
+            slim["target_count"] = summary.get("target_count")
+        elif isinstance(summary.get("targets"), list):
+            slim["target_count"] = len(summary.get("targets") or [])
+        return {key: value for key, value in slim.items() if value not in (None, [], {})}
+
+    @staticmethod
     def _scan_dict(row: ScanRow, compact: bool = False) -> dict[str, Any]:
         config = json.loads(row.config_json or "{}")
+        summary = json.loads(row.summary_json or "{}")
         if compact:
             targets = config.pop("targets", None)
             custom_paths = config.pop("custom_paths", None)
@@ -310,6 +361,9 @@ class ScanStore:
                 config["target_count"] = len(targets or [])
             if custom_paths is not None or "custom_path_count" not in config:
                 config["custom_path_count"] = len(custom_paths or [])
+            # Older scans stored the full target list inside summary_json (~175KB).
+            # That alone made Jobs polling ~1MB and caused browser "Failed to fetch".
+            summary = ScanStore._slim_summary(summary)
         return {
             "id": row.id,
             "status": row.status,
@@ -317,7 +371,7 @@ class ScanStore:
             "updated_at": row.updated_at.isoformat() if row.updated_at else "",
             "config": config,
             "progress": json.loads(row.progress_json or "{}"),
-            "summary": json.loads(row.summary_json or "{}"),
+            "summary": summary,
             "output_dir": row.output_dir,
             "archived": bool(row.archived),
         }

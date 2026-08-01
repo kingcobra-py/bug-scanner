@@ -138,7 +138,17 @@ class ScanEngine:
 
         add_log_subscriber(_log_cb)
 
+        # Progress ticks fire on every request. Persist/broadcast at most a few
+        # times per second so SQLite + the asyncio loop stay free for dashboard
+        # API calls (otherwise the UI shows "Failed to fetch" / frozen jobs).
+        last_prog_persist = {"t": 0.0}
+
         def _prog_cb(snap) -> None:
+            now = time.monotonic()
+            force = bool(getattr(snap, "percent", 0) >= 100 or stop_event.is_set())
+            if not force and (now - last_prog_persist["t"]) < 0.5:
+                return
+            last_prog_persist["t"] = now
             data = asdict(snap)
             try:
                 self.store.update_progress(scan_id, data)
@@ -285,7 +295,12 @@ class ScanEngine:
                     except Exception:
                         pass
 
-            report = self._write_reports(out_dir, config, findings_dicts, progress.snapshot())
+            final_snap = progress.snapshot()
+            try:
+                self.store.update_progress(scan_id, asdict(final_snap))
+            except Exception:
+                pass
+            report = self._write_reports(out_dir, config, findings_dicts, final_snap)
             status = "stopped" if stop_event.is_set() else "completed"
             self.store.update_status(scan_id, status)
             self.store.update_summary(scan_id, report.get("summary", {}))
@@ -491,7 +506,8 @@ class ScanEngine:
         summary = {
             "scan_id": config.scan_id,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "targets": config.targets,
+            # Persist counts only — full target arrays bloat Jobs API polls.
+            "target_count": len(config.targets),
             "modules": config.modules,
             "finding_count": len(findings),
             "by_severity": {},

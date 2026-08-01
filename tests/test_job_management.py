@@ -48,6 +48,60 @@ def test_compact_scan_list_keeps_precomputed_counts(tmp_path):
     assert compact["config"]["custom_path_count"] == 12
 
 
+def test_compact_scan_list_slims_fat_summaries(tmp_path):
+    store = ScanStore(tmp_path / "scanner.db")
+    store.create_scan("scan-fat", {"modules": ["git"], "target_count": 2}, str(tmp_path / "scan-fat"))
+    store.update_summary(
+        "scan-fat",
+        {
+            "finding_count": 3,
+            "targets": ["a.example"] * 1000,
+            "by_severity": {"high": 3},
+        },
+    )
+
+    full = store.list_scans(compact=False)[0]
+    compact = store.list_scans(compact=True)[0]
+    assert len(full["summary"]["targets"]) == 1000
+    assert "targets" not in compact["summary"]
+    assert compact["summary"]["finding_count"] == 3
+    assert compact["summary"]["target_count"] == 1000
+    assert store.slim_stored_summaries() >= 1
+    rewritten = store.get_scan("scan-fat", compact=False)
+    assert "targets" not in rewritten["summary"]
+
+
+def test_findings_are_newest_first(tmp_path):
+    store = ScanStore(tmp_path / "scanner.db")
+    store.create_scan("scan-order", {"targets": ["a.example"]}, str(tmp_path / "scan-order"))
+    store.add_finding(
+        "scan-order",
+        {
+            "id": "old",
+            "type": "path",
+            "severity": "low",
+            "target": "https://a.example",
+            "url": "https://a.example/old",
+            "title": "Old hit",
+            "timestamp": "2026-08-01T10:00:00+00:00",
+        },
+    )
+    store.add_finding(
+        "scan-order",
+        {
+            "id": "new",
+            "type": "path",
+            "severity": "high",
+            "target": "https://a.example",
+            "url": "https://a.example/new",
+            "title": "New hit",
+            "timestamp": "2026-08-01T20:00:00+00:00",
+        },
+    )
+    rows = store.get_findings("scan-order")
+    assert [row["id"] for row in rows] == ["new", "old"]
+
+
 def test_orphaned_running_job_can_be_stopped_and_deleted(tmp_path):
     store = ScanStore(tmp_path / "scanner.db")
     store.create_scan("scan-2", {"targets": ["a.example"]}, str(tmp_path / "scan-2"))

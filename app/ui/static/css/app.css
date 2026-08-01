@@ -203,6 +203,7 @@ tr.find-row { transition: background .12s var(--ease); }
 .secret-actions { display: flex; align-items: center; justify-content: flex-end; gap: .4rem; white-space: nowrap; }
 .sensitive-option span { color: #f59e0b; font-size: .65rem; }
 .table-wrap { max-height: 420px; overflow: auto; }
+.hit-time { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: .68rem; color: #94a3b8; white-space: nowrap; }
 table { width: 100%; font-size: .75rem; }
 th { position: sticky; top: 0; z-index: 2; text-align: left; color: #64748b; font-size: .63rem; text-transform: uppercase; letter-spacing: .07em; padding: .65rem .55rem; background: #0b1224; }
 td { padding: .65rem .55rem; border-top: 1px solid rgba(51,65,85,.5); color: #cbd5e1; }

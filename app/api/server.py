@@ -144,6 +144,12 @@ def create_app() -> FastAPI:
         for scan in store.list_scans(limit=1000, compact=True):
             if scan.get("status") in {"pending", "running", "stopping"} and not engine.is_active(scan["id"]):
                 store.update_status(scan["id"], "stopped")
+        # One-time shrink of legacy summary_json rows that still embed the full
+        # target list (those alone made /api/scans compact responses >1MB).
+        try:
+            store.slim_stored_summaries()
+        except Exception:
+            pass
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -370,8 +376,12 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/scans/{scan_id}/results")
-    async def get_results(scan_id: str, provider: Optional[str] = None) -> dict[str, Any]:
-        row = store.get_scan(scan_id)
+    async def get_results(
+        scan_id: str,
+        provider: Optional[str] = None,
+        include_findings: bool = False,
+    ) -> dict[str, Any]:
+        row = store.get_scan(scan_id, compact=True)
         if not row:
             raise HTTPException(status_code=404, detail="scan not found")
         findings = dedupe_findings(store.get_findings(scan_id))
@@ -477,7 +487,7 @@ def create_app() -> FastAPI:
             except Exception:
                 vuln_files = {}
 
-        return {
+        payload = {
             "scan": row,
             "finding_count": len(findings),
             "by_severity": by_severity,
@@ -489,8 +499,12 @@ def create_app() -> FastAPI:
             ],
             "vulnerable_hosts": vulnerable_hosts,
             "vuln_files": vuln_files,
-            "findings": findings,
         }
+        # Findings are loaded via /findings (newest-first). Including them here
+        # duplicated ~0.5MB+ on every Results poll and contributed to fetch failures.
+        if include_findings:
+            payload["findings"] = findings
+        return payload
 
     @app.get("/api/scans/{scan_id}/vulns")
     async def list_vuln_files(scan_id: str) -> dict[str, Any]:

@@ -66,10 +66,20 @@ function formatEta(seconds) {
 function withSearchText(finding) {
   return {
     ...finding,
-    _search: [finding.severity, finding.module, finding.type, finding.title, finding.url]
+    _search: [finding.severity, finding.module, finding.type, finding.title, finding.url, finding.timestamp]
       .join(" ")
       .toLowerCase(),
   };
+}
+
+function formatHitTime(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return String(value).replace("T", " ").replace(/\+.*/, "").slice(0, 19);
+  }
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function showTab(name) {
@@ -357,11 +367,13 @@ function jobCard(job) {
   const modules = config.modules || [];
   const canStop = ["running", "pending"].includes(job.status);
   const isStopping = job.status === "stopping";
+  const isStoppedEarly = job.status === "stopped" && pct > 0 && pct < 100;
+  const statusLabel = isStoppedEarly ? `stopped @ ${pct.toFixed(1)}%` : job.status;
   return `
     <article class="job-card ${esc(job.status)}">
       <div class="job-card-head">
-        <div class="min-w-0"><div class="job-title truncate">${esc(name)}</div><div class="job-id">${esc(job.id)} · ${formatNumber(config.target_count ?? (config.targets || []).length)} targets</div></div>
-        <span class="status-badge ${esc(job.status)}">${esc(job.status)}</span>
+        <div class="min-w-0"><div class="job-title truncate">${esc(name)}</div><div class="job-id">${esc(job.id)} · ${formatNumber(config.target_count ?? (config.targets || []).length)} targets · ${esc(formatHitTime(job.updated_at || job.created_at))}</div></div>
+        <span class="status-badge ${esc(job.status)}" title="${esc(job.status)}">${esc(statusLabel)}</span>
       </div>
       <div class="flex justify-between text-[11px] text-slate-500 mt-4 mb-1.5"><span>${pct.toFixed(1)}%</span><span>ETA ${formatEta(progress.eta_seconds)}</span></div>
       <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
@@ -475,7 +487,7 @@ async function reloadResults() {
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
-    }).map(withSearchText);
+    }).map(withSearchText).sort((a, b) => String(b.timestamp || "").localeCompare(String(a.timestamp || "")));
     renderResults();
     renderFindings();
   } catch (error) {
@@ -573,17 +585,20 @@ function renderFindings() {
     // in the search box no longer re-serializes every row on each keystroke.
     return !query || finding._search.includes(query);
   });
+  // Newest hits stay on top after filtering.
+  matches.sort((a, b) => String(b.timestamp || "").localeCompare(String(a.timestamp || "")));
   const rows = matches.slice(0, FINDINGS_RENDER_CAP);
   $("findingsBody").innerHTML = rows.length ? rows.map((finding, index) => `
     <tr class="find-row finding-row" data-index="${index}">
       <td class="sev-${esc(finding.severity)}">${esc(finding.severity)}</td>
+      <td class="hit-time" title="${esc(finding.timestamp || "")}">${esc(formatHitTime(finding.timestamp))}</td>
       <td>${esc(finding.module)}</td>
       <td class="max-w-[190px] truncate" title="${esc(finding.title)}">${esc(finding.title)}</td>
       <td class="max-w-[210px] truncate font-mono text-cyan-200" title="${esc(finding.url)}">${esc(finding.url)}</td>
-    </tr>`).join("") : '<tr><td colspan="4" class="text-slate-500">No findings for this filter.</td></tr>';
+    </tr>`).join("") : '<tr><td colspan="5" class="text-slate-500">No findings for this filter.</td></tr>';
   $("findingsCount").textContent = matches.length > FINDINGS_RENDER_CAP
-    ? `Showing first ${FINDINGS_RENDER_CAP.toLocaleString()} of ${matches.length.toLocaleString()} — refine your search`
-    : `${matches.length.toLocaleString()} finding${matches.length === 1 ? "" : "s"}`;
+    ? `Showing newest ${FINDINGS_RENDER_CAP.toLocaleString()} of ${matches.length.toLocaleString()} — refine your search`
+    : `${matches.length.toLocaleString()} finding${matches.length === 1 ? "" : "s"} · newest first`;
   state._findingsRows = rows;
 }
 
