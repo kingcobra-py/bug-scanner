@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from app.api import server
 from app.api.server import create_app
-from app.core.providers import provider_for_kind
+from app.core.providers import provider_for_kind, provider_metadata
 from app.core.wordlists import parse_target_lines, save_uploaded_targets
 
 
@@ -85,3 +85,5 @@ def test_provider_kind_mapping():
     assert provider_for_kind("stripe_live") == "stripe"
     assert provider_for_kind("github_token") == "github"
     assert provider_for_kind("unknown_vendor_key") == "generic"
+    assert provider_metadata("twilio")["logo"] == "/static/img/providers/twilio.svg"
+    assert provider_metadata("sendgrid")["logo"] == "/static/img/providers/sendgrid.png"

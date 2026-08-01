@@ -166,7 +166,10 @@
         </div>
         <div class="grid md:grid-cols-2 gap-4">
           <div><label class="label">Path mode</label><select id="pathsMode" class="input"><option value="merge">Merge custom + built-in</option><option value="custom_only">Custom only</option><option value="builtin_only">Built-in only</option></select></div>
-          <div class="flex items-end pb-2"><label class="check-option"><input id="methodTrace" type="checkbox" /> Include HTTP TRACE method test</label></div>
+          <div class="space-y-2">
+            <label class="check-option"><input id="methodTrace" type="checkbox" /> Include HTTP TRACE method test</label>
+            <label class="check-option sensitive-option"><input id="storeFullSecrets" type="checkbox" checked /> Store full API values <span>(sensitive)</span></label>
+          </div>
         </div>
         <label class="label">Authorization / scope notes</label>
         <textarea id="scope" class="input h-20" placeholder="Program name, scope reference, operator notes"></textarea>

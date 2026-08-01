@@ -6,11 +6,11 @@ from typing import Any
 
 
 PROVIDERS: dict[str, dict[str, str]] = {
-    "aws": {"label": "AWS", "color": "#ff9900", "logo": "https://cdn.simpleicons.org/amazonwebservices/ff9900"},
+    "aws": {"label": "AWS", "color": "#ff9900", "logo": "/static/img/providers/aws.svg"},
     "github": {"label": "GitHub", "color": "#f0f6fc", "logo": "https://cdn.simpleicons.org/github/f0f6fc"},
     "gitlab": {"label": "GitLab", "color": "#fc6d26", "logo": "https://cdn.simpleicons.org/gitlab/fc6d26"},
-    "stripe": {"label": "Stripe", "color": "#635bff", "logo": "https://cdn.simpleicons.org/stripe/635bff"},
-    "sendgrid": {"label": "SendGrid", "color": "#1a82e2", "logo": "https://cdn.simpleicons.org/sendgrid/1a82e2"},
+    "stripe": {"label": "Stripe", "color": "#635bff", "logo": "/static/img/providers/stripe.svg"},
+    "sendgrid": {"label": "SendGrid", "color": "#1a82e2", "logo": "/static/img/providers/sendgrid.png"},
     "brevo": {"label": "Brevo", "color": "#0b996e", "logo": "https://cdn.simpleicons.org/brevo/0b996e"},
     "mailgun": {"label": "Mailgun", "color": "#f06b66", "logo": "https://cdn.simpleicons.org/mailgun/f06b66"},
     "postmark": {"label": "Postmark", "color": "#ffde00", "logo": "https://cdn.simpleicons.org/postmark/ffde00"},
@@ -18,8 +18,8 @@ PROVIDERS: dict[str, dict[str, str]] = {
     "openai": {"label": "OpenAI", "color": "#10a37f", "logo": "https://cdn.simpleicons.org/openai/10a37f"},
     "anthropic": {"label": "Anthropic", "color": "#d4a27f", "logo": "https://cdn.simpleicons.org/anthropic/d4a27f"},
     "google": {"label": "Google", "color": "#4285f4", "logo": "https://cdn.simpleicons.org/google/4285f4"},
-    "azure": {"label": "Azure", "color": "#0089d6", "logo": "https://cdn.simpleicons.org/microsoftazure/0089d6"},
-    "twilio": {"label": "Twilio", "color": "#f22f46", "logo": "https://cdn.simpleicons.org/twilio/f22f46"},
+    "azure": {"label": "Azure", "color": "#0089d6", "logo": "/static/img/providers/azure.svg"},
+    "twilio": {"label": "Twilio", "color": "#f22f46", "logo": "/static/img/providers/twilio.svg"},
     "tencent": {"label": "Tencent", "color": "#00a4ff", "logo": "https://cdn.simpleicons.org/tencentqq/00a4ff"},
     "aliyun": {"label": "Alibaba Cloud", "color": "#ff6a00", "logo": "https://cdn.simpleicons.org/alibabacloud/ff6a00"},
     "smtp": {"label": "SMTP", "color": "#22d3ee", "logo": ""},

@@ -36,6 +36,7 @@ class ScanRow(Base):
     progress_json = Column(Text, default="{}")
     summary_json = Column(Text, default="{}")
     output_dir = Column(String(512), default="")
+    archived = Column(Integer, default=0)
 
 
 class FindingRow(Base):
@@ -85,6 +86,11 @@ class ScanStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.engine = create_engine(f"sqlite:///{self.db_path}", future=True)
         Base.metadata.create_all(self.engine)
+        # create_all does not add columns to an existing SQLite table.
+        with self.engine.begin() as conn:
+            columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(scans)")}
+            if "archived" not in columns:
+                conn.exec_driver_sql("ALTER TABLE scans ADD COLUMN archived INTEGER DEFAULT 0")
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         self._lock = threading.Lock()
 
@@ -198,11 +204,17 @@ class ScanStore:
             s.commit()
             return result
 
-    def list_scans(self, limit: int = 100, compact: bool = False) -> list[dict[str, Any]]:
+    def list_scans(
+        self,
+        limit: int = 100,
+        compact: bool = False,
+        include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
         with Session(self.engine) as s:
-            rows = s.scalars(
-                select(ScanRow).order_by(ScanRow.created_at.desc()).limit(max(1, min(limit, 1000)))
-            ).all()
+            stmt = select(ScanRow).order_by(ScanRow.created_at.desc())
+            if not include_archived:
+                stmt = stmt.where(ScanRow.archived == 0)
+            rows = s.scalars(stmt.limit(max(1, min(limit, 1000)))).all()
             return [self._scan_dict(r, compact=compact) for r in rows]
 
     def get_scan(self, scan_id: str) -> Optional[dict[str, Any]]:
@@ -218,6 +230,16 @@ class ScanStore:
             s.execute(delete(FindingRow).where(FindingRow.scan_id == scan_id))
             s.execute(delete(LogRow).where(LogRow.scan_id == scan_id))
             s.delete(row)
+            s.commit()
+            return True
+
+    def archive_scan(self, scan_id: str) -> bool:
+        with self._lock, Session(self.engine) as s:
+            row = s.get(ScanRow, scan_id)
+            if not row:
+                return False
+            row.archived = 1
+            row.updated_at = datetime.now(timezone.utc)
             s.commit()
             return True
 
@@ -287,6 +309,7 @@ class ScanStore:
             "progress": json.loads(row.progress_json or "{}"),
             "summary": json.loads(row.summary_json or "{}"),
             "output_dir": row.output_dir,
+            "archived": bool(row.archived),
         }
 
     @staticmethod

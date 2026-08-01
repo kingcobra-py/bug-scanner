@@ -4,6 +4,7 @@ const state = {
   uploadKind: "targets",
   uploads: [],
   jobs: [],
+  allScans: [],
   scanId: null,
   provider: "",
   results: null,
@@ -207,6 +208,7 @@ async function startJob() {
     rate_limit_per_host: Number($("rateLimit").value || 50),
     paths_mode: $("pathsMode").value,
     method_test_trace: $("methodTrace").checked,
+    redact_secrets: !$("storeFullSecrets").checked,
     scope_notes: $("scope").value,
   };
   if (!body.modules.length) {
@@ -239,8 +241,9 @@ async function refreshJobs() {
   if (state.jobsRefreshPending) return;
   state.jobsRefreshPending = true;
   try {
-    state.jobs = await api("/api/scans?compact=true&limit=100");
-    if (!state.scanId && state.jobs.length) state.scanId = state.jobs[0].id;
+    state.allScans = await api("/api/scans?compact=true&limit=100&include_archived=true");
+    state.jobs = state.allScans.filter((job) => !job.archived);
+    if (!state.scanId && state.allScans.length) state.scanId = state.allScans[0].id;
     renderJobs();
     syncScanSelectors();
   } catch (error) {
@@ -293,12 +296,11 @@ function renderJobs() {
           alert(error.message);
         }
       } else {
-        if (!confirm("Permanently delete this job, its findings, logs, and files?")) return;
+        if (!confirm("Remove this job from Jobs? Its results, findings, and artifacts will be preserved.")) return;
         button.disabled = true;
         button.textContent = "Deleting…";
         try {
           await api(`/api/scans/${encodeURIComponent(id)}`, { method: "DELETE" });
-          if (state.scanId === id) state.scanId = null;
           await refreshJobs();
         } catch (error) {
           button.disabled = false;
@@ -349,11 +351,12 @@ function syncScanSelectors() {
   ["resultScanSelect", "logScanSelect"].forEach((id) => {
     const select = $(id);
     const current = state.scanId || select.value;
-    select.innerHTML = state.jobs.map((job) => {
+    select.innerHTML = state.allScans.map((job) => {
       const name = job.config?.job_name || `Scan ${job.id}`;
-      return `<option value="${esc(job.id)}">${esc(name)} · ${esc(job.status)}</option>`;
+      const suffix = job.archived ? "results preserved" : job.status;
+      return `<option value="${esc(job.id)}">${esc(name)} · ${esc(suffix)}</option>`;
     }).join("");
-    if (state.jobs.some((job) => job.id === current)) select.value = current;
+    if (state.allScans.some((job) => job.id === current)) select.value = current;
   });
 }
 
@@ -477,13 +480,39 @@ function renderProviderFilters(providers) {
 }
 
 function renderSecrets(secrets) {
-  $("secretsBox").innerHTML = secrets.length ? secrets.map((secret) => `
+  const providers = new Map((state.results?.providers || []).map((item) => [item.id, item]));
+  $("secretsBox").innerHTML = secrets.length ? secrets.map((secret, index) => {
+    const provider = providers.get(secret.provider) || {};
+    return `
     <div class="secret-card">
-      <span class="text-amber-300">${esc(secret.kind)}</span>
-      <span class="secret-value" title="${esc(secret.value)}">${esc(secret.value)}</span>
-      <span class="text-slate-500 truncate" title="${esc((secret.sources || []).join("\n"))}">${esc(secret.source_url || "")}</span>
-      <span class="pill">${formatNumber(secret.occurrences)} occurrence${secret.occurrences === 1 ? "" : "s"}</span>
-    </div>`).join("") : '<div class="py-8 text-center text-sm text-slate-500">No extracted secrets for this filter.</div>';
+      <span class="secret-kind">${provider.logo ? `<img src="${esc(provider.logo)}" alt="" />` : ""}<span>${esc(secret.kind)}</span></span>
+      <code class="secret-value">${esc(secret.value)}</code>
+      <span class="text-slate-500 break-all" title="${esc((secret.sources || []).join("\n"))}">${esc(secret.source_url || "")}</span>
+      <span class="secret-actions"><span class="pill">${formatNumber(secret.occurrences)} occurrence${secret.occurrences === 1 ? "" : "s"}</span><button class="btn-ghost copy-secret" data-index="${index}">Copy full value</button></span>
+    </div>`;
+  }).join("") : '<div class="py-8 text-center text-sm text-slate-500">No extracted secrets for this filter.</div>';
+  $("secretsBox").querySelectorAll(".copy-secret").forEach((button) => {
+    button.onclick = async () => {
+      await copyText(String(secrets[Number(button.dataset.index)]?.value || ""));
+      button.textContent = "Copied";
+      setTimeout(() => { button.textContent = "Copy full value"; }, 1200);
+    };
+  });
+}
+
+async function copyText(value) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const input = document.createElement("textarea");
+  input.value = value;
+  input.style.position = "fixed";
+  input.style.opacity = "0";
+  document.body.appendChild(input);
+  input.select();
+  document.execCommand("copy");
+  input.remove();
 }
 
 function renderFindings() {

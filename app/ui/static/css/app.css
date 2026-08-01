@@ -162,12 +162,17 @@ tr.find-row:hover { background: rgba(34, 211, 238, 0.06); cursor: pointer; }
 
 .provider-filters { display: flex; flex-wrap: wrap; gap: .55rem; }
 .provider-chip { display: flex; align-items: center; gap: .45rem; border: 1px solid var(--line); background: rgba(2,6,23,.6); border-radius: 10px; padding: .48rem .7rem; color: #94a3b8; font-size: .75rem; }
-.provider-chip img, .provider-mark { width: 18px; height: 18px; object-fit: contain; }
+.provider-chip img { width: 42px; height: 24px; object-fit: contain; }
+.provider-mark { width: 24px; height: 24px; object-fit: contain; }
 .provider-mark { display: grid; place-items: center; border-radius: 5px; background: rgba(148,163,184,.12); font-size: .58rem; }
 .provider-chip.active { border-color: rgba(34,211,238,.65); background: rgba(34,211,238,.08); color: #cffafe; }
 .provider-chip b { color: #e2e8f0; font-size: .65rem; background: rgba(100,116,139,.15); padding: .08rem .35rem; border-radius: 999px; }
-.secret-card { display: grid; grid-template-columns: 150px minmax(180px,1fr) 1.3fr auto; gap: .75rem; align-items: center; border-top: 1px solid var(--line); padding: .65rem .3rem; font-size: .76rem; }
-.secret-value { color: #6ee7b7; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.secret-card { display: grid; grid-template-columns: 170px minmax(220px,1.4fr) minmax(180px,1fr) auto; gap: .75rem; align-items: center; border-top: 1px solid var(--line); padding: .75rem .3rem; font-size: .76rem; }
+.secret-kind { display: flex; align-items: center; gap: .55rem; color: #fcd34d; min-width: 0; }
+.secret-kind img { width: 40px; height: 24px; object-fit: contain; flex: none; }
+.secret-value { color: #6ee7b7; font-family: monospace; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-all; }
+.secret-actions { display: flex; align-items: center; justify-content: flex-end; gap: .4rem; white-space: nowrap; }
+.sensitive-option span { color: #f59e0b; font-size: .65rem; }
 .table-wrap { max-height: 420px; overflow: auto; }
 table { width: 100%; font-size: .75rem; }
 th { position: sticky; top: 0; z-index: 2; text-align: left; color: #64748b; font-size: .63rem; text-transform: uppercase; letter-spacing: .07em; padding: .65rem .55rem; background: #0b1224; }

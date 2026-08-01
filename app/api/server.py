@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -95,6 +94,7 @@ class ScanCreate(BaseModel):
     custom_paths: list[str] = Field(default_factory=list)
     scope_notes: str = ""
     verify_tls: bool = False
+    redact_secrets: bool = True
     method_test_trace: bool = False
     verbose: bool = False
 
@@ -162,6 +162,7 @@ def create_app() -> FastAPI:
             paths_mode=body.paths_mode,
             custom_paths=list(dict.fromkeys(custom_paths)),
             scope_notes=body.scope_notes,
+            redact_secrets=body.redact_secrets,
             verify_tls=body.verify_tls,
             method_test_trace=body.method_test_trace,
             verbose=body.verbose,
@@ -171,8 +172,16 @@ def create_app() -> FastAPI:
         return {"id": cfg.scan_id, "status": "running"}
 
     @app.get("/api/scans")
-    async def list_scans(limit: int = 100, compact: bool = False) -> list[dict[str, Any]]:
-        return store.list_scans(limit=limit, compact=compact)
+    async def list_scans(
+        limit: int = 100,
+        compact: bool = False,
+        include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
+        return store.list_scans(
+            limit=limit,
+            compact=compact,
+            include_archived=include_archived,
+        )
 
     @app.get("/api/scans/{scan_id}")
     async def get_scan(scan_id: str) -> dict[str, Any]:
@@ -213,14 +222,10 @@ def create_app() -> FastAPI:
         if engine.is_active(scan_id) or row.get("status") in {"pending", "running", "stopping"}:
             raise HTTPException(status_code=409, detail="stop the running job before deleting it")
 
-        output_dir = Path(row.get("output_dir") or (ROOT / "output" / "scans" / scan_id)).resolve()
-        scans_root = (ROOT / "output" / "scans").resolve()
-        if output_dir.parent != scans_root or output_dir.name != scan_id:
-            raise HTTPException(status_code=400, detail="invalid scan output path")
-        if output_dir.exists():
-            shutil.rmtree(output_dir)
-        store.delete_scan(scan_id)
-        return {"deleted": True, "id": scan_id}
+        # "Delete" removes the operational job card only. Findings, logs,
+        # reports, and artifacts remain queryable from Results.
+        store.archive_scan(scan_id)
+        return {"deleted": True, "archived": True, "results_preserved": True, "id": scan_id}
 
     async def _save_upload(file: UploadFile, kind: str) -> dict[str, Any]:
         content = await file.read()
