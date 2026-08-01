@@ -1,3 +1,4 @@
+from app.api.server import read_file_logs
 from app.modules.base import finding_from_hit, stream_findings
 from app.storage.models import TargetContext
 from app.utils.logger import add_log_subscriber, get_scan_logger, remove_log_subscriber
@@ -48,3 +49,22 @@ def test_finding_stream_fires_when_finding_is_created():
         confidence=0.9,
     )
     assert streamed == [finding]
+
+
+def test_file_log_fallback_supports_older_jobs(tmp_path):
+    (tmp_path / "scan.log").write_text(
+        "[2026-08-01 16:00:00] [INFO] [engine] scan started\n"
+        "[2026-08-01 16:00:01] [INFO] [git] HIT https://example.test/.git/HEAD\n"
+        "[2026-08-01 16:00:02] [WARNING] [engine] target timeout\n",
+        encoding="utf-8",
+    )
+
+    rows = read_file_logs(tmp_path, module="git", limit=10)
+    assert rows == [
+        {
+            "timestamp": "2026-08-01 16:00:01",
+            "level": "INFO",
+            "module": "git",
+            "message": "HIT https://example.test/.git/HEAD",
+        }
+    ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -27,6 +28,34 @@ UPLOAD_DIR = ROOT / "output" / "uploads"
 
 store = ScanStore(ROOT / "output" / "scans" / "scanner.db")
 engine = ScanEngine(store=store, enable_cli_progress=False)
+LOG_LINE = re.compile(
+    r"^\[(?P<timestamp>[^\]]+)\]\s+\[(?P<level>[A-Z]+)\]\s+\[(?P<module>[^\]]+)\]\s*(?P<message>.*)$"
+)
+
+
+def read_file_logs(
+    output_dir: str | Path,
+    *,
+    level: Optional[str] = None,
+    module: Optional[str] = None,
+    limit: int = 500,
+) -> list[dict[str, str]]:
+    path = Path(output_dir) / "scan.log"
+    if not path.is_file():
+        return []
+    rows: list[dict[str, str]] = []
+    # Rotating logs are capped at 5 MB, so reading the active file is bounded.
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        match = LOG_LINE.match(line)
+        if not match:
+            continue
+        item = match.groupdict()
+        if level and item["level"] != level.upper():
+            continue
+        if module and item["module"] != module:
+            continue
+        rows.append(item)
+    return rows[-max(1, min(limit, 5000)) :]
 
 
 class ConnectionManager:
@@ -205,7 +234,18 @@ def create_app() -> FastAPI:
         module: Optional[str] = None,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
-        return store.get_logs(scan_id, level=level, module=module, limit=limit)
+        rows = store.get_logs(scan_id, level=level, module=module, limit=limit)
+        if rows:
+            return rows
+        scan = store.get_scan(scan_id)
+        if not scan:
+            raise HTTPException(status_code=404, detail="scan not found")
+        return read_file_logs(
+            scan.get("output_dir") or (ROOT / "output" / "scans" / scan_id),
+            level=level,
+            module=module,
+            limit=limit,
+        )
 
     @app.post("/api/scans/{scan_id}/stop")
     async def stop_scan(scan_id: str) -> dict[str, Any]:
