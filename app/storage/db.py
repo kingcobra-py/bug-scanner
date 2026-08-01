@@ -66,6 +66,18 @@ class LogRow(Base):
     message = Column(Text)
 
 
+class UploadRow(Base):
+    __tablename__ = "uploads"
+    id = Column(String(32), primary_key=True)
+    kind = Column(String(16), index=True)
+    original_name = Column(String(255))
+    stored_path = Column(String(1024), unique=True)
+    item_count = Column(Integer, default=0)
+    size_bytes = Column(Integer, default=0)
+    sha256 = Column(String(64), default="")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class ScanStore:
     def __init__(self, db_path: Path | str = "output/scans/scanner.db") -> None:
         self.db_path = Path(db_path)
@@ -147,6 +159,43 @@ class ScanStore:
                 )
             )
             s.commit()
+
+    def add_upload(self, upload: dict[str, Any]) -> None:
+        with self._lock, Session(self.engine) as s:
+            s.merge(
+                UploadRow(
+                    id=upload["id"],
+                    kind=upload["kind"],
+                    original_name=upload["original_name"],
+                    stored_path=upload["stored_path"],
+                    item_count=int(upload.get("item_count", 0)),
+                    size_bytes=int(upload.get("size_bytes", 0)),
+                    sha256=upload.get("sha256", ""),
+                )
+            )
+            s.commit()
+
+    def list_uploads(self, kind: Optional[str] = None) -> list[dict[str, Any]]:
+        with Session(self.engine) as s:
+            stmt = select(UploadRow).order_by(UploadRow.created_at.desc())
+            if kind:
+                stmt = stmt.where(UploadRow.kind == kind)
+            return [self._upload_dict(row) for row in s.scalars(stmt).all()]
+
+    def get_upload(self, upload_id: str) -> Optional[dict[str, Any]]:
+        with Session(self.engine) as s:
+            row = s.get(UploadRow, upload_id)
+            return self._upload_dict(row) if row else None
+
+    def delete_upload(self, upload_id: str) -> Optional[dict[str, Any]]:
+        with self._lock, Session(self.engine) as s:
+            row = s.get(UploadRow, upload_id)
+            if not row:
+                return None
+            result = self._upload_dict(row)
+            s.delete(row)
+            s.commit()
+            return result
 
     def list_scans(self) -> list[dict[str, Any]]:
         with Session(self.engine) as s:
@@ -237,4 +286,17 @@ class ScanStore:
             "timestamp": row.timestamp,
             "validated": bool(row.validated),
             "tags": json.loads(row.tags_json or "[]"),
+        }
+
+    @staticmethod
+    def _upload_dict(row: UploadRow) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "kind": row.kind,
+            "original_name": row.original_name,
+            "stored_path": row.stored_path,
+            "item_count": row.item_count,
+            "size_bytes": row.size_bytes,
+            "sha256": row.sha256,
+            "created_at": row.created_at.isoformat() if row.created_at else "",
         }

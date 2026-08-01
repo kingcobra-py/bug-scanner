@@ -90,6 +90,9 @@ class ProgressSnapshot:
 @dataclass
 class ScanConfig:
     targets: list[str]
+    job_name: str = ""
+    targets_upload_id: str = ""
+    wordlist_upload_id: str = ""
     threads: int = 20
     timeout: float = 8.0
     connect_timeout: float = 5.0

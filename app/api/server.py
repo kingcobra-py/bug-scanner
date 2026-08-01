@@ -14,10 +14,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.core.engine import ScanEngine
+from app.core.providers import provider_for_kind, provider_metadata
+from app.core.uploads import create_upload, delete_upload_file, read_upload_items
 from app.core.vuln_artifacts import classify_finding, detection_method, host_from_finding, is_vuln_worthy, write_vuln_artifacts
-from app.core.wordlists import save_uploaded_targets, save_uploaded_wordlist
 from app.storage.db import ScanStore
 from app.storage.models import ScanConfig
+from app.utils.dedupe import dedupe_findings, value_hash
 
 ROOT = Path(__file__).resolve().parents[2]
 UI_DIR = ROOT / "app" / "ui"
@@ -78,6 +80,9 @@ engine.on_log = lambda sid, e: _broadcast_threadsafe({"type": "log", "scan_id": 
 class ScanCreate(BaseModel):
     targets: list[str] = Field(default_factory=list)
     targets_text: str = ""
+    job_name: str = ""
+    targets_upload_id: str = ""
+    wordlist_upload_id: str = ""
     modules: list[str] = Field(
         default_factory=lambda: ["git", "js", "config", "path", "methods", "wordpress", "joomla", "react"]
     )
@@ -119,17 +124,37 @@ def create_app() -> FastAPI:
         targets = list(body.targets)
         if body.targets_text:
             targets.extend([ln.strip() for ln in body.targets_text.splitlines() if ln.strip()])
+        if body.targets_upload_id:
+            upload = store.get_upload(body.targets_upload_id)
+            if not upload or upload.get("kind") != "targets":
+                raise HTTPException(status_code=404, detail="target upload not found")
+            try:
+                targets.extend(read_upload_items(upload))
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not targets:
             return {"error": "no targets provided"}
+        custom_paths = list(body.custom_paths)
+        if body.wordlist_upload_id:
+            upload = store.get_upload(body.wordlist_upload_id)
+            if not upload or upload.get("kind") != "wordlist":
+                raise HTTPException(status_code=404, detail="wordlist upload not found")
+            try:
+                custom_paths.extend(read_upload_items(upload))
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         cfg = ScanConfig(
-            targets=targets,
+            targets=list(dict.fromkeys(targets)),
+            job_name=body.job_name.strip()[:120],
+            targets_upload_id=body.targets_upload_id,
+            wordlist_upload_id=body.wordlist_upload_id,
             threads=max(1, min(int(body.threads or 20), 500)),
             timeout=body.timeout,
             retries=body.retries,
             rate_limit_per_host=max(1.0, float(body.rate_limit_per_host or 50.0)),
             modules=body.modules,
             paths_mode=body.paths_mode,
-            custom_paths=body.custom_paths,
+            custom_paths=list(dict.fromkeys(custom_paths)),
             scope_notes=body.scope_notes,
             verify_tls=body.verify_tls,
             method_test_trace=body.method_test_trace,
@@ -172,40 +197,87 @@ def create_app() -> FastAPI:
         ok = engine.stop(scan_id)
         return {"stopped": ok, "id": scan_id}
 
+    async def _save_upload(file: UploadFile, kind: str) -> dict[str, Any]:
+        content = await file.read()
+        try:
+            return create_upload(
+                store,
+                UPLOAD_DIR,
+                kind=kind,  # type: ignore[arg-type]
+                filename=file.filename or f"{kind}.txt",
+                content=content,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/uploads")
+    async def upload_file(
+        file: UploadFile = File(...),
+        kind: str = Form("targets"),
+    ) -> dict[str, Any]:
+        return await _save_upload(file, kind)
+
+    @app.get("/api/uploads")
+    async def list_uploads(kind: Optional[str] = None) -> list[dict[str, Any]]:
+        if kind and kind not in {"targets", "wordlist"}:
+            raise HTTPException(status_code=400, detail="invalid upload kind")
+        rows = store.list_uploads(kind=kind)
+        for row in rows:
+            row["exists"] = Path(row.get("stored_path") or "").is_file()
+        return rows
+
+    @app.get("/api/uploads/{upload_id}")
+    async def get_upload(upload_id: str) -> dict[str, Any]:
+        row = store.get_upload(upload_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="upload not found")
+        try:
+            items = read_upload_items(row)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=410, detail=str(exc)) from exc
+        return {**row, "preview": items[:50], "exists": True}
+
+    @app.delete("/api/uploads/{upload_id}")
+    async def delete_upload(upload_id: str) -> dict[str, Any]:
+        row = store.get_upload(upload_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="upload not found")
+        delete_upload_file(row, UPLOAD_DIR)
+        store.delete_upload(upload_id)
+        return {"deleted": True, "id": upload_id}
+
+    # Backward-compatible upload routes used by older clients.
     @app.post("/api/wordlists/upload")
     async def upload_wordlist(
         file: UploadFile = File(...),
         mode: str = Form("merge"),
     ) -> dict[str, Any]:
-        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        dest = UPLOAD_DIR / (file.filename or "custom_paths.txt")
-        content = await file.read()
-        paths = save_uploaded_wordlist(content, dest)
-        return {"path": str(dest), "count": len(paths), "mode": mode, "paths_preview": paths[:50]}
+        record = await _save_upload(file, "wordlist")
+        return {**record, "mode": mode, "paths_preview": record["preview"]}
 
     @app.post("/api/targets/upload")
     async def upload_targets(file: UploadFile = File(...)) -> dict[str, Any]:
-        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        dest = UPLOAD_DIR / (file.filename or "targets.txt")
-        content = await file.read()
-        targets = save_uploaded_targets(content, dest)
+        record = await _save_upload(file, "targets")
+        targets = read_upload_items(record)
         return {
-            "path": str(dest),
-            "count": len(targets),
+            **record,
+            "path": record["stored_path"],
+            "count": record["item_count"],
             "targets": targets,
             "targets_text": "\n".join(targets),
-            "preview": targets[:50],
         }
 
     @app.get("/api/scans/{scan_id}/results")
-    async def get_results(scan_id: str) -> dict[str, Any]:
+    async def get_results(scan_id: str, provider: Optional[str] = None) -> dict[str, Any]:
         row = store.get_scan(scan_id)
         if not row:
             raise HTTPException(status_code=404, detail="scan not found")
-        findings = store.get_findings(scan_id)
+        findings = dedupe_findings(store.get_findings(scan_id))
         by_severity: dict[str, int] = {}
         by_module: dict[str, int] = {}
         secrets: list[dict[str, Any]] = []
+        secret_index: dict[str, dict[str, Any]] = {}
+        provider_counts: dict[str, int] = {}
         host_map: dict[str, dict[str, Any]] = {}
         for f in findings:
             sev = f.get("severity") or "info"
@@ -214,16 +286,28 @@ def create_app() -> FastAPI:
             by_module[mod] = by_module.get(mod, 0) + 1
             extracted = f.get("extracted") or {}
             for secret in extracted.get("secrets") or []:
-                secrets.append(
-                    {
-                        "kind": secret.get("kind"),
+                kind = secret.get("kind") or "secret"
+                provider_id = provider_for_kind(kind)
+                source_url = secret.get("source_url") or f.get("url")
+                key = f"{provider_id}:{kind}:{value_hash(str(secret.get('value') or ''))}"
+                if key not in secret_index:
+                    secret_index[key] = {
+                        "kind": kind,
+                        "provider": provider_id,
                         "value": secret.get("value"),
-                        "source_url": secret.get("source_url") or f.get("url"),
+                        "source_url": source_url,
+                        "sources": [source_url] if source_url else [],
+                        "occurrences": 1,
                         "module": mod,
                         "title": f.get("title"),
                         "finding_id": f.get("id"),
                     }
-                )
+                    provider_counts[provider_id] = provider_counts.get(provider_id, 0) + 1
+                else:
+                    item = secret_index[key]
+                    item["occurrences"] += 1
+                    if source_url and source_url not in item["sources"]:
+                        item["sources"].append(source_url)
             if not is_vuln_worthy(f):
                 continue
             cats = classify_finding(f)
@@ -257,6 +341,10 @@ def create_app() -> FastAPI:
                 }
             )
 
+        secrets = list(secret_index.values())
+        if provider:
+            secrets = [item for item in secrets if item.get("provider") == provider]
+
         vulnerable_hosts = []
         for host, bucket in sorted(host_map.items()):
             vulnerable_hosts.append(
@@ -288,6 +376,10 @@ def create_app() -> FastAPI:
             "by_severity": by_severity,
             "by_module": by_module,
             "secrets": secrets,
+            "providers": [
+                provider_metadata(provider_id, count)
+                for provider_id, count in sorted(provider_counts.items())
+            ],
             "vulnerable_hosts": vulnerable_hosts,
             "vuln_files": vuln_files,
             "findings": findings,
