@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -148,6 +149,7 @@ class ChunkUploadInit(BaseModel):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="BB Scanner", version="1.0.0")
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
     static_dir = UI_DIR / "static"
     static_dir.mkdir(parents=True, exist_ok=True)
