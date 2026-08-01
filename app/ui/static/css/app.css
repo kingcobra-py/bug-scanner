@@ -36,8 +36,8 @@ body {
   width: 2px;
   height: 2px;
   border-radius: 50%;
-  background: rgba(255,255,255,.75);
-  box-shadow: 0 0 4px rgba(255,255,255,.25);
+  background: rgba(255,255,255,.95);
+  box-shadow: 0 0 5px rgba(255,255,255,.5);
   opacity: 0;
   animation: ashFall var(--duration) linear var(--delay) infinite;
 }
@@ -56,8 +56,8 @@ body {
 .ash-layer i:nth-child(14) { --x: 72vw; --drift: -22px; --duration: 37s; --delay: -14s; }
 @keyframes ashFall {
   0% { transform: translate3d(0, -2vh, 0); opacity: 0; }
-  8% { opacity: .42; }
-  86% { opacity: .28; }
+  8% { opacity: .72; }
+  86% { opacity: .52; }
   100% { transform: translate3d(var(--drift), 105vh, 0); opacity: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
