@@ -42,14 +42,29 @@ class HttpResponse:
 
 
 class HostRateLimiter:
+    """Per-host rate limiting without a single global lock.
+
+    Every HTTP attempt (including redirect hops) calls wait() once. A single
+    shared lock here means hundreds of worker threads hitting completely
+    unrelated hosts still serialize behind each other on every request —
+    measured to reduce effective throughput as thread count grows. Sharding
+    into a fixed number of lock buckets (by host hash) keeps unrelated hosts
+    independent while bounding memory.
+    """
+
+    _SHARDS = 64
+
     def __init__(self, per_host: float = 10.0) -> None:
         self.per_host = max(per_host, 0.1)
-        self._lock = threading.Lock()
+        self._shard_locks = [threading.Lock() for _ in range(self._SHARDS)]
         self._next: dict[str, float] = {}
+
+    def _shard(self, host: str) -> threading.Lock:
+        return self._shard_locks[hash(host) % self._SHARDS]
 
     def wait(self, host: str) -> None:
         min_interval = 1.0 / self.per_host
-        with self._lock:
+        with self._shard(host):
             now = time.monotonic()
             nxt = self._next.get(host, 0.0)
             delay = max(0.0, nxt - now)
