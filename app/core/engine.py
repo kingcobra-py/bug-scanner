@@ -179,9 +179,9 @@ class ScanEngine:
             progress.set_total(max(len(live_targets) * len(modules) * 8, progress.snapshot().total))
 
             all_findings: list[Finding] = []
+            persisted_ids: set[str] = set()
             with ThreadPoolExecutor(max_workers=max(1, config.threads)) as pool:
-                # Process targets sequentially for clearer progress; modules can fan out internally via http threads.
-                # Still use pool for target-level parallelism when many hosts.
+                # Target-level parallelism; persist/broadcast findings as each target finishes.
                 futs = {
                     pool.submit(self._scan_target, tgt, modules, ctx): tgt
                     for tgt in live_targets
@@ -193,6 +193,12 @@ class ScanEngine:
                     try:
                         findings = fut.result()
                         all_findings.extend(findings)
+                        self._persist_findings_live(
+                            scan_id,
+                            findings,
+                            out_dir,
+                            persisted_ids,
+                        )
                     except Exception as e:
                         logger.error("target failed %s: %s", tgt.url, e)
                         logger.debug(traceback.format_exc())
@@ -206,8 +212,13 @@ class ScanEngine:
                 progress.tick(success=True, module="extract")
 
             findings_dicts = dedupe_findings([f.to_dict() for f in all_findings + ctx.findings])
+            # Persist any leftovers not already streamed (dedupe / race edge).
             for fd in findings_dicts:
+                fid = fd.get("id") or ""
+                if fid and fid in persisted_ids:
+                    continue
                 self.store.add_finding(scan_id, fd)
+                persisted_ids.add(fid)
                 if self.on_finding:
                     try:
                         self.on_finding(scan_id, fd)
@@ -315,6 +326,46 @@ class ScanEngine:
         if config.custom_paths and "path" not in enabled and config.paths_mode == "custom_only":
             mods.append(PathBruteforceModule(custom_paths=config.custom_paths, mode="custom_only"))
         return mods
+
+    def _persist_findings_live(
+        self,
+        scan_id: str,
+        findings: list[Finding],
+        out_dir: Path,
+        persisted_ids: set[str],
+    ) -> None:
+        if not findings:
+            return
+        batch = []
+        for finding in findings:
+            fd = finding.to_dict()
+            fid = fd.get("id") or ""
+            if not fid or fid in persisted_ids:
+                continue
+            persisted_ids.add(fid)
+            batch.append(fd)
+            try:
+                self.store.add_finding(scan_id, fd)
+            except Exception:
+                pass
+            if self.on_finding:
+                try:
+                    self.on_finding(scan_id, fd)
+                except Exception:
+                    pass
+        if not batch:
+            return
+        # Append live hits log + refresh vuln artifact tree for dashboard mid-scan.
+        hits_path = Path(out_dir) / "hits.jsonl"
+        with hits_path.open("a", encoding="utf-8") as fh:
+            for fd in batch:
+                fh.write(json.dumps(fd, ensure_ascii=False) + "\n")
+        try:
+            # Rebuild from DB so dashboard/results stay current while scan runs.
+            existing = self.store.get_findings(scan_id)
+            write_vuln_artifacts(out_dir, existing)
+        except Exception:
+            pass
 
     def _scan_target(self, target: TargetContext, modules: list[Any], ctx: ScanContext) -> list[Finding]:
         # per-target shallow copy of mutable lists to avoid cross-talk; findings go to local then merge
