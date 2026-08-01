@@ -87,11 +87,12 @@ class ScanEngine:
         http = HttpClient(
             timeout=config.timeout,
             connect_timeout=config.connect_timeout,
-            retries=2,
+            retries=config.retries,
             verify_tls=config.verify_tls,
             proxy=config.proxy,
             headers=config.headers,
             max_body_bytes=config.max_body_bytes,
+            rate_limit_per_host=max(float(getattr(config, "rate_limit_per_host", 50.0) or 50.0), 1.0),
         )
         logger = get_scan_logger(scan_id, out_dir, module="engine", level="DEBUG" if config.verbose else "INFO")
 
@@ -148,34 +149,30 @@ class ScanEngine:
             progress.start(est)
 
             live_targets: list[TargetContext] = []
-            for turl in targets:
-                if stop_event.is_set():
-                    break
-                progress.set_current(target=turl, module="probe")
-                chosen = self._live_probe(http, turl, config.probe_both_schemes)
-                progress.tick(success=chosen.live, timeout=False, module="probe")
-                if not chosen.live:
-                    logger.warning("target offline/unreachable: %s", turl)
-                    continue
-                # soft404 baseline
-                try:
-                    profile = http.build_soft404_profile(chosen.url)
-                    chosen.soft404_profile = profile
-                    logger.info("soft404 profile host=%s status=%s", chosen.url, profile.get("status"))
-                except Exception as e:
-                    logger.warning("soft404 failed: %s", e)
-                # fingerprint
-                progress.set_current(target=chosen.url, module="fingerprint")
-                fp = fingerprint_target(http, chosen.url)
-                chosen.tech = fp.get("tech", [])
-                chosen.title = fp.get("title", "")
-                chosen.status_code = fp.get("status_code", chosen.status_code)
-                chosen.final_url = fp.get("final_url", chosen.url)
-                chosen.headers = fp.get("headers", {})
-                chosen.meta = fp.get("meta", {})
-                progress.tick(success=True, module="fingerprint")
-                logger.info("fingerprint %s -> %s", chosen.url, ",".join(chosen.tech) or "generic")
-                live_targets.append(chosen)
+            probe_workers = max(1, min(int(config.threads), len(targets) or 1))
+            logger.info(
+                "probe phase workers=%d rate_limit_per_host=%.1f",
+                probe_workers,
+                float(getattr(config, "rate_limit_per_host", 50.0) or 50.0),
+            )
+            with ThreadPoolExecutor(max_workers=probe_workers) as probe_pool:
+                futs = {
+                    probe_pool.submit(self._prepare_target, http, turl, config, progress, logger): turl
+                    for turl in targets
+                }
+                for fut in as_completed(futs):
+                    if stop_event.is_set():
+                        break
+                    turl = futs[fut]
+                    try:
+                        chosen = fut.result()
+                    except Exception as e:
+                        logger.error("probe failed %s: %s", turl, e)
+                        progress.tick(success=False, module="probe")
+                        continue
+                    if not chosen or not chosen.live:
+                        continue
+                    live_targets.append(chosen)
 
             modules = self._build_modules(config)
             # refine total
@@ -242,6 +239,38 @@ class ScanEngine:
                 continue
             raw.append(normalize_target(t))
         return dedupe_strings([t for t in raw if t])
+
+    def _prepare_target(
+        self,
+        http: HttpClient,
+        turl: str,
+        config: ScanConfig,
+        progress: ProgressManager,
+        logger,
+    ) -> Optional[TargetContext]:
+        progress.set_current(target=turl, module="probe")
+        chosen = self._live_probe(http, turl, config.probe_both_schemes)
+        progress.tick(success=chosen.live, timeout=False, module="probe")
+        if not chosen.live:
+            logger.warning("target offline/unreachable: %s", turl)
+            return None
+        try:
+            profile = http.build_soft404_profile(chosen.url)
+            chosen.soft404_profile = profile
+            logger.info("soft404 profile host=%s status=%s", chosen.url, profile.get("status"))
+        except Exception as e:
+            logger.warning("soft404 failed: %s", e)
+        progress.set_current(target=chosen.url, module="fingerprint")
+        fp = fingerprint_target(http, chosen.url)
+        chosen.tech = fp.get("tech", [])
+        chosen.title = fp.get("title", "")
+        chosen.status_code = fp.get("status_code", chosen.status_code)
+        chosen.final_url = fp.get("final_url", chosen.url)
+        chosen.headers = fp.get("headers", {})
+        chosen.meta = fp.get("meta", {})
+        progress.tick(success=True, module="fingerprint")
+        logger.info("fingerprint %s -> %s", chosen.url, ",".join(chosen.tech) or "generic")
+        return chosen
 
     def _live_probe(self, http: HttpClient, url: str, both: bool) -> TargetContext:
         candidates = origin_variants(url) if both else [normalize_target(url)]

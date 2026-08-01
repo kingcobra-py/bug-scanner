@@ -84,6 +84,7 @@ class ScanCreate(BaseModel):
     threads: int = 20
     timeout: float = 8.0
     retries: int = 2
+    rate_limit_per_host: float = 50.0
     paths_mode: str = "merge"
     custom_paths: list[str] = Field(default_factory=list)
     scope_notes: str = ""
@@ -122,9 +123,10 @@ def create_app() -> FastAPI:
             return {"error": "no targets provided"}
         cfg = ScanConfig(
             targets=targets,
-            threads=body.threads,
+            threads=max(1, min(int(body.threads or 20), 500)),
             timeout=body.timeout,
             retries=body.retries,
+            rate_limit_per_host=max(1.0, float(body.rate_limit_per_host or 50.0)),
             modules=body.modules,
             paths_mode=body.paths_mode,
             custom_paths=body.custom_paths,

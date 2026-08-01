@@ -94,6 +94,7 @@ class ScanConfig:
     timeout: float = 8.0
     connect_timeout: float = 5.0
     retries: int = 2
+    rate_limit_per_host: float = 50.0
     modules: list[str] = field(default_factory=lambda: [
         "git", "js", "config", "path", "methods", "wordpress", "joomla", "react", "crawl"
     ])

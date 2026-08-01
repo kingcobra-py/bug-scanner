@@ -287,8 +287,10 @@ async function startScan() {
   const body = {
     targets_text,
     modules: selectedModules(),
-    threads: Number($("threads").value || 20),
+    threads: Number($("threads").value || 50),
     timeout: Number($("timeout").value || 8),
+    retries: Number($("retries").value || 1),
+    rate_limit_per_host: Number($("rateLimit").value || 50),
     paths_mode: $("pathsMode").value,
     custom_paths: customPaths,
     scope_notes: $("scope").value,

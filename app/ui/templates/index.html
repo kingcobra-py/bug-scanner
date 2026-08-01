@@ -39,13 +39,22 @@
           <div class="grid grid-cols-2 gap-3 mt-3">
             <div>
               <label class="label">Threads</label>
-              <input id="threads" type="number" class="input" value="20" />
+              <input id="threads" type="number" class="input" value="50" min="1" max="500" />
             </div>
             <div>
               <label class="label">Timeout (s)</label>
               <input id="timeout" type="number" class="input" value="8" />
             </div>
+            <div>
+              <label class="label">Rate limit / host</label>
+              <input id="rateLimit" type="number" class="input" value="50" min="1" max="500" />
+            </div>
+            <div>
+              <label class="label">Retries</label>
+              <input id="retries" type="number" class="input" value="1" min="0" max="5" />
+            </div>
           </div>
+          <div class="text-xs text-slate-500 mt-1">Threads parallelize probe + scan. Rate limit caps requests per host/sec.</div>
 
           <label class="label mt-3">Modules</label>
           <div id="modules" class="grid grid-cols-2 gap-2 text-sm"></div>

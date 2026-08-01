@@ -70,7 +70,7 @@ class HttpClient:
         headers: Optional[dict[str, str]] = None,
         max_body_bytes: int = 2_097_152,
         max_redirects: int = 5,
-        rate_limit_per_host: float = 10.0,
+        rate_limit_per_host: float = 50.0,
         user_agent: str = DEFAULT_UA,
     ) -> None:
         self.timeout = httpx.Timeout(timeout, connect=connect_timeout)
