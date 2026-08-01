@@ -120,6 +120,9 @@ class ScanEngine:
             max_body_bytes=config.max_body_bytes,
             rate_limit_per_host=max(float(getattr(config, "rate_limit_per_host", 50.0) or 50.0), 1.0),
             on_request=progress.record_request,
+            # Give every worker thread a real chance at a free connection
+            # instead of queuing behind a fixed-size pool.
+            max_connections=max(512, int(config.threads) * 2),
         )
         with self._lock:
             self._clients[scan_id] = http
@@ -353,13 +356,16 @@ class ScanEngine:
         chosen = self._live_probes(http, turl, config.probe_both_schemes)
         progress.tick(success=bool(chosen), timeout=False, module="probe")
         if not chosen:
-            logger.warning("target offline/unreachable: %s", turl)
+            # Fires per dead target — DEBUG only, since bug-bounty target
+            # lists commonly contain millions of unreachable hosts and this
+            # was, by far, the largest source of log volume at scale.
+            logger.debug("target offline/unreachable: %s", turl)
             return []
         for target in chosen:
             try:
                 profile = http.build_soft404_profile(target.url)
                 target.soft404_profile = profile
-                logger.info("soft404 profile host=%s status=%s", target.url, profile.get("status"))
+                logger.debug("soft404 profile host=%s status=%s", target.url, profile.get("status"))
             except Exception as e:
                 logger.warning("soft404 failed: %s", e)
             progress.set_current(target=target.url, module="fingerprint")
@@ -371,7 +377,7 @@ class ScanEngine:
             target.headers = fp.get("headers", {})
             target.meta = fp.get("meta", {})
             progress.tick(success=True, module="fingerprint")
-            logger.info("fingerprint %s -> %s", target.url, ",".join(target.tech) or "generic")
+            logger.debug("fingerprint %s -> %s", target.url, ",".join(target.tech) or "generic")
         return chosen
 
     def _live_probe(self, http: HttpClient, url: str, both: bool) -> TargetContext:
@@ -490,7 +496,9 @@ class ScanEngine:
         )
         out: list[Finding] = []
         log = get_scan_logger(ctx.config.scan_id, ctx.output_dir, module="engine")
-        log.info("target start %s tech=%s", target.url, ",".join(target.tech))
+        # DEBUG only: these fire per target (and per module below), which at
+        # 10M+ targets is the single largest source of log volume/DB writes.
+        log.debug("target start %s tech=%s", target.url, ",".join(target.tech))
         for mod in modules:
             if ctx.stop_event.is_set():
                 break
@@ -500,18 +508,18 @@ class ScanEngine:
             ctx.progress.set_current(target=target.url, module=name)
             mlog = get_scan_logger(ctx.config.scan_id, ctx.output_dir, module=name)
             local_ctx.logger = mlog
-            mlog.info("module start on %s", target.url)
+            mlog.debug("module start on %s", target.url)
             try:
                 with stream_findings(on_finding):
                     findings = mod.run(target, local_ctx) or []
                 out.extend(findings)
                 # share findings for later modules (method tester uses endpoints)
                 local_ctx.findings.extend(findings)
-                mlog.info("module end hits=%d", len(findings))
+                mlog.debug("module end hits=%d", len(findings))
             except Exception as e:
                 mlog.error("module error: %s", e)
                 mlog.debug(traceback.format_exc())
-        log.info("target end %s findings=%d", target.url, len(out))
+        log.debug("target end %s findings=%d", target.url, len(out))
         return out
 
     def _write_reports(self, out_dir: Path, config: ScanConfig, findings: list[dict], snap) -> dict[str, Any]:

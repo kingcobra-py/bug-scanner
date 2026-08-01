@@ -208,7 +208,7 @@ def create_app() -> FastAPI:
             job_name=body.job_name.strip()[:120],
             targets_upload_id=body.targets_upload_id,
             wordlist_upload_id=body.wordlist_upload_id,
-            threads=max(1, min(int(body.threads or 20), 500)),
+            threads=max(1, min(int(body.threads or 20), 2000)),
             timeout=body.timeout,
             retries=body.retries,
             rate_limit_per_host=max(1.0, float(body.rate_limit_per_host or 50.0)),

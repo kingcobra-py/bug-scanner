@@ -73,6 +73,7 @@ class HttpClient:
         rate_limit_per_host: float = 50.0,
         user_agent: str = DEFAULT_UA,
         on_request: Optional[Callable[[], None]] = None,
+        max_connections: int = 512,
     ) -> None:
         self.timeout = httpx.Timeout(timeout, connect=connect_timeout)
         self.retries = retries
@@ -86,14 +87,18 @@ class HttpClient:
         self.on_request = on_request
         self._soft404: dict[str, dict[str, Any]] = {}
         self._soft404_lock = threading.Lock()
+        # Connections must scale with worker threads, or extra threads just
+        # queue behind the pool's semaphore instead of doing real work.
+        max_connections = max(64, min(int(max_connections), 8000))
         kwargs: dict[str, Any] = {
             "timeout": self.timeout,
             "verify": self.verify_tls,
             "follow_redirects": False,
             "headers": self.base_headers,
-            # httpx.Client is thread-safe. One shared pool avoids creating 300
-            # TLS contexts/pools (~29GB observed with 300 per-thread clients).
-            "limits": httpx.Limits(max_connections=512, max_keepalive_connections=64),
+            # httpx.Client is thread-safe. One shared pool avoids creating one
+            # TLS context/pool per worker thread (~29GB observed at 300
+            # threads before this).
+            "limits": httpx.Limits(max_connections=max_connections, max_keepalive_connections=max(64, max_connections // 8)),
         }
         if self.proxy:
             kwargs["proxy"] = self.proxy
@@ -122,6 +127,7 @@ class HttpClient:
         json_body: Any = None,
         allow_redirects: bool = True,
         retry_on_403: bool = True,
+        retries: Optional[int] = None,
     ) -> HttpResponse:
         host = httpx.URL(url).host or ""
         self.limiter.wait(host)
@@ -130,8 +136,9 @@ class HttpClient:
         chain: list[str] = []
         current = url
         method_u = method.upper()
+        max_retries = self.retries if retries is None else max(0, retries)
 
-        for attempt in range(self.retries + 1):
+        for attempt in range(max_retries + 1):
             try:
                 t0 = time.monotonic()
                 resp = self._send(
@@ -168,7 +175,7 @@ class HttpClient:
                     redirected_from=chain,
                     method=method_u,
                 )
-                if resp.status_code in (429, 503) and attempt < self.retries:
+                if resp.status_code in (429, 503) and attempt < max_retries:
                     time.sleep(self.retry_backoff * (2**attempt))
                     continue
                 if resp.status_code == 403 and retry_on_403:
@@ -186,13 +193,13 @@ class HttpClient:
                 return result
             except httpx.TimeoutException as e:
                 last_err = f"timeout:{e.__class__.__name__}"
-                if attempt < self.retries:
+                if attempt < max_retries:
                     time.sleep(self.retry_backoff * (2**attempt))
                     continue
                 return HttpResponse(url=url, status_code=0, headers={}, text="", content=b"", elapsed=0.0, error=last_err, method=method_u)
             except Exception as e:
                 last_err = f"error:{e.__class__.__name__}:{e}"
-                if attempt < self.retries:
+                if attempt < max_retries:
                     time.sleep(self.retry_backoff * (2**attempt))
                     continue
                 return HttpResponse(url=url, status_code=0, headers={}, text="", content=b"", elapsed=0.0, error=last_err, method=method_u)
@@ -297,7 +304,9 @@ class HttpClient:
     def build_soft404_profile(self, base_url: str) -> dict[str, Any]:
         rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
         probe = join_url(base_url, f"/bbscanner-soft404-{rand}")
-        resp = self.get(probe, retry_on_403=False)
+        # This is a synthetic self-check against an already-confirmed-live
+        # host, not a real target request — retrying it just wastes time.
+        resp = self.get(probe, retry_on_403=False, retries=0)
         profile = {
             "status": resp.status_code,
             "length": len(resp.content),
@@ -345,7 +354,11 @@ class HttpClient:
         return html[start + 1 : end].strip()[:200]
 
     def probe_live(self, url: str) -> HttpResponse:
-        return self.get(url)
+        # This is the initial liveness check across the whole target list —
+        # at scale most targets are dead/filtered, so retrying a timeout here
+        # doubles/triples the time wasted on hosts that will never respond.
+        # Real per-path module requests still use the configured retry count.
+        return self.get(url, retries=0)
 
     def test_methods(
         self,

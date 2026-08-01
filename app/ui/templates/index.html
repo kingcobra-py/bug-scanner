@@ -165,7 +165,7 @@
           <div><label class="label">Custom path file</label><select id="jobWordlistUpload" class="input"><option value="">None — built-ins only</option></select></div>
         </div>
         <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <div><label class="label">Threads</label><input id="threads" type="number" class="input" value="100" min="1" max="500" /></div>
+          <div><label class="label" title="I/O-bound worker threads. Higher values help when scanning millions of targets, since most time is spent waiting on the network, not CPU.">Threads</label><input id="threads" type="number" class="input" value="100" min="1" max="2000" /></div>
           <div><label class="label">Timeout</label><input id="timeout" type="number" class="input" value="8" min="1" max="60" /></div>
           <div><label class="label" title="Safety ceiling for repeated requests to the same host; not a guaranteed global speed">Max req/sec / host</label><input id="rateLimit" type="number" class="input" value="50" min="1" max="500" title="Per-host safety ceiling, not global RPS" /></div>
           <div><label class="label">Retries</label><input id="retries" type="number" class="input" value="1" min="0" max="5" /></div>

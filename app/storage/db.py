@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -101,6 +102,75 @@ class ScanStore:
             conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         self._lock = threading.Lock()
+        # A scan can log thousands of lines/sec across hundreds of worker
+        # threads. Committing each one synchronously under a shared lock was
+        # the dominant bottleneck at high thread counts (every request stalls
+        # behind every other thread's disk commit). Logs are now buffered in
+        # memory and flushed in small batches by one background thread, so
+        # add_log() never blocks a scan worker on disk I/O.
+        self._log_queue: queue.Queue[tuple[str, dict[str, Any]] | None] = queue.Queue()
+        self._log_flush_interval = 0.25
+        self._log_flush_batch = 500
+        self._log_counter_lock = threading.Lock()
+        self._log_enqueued = 0
+        self._log_committed = 0
+        self._log_writer = threading.Thread(target=self._log_writer_loop, daemon=True)
+        self._log_writer.start()
+
+    def _log_writer_loop(self) -> None:
+        while True:
+            try:
+                item = self._log_queue.get(timeout=self._log_flush_interval)
+            except queue.Empty:
+                continue
+            if item is None:
+                return
+            batch = [item]
+            while len(batch) < self._log_flush_batch:
+                try:
+                    nxt = self._log_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    self._flush_log_batch(batch)
+                    return
+                batch.append(nxt)
+            self._flush_log_batch(batch)
+
+    def _flush_log_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
+        if not batch:
+            return
+        try:
+            with Session(self.engine) as s:
+                for scan_id, event in batch:
+                    s.add(
+                        LogRow(
+                            scan_id=scan_id,
+                            timestamp=event.get("timestamp", ""),
+                            level=event.get("level", "INFO"),
+                            module=event.get("module", "engine"),
+                            message=event.get("message", ""),
+                        )
+                    )
+                s.commit()
+        except Exception:
+            pass
+        finally:
+            with self._log_counter_lock:
+                self._log_committed += len(batch)
+
+    def flush_logs(self, timeout: float = 5.0) -> None:
+        """Block until every log queued so far has been committed. Used by tests/shutdown."""
+        import time
+
+        with self._log_counter_lock:
+            target = self._log_enqueued
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._log_counter_lock:
+                if self._log_committed >= target:
+                    return
+            time.sleep(0.01)
 
     def create_scan(self, scan_id: str, config: dict[str, Any], output_dir: str) -> None:
         with self._lock, Session(self.engine) as s:
@@ -163,17 +233,11 @@ class ScanStore:
             s.commit()
 
     def add_log(self, scan_id: str, event: dict[str, Any]) -> None:
-        with self._lock, Session(self.engine) as s:
-            s.add(
-                LogRow(
-                    scan_id=scan_id,
-                    timestamp=event.get("timestamp", ""),
-                    level=event.get("level", "INFO"),
-                    module=event.get("module", "engine"),
-                    message=event.get("message", ""),
-                )
-            )
-            s.commit()
+        # Non-blocking: the background writer batches these to avoid
+        # serializing every scan worker thread behind one SQLite commit.
+        with self._log_counter_lock:
+            self._log_enqueued += 1
+        self._log_queue.put((scan_id, event))
 
     def add_upload(self, upload: dict[str, Any]) -> None:
         with self._lock, Session(self.engine) as s:
