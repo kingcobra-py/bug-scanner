@@ -143,9 +143,66 @@ class HttpClient:
     def close(self) -> None:
         self._shared_client.close()
 
-    def _send(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    def _read_body_capped(self, resp: httpx.Response) -> bytes:
+        """Read at most max_body_bytes, then stop.
+
+        httpx's ``resp.content`` (and non-stream ``.request()``) buffer the
+        *entire* response before we can slice it. On a large multi-host scan
+        that meant a handful of fat download/ISO/backup endpoints could push
+        a single worker past 20GB RSS and into the OOM killer, even with
+        max_body_bytes set. Streaming + early close bounds peak body memory
+        to the configured cap per in-flight request.
+        """
+        chunks: list[bytes] = []
+        total = 0
+        limit = max(0, int(self.max_body_bytes))
+        if limit == 0:
+            return b""
+        for chunk in resp.iter_bytes():
+            if total >= limit:
+                break
+            if not chunk:
+                continue
+            need = limit - total
+            if len(chunk) > need:
+                chunks.append(chunk[:need])
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return b"".join(chunks)
+
+    def _send(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        data: Any = None,
+        json_body: Any = None,
+        read_body: bool = True,
+    ) -> tuple[str, int, dict[str, str], bytes, Optional[str]]:
+        """Perform one HTTP exchange with a hard body-size cap.
+
+        Returns ``(final_url, status_code, headers, body, encoding)``.
+        """
         try:
-            return self._shared_client.request(method, url, **kwargs)
+            with self._shared_client.stream(
+                method,
+                url,
+                headers=headers,
+                content=data,
+                json=json_body,
+            ) as resp:
+                status = resp.status_code
+                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                resp_url = str(resp.url)
+                encoding = resp.encoding
+                # Redirect hops only need status/Location; skip body entirely.
+                if read_body and not (300 <= status < 400):
+                    body = self._read_body_capped(resp)
+                else:
+                    body = b""
+                return resp_url, status, resp_headers, body, encoding
         finally:
             # This is a stateless recon scanner hitting a huge number of
             # unrelated hosts, never authenticated/session-based crawling
@@ -162,6 +219,13 @@ class HttpClient:
                     self.on_request()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _decode_body(body: bytes, encoding: Optional[str]) -> str:
+        try:
+            return body.decode(encoding or "utf-8", errors="replace")
+        except Exception:
+            return body.decode("utf-8", errors="replace")
 
     def request(
         self,
@@ -187,53 +251,54 @@ class HttpClient:
         for attempt in range(max_retries + 1):
             try:
                 t0 = time.monotonic()
-                resp = self._send(
+                # _send always skips bodies on 3xx hops and caps every other
+                # body at max_body_bytes, so following redirects never buffers
+                # an unbounded download along the way.
+                resp_url, status, resp_headers, body, encoding = self._send(
                     method_u,
                     current,
                     headers=hdrs,
-                    content=data,
-                    json=json_body,
+                    data=data,
+                    json_body=json_body,
+                    read_body=True,
                 )
-                # manual redirect handling
                 hops = 0
-                while allow_redirects and resp.is_redirect and hops < self.max_redirects:
-                    loc = resp.headers.get("location")
+                while allow_redirects and 300 <= status < 400 and hops < self.max_redirects:
+                    loc = resp_headers.get("location")
                     if not loc:
                         break
-                    chain.append(str(resp.url))
+                    chain.append(resp_url)
                     current = str(httpx.URL(current).join(loc))
                     hops += 1
                     self.limiter.wait(httpx.URL(current).host or "")
-                    resp = self._send(method_u, current, headers=hdrs)
+                    resp_url, status, resp_headers, body, encoding = self._send(
+                        method_u, current, headers=hdrs, read_body=True
+                    )
                 elapsed = time.monotonic() - t0
-                body = resp.content[: self.max_body_bytes]
-                try:
-                    text = body.decode(resp.encoding or "utf-8", errors="replace")
-                except Exception:
-                    text = body.decode("utf-8", errors="replace")
+                text = self._decode_body(body, encoding)
                 result = HttpResponse(
-                    url=str(resp.url),
-                    status_code=resp.status_code,
-                    headers={k.lower(): v for k, v in resp.headers.items()},
+                    url=resp_url,
+                    status_code=status,
+                    headers=resp_headers,
                     text=text,
                     content=body,
                     elapsed=elapsed,
                     redirected_from=chain,
                     method=method_u,
                 )
-                if resp.status_code in (429, 503) and attempt < max_retries:
+                if status in (429, 503) and attempt < max_retries:
                     time.sleep(self.retry_backoff * (2**attempt))
                     continue
-                if resp.status_code == 403 and retry_on_403:
-                    alt = self._retry_403(method_u, str(resp.url), hdrs)
+                if status == 403 and retry_on_403:
+                    alt = self._retry_403(method_u, resp_url, hdrs)
                     if alt and alt.status_code != 403:
                         return alt
                     result.forbidden_but_exists = self._looks_like_forbidden(result)
-                if resp.status_code == 404:
+                if status == 404:
                     alt = self._retry_404_variants(method_u, url, hdrs)
                     if alt and alt.status_code not in (0, 404):
                         return alt
-                profile = self.get_soft404_profile(str(resp.url))
+                profile = self.get_soft404_profile(resp_url)
                 if profile and self.is_soft404(result, profile):
                     result.soft404 = True
                 return result
@@ -263,15 +328,15 @@ class HttpClient:
         for hdr in variants:
             try:
                 self.limiter.wait(httpx.URL(url).host or "")
-                resp = self._send(method, url, headers=hdr)
-                if resp.status_code != 403:
-                    body = resp.content[: self.max_body_bytes]
-                    text = body.decode("utf-8", errors="replace")
+                resp_url, status, resp_headers, body, encoding = self._send(
+                    method, url, headers=hdr, read_body=True
+                )
+                if status != 403:
                     return HttpResponse(
-                        url=str(resp.url),
-                        status_code=resp.status_code,
-                        headers={k.lower(): v for k, v in resp.headers.items()},
-                        text=text,
+                        url=resp_url,
+                        status_code=status,
+                        headers=resp_headers,
+                        text=self._decode_body(body, encoding),
                         content=body,
                         elapsed=0.0,
                         method=method,
@@ -282,14 +347,15 @@ class HttpClient:
         for alt_url in self._path_variants(url):
             try:
                 self.limiter.wait(httpx.URL(alt_url).host or "")
-                resp = self._send(method, alt_url, headers=headers)
-                if resp.status_code not in (403, 404, 0):
-                    body = resp.content[: self.max_body_bytes]
+                resp_url, status, resp_headers, body, encoding = self._send(
+                    method, alt_url, headers=headers, read_body=True
+                )
+                if status not in (403, 404, 0):
                     return HttpResponse(
-                        url=str(resp.url),
-                        status_code=resp.status_code,
-                        headers={k.lower(): v for k, v in resp.headers.items()},
-                        text=body.decode("utf-8", errors="replace"),
+                        url=resp_url,
+                        status_code=status,
+                        headers=resp_headers,
+                        text=self._decode_body(body, encoding),
                         content=body,
                         elapsed=0.0,
                         method=method,
@@ -302,14 +368,15 @@ class HttpClient:
         for alt_url in self._path_variants(url):
             try:
                 self.limiter.wait(httpx.URL(alt_url).host or "")
-                resp = self._send(method, alt_url, headers=headers)
-                if resp.status_code not in (404, 0):
-                    body = resp.content[: self.max_body_bytes]
+                resp_url, status, resp_headers, body, encoding = self._send(
+                    method, alt_url, headers=headers, read_body=True
+                )
+                if status not in (404, 0):
                     return HttpResponse(
-                        url=str(resp.url),
-                        status_code=resp.status_code,
-                        headers={k.lower(): v for k, v in resp.headers.items()},
-                        text=body.decode("utf-8", errors="replace"),
+                        url=resp_url,
+                        status_code=status,
+                        headers=resp_headers,
+                        text=self._decode_body(body, encoding),
                         content=body,
                         elapsed=0.0,
                         method=method,

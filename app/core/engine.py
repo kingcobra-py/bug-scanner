@@ -612,7 +612,7 @@ class ScanEngine:
         inflight: dict[Future, str] = {}
         exhausted = False
         while (inflight or not exhausted) and not stop_event.is_set():
-            while len(inflight) < max_inflight and not exhausted:
+            while len(inflight) < max_inflight and not exhausted and not stop_event.is_set():
                 try:
                     turl = next(targets)
                 except StopIteration:
@@ -622,7 +622,14 @@ class ScanEngine:
                 inflight[future] = turl
             if not inflight:
                 continue
-            done, _ = wait(inflight, return_when=FIRST_COMPLETED)
+            # Timed wait so a Stop request is not blocked behind a single
+            # slow/hung target (which previously kept workers alive and their
+            # RSS pinned for the full HTTP timeout window).
+            done, _ = wait(inflight, timeout=0.5, return_when=FIRST_COMPLETED)
+            if stop_event.is_set():
+                for fut in list(inflight):
+                    fut.cancel()
+                break
             for future in done:
                 turl = inflight.pop(future)
                 try:

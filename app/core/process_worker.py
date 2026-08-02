@@ -192,6 +192,13 @@ def run_worker(
                 logger=logger,
             )
         finally:
+            # Closing the shared client first aborts in-flight socket reads so
+            # stop doesn't leave workers pinned on huge/slow downloads.
+            if stop_event.is_set():
+                try:
+                    http.close()
+                except Exception:
+                    pass
             pool.shutdown(wait=not stop_event.is_set(), cancel_futures=stop_event.is_set())
     except Exception as e:
         logger.error("worker %d failed: %s", worker_id, e)

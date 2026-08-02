@@ -99,3 +99,34 @@ def test_rate_limiter_buckets_stay_bounded_across_many_distinct_hosts():
     # Bounded per shard regardless of how many thousands of distinct hosts
     # were rate-limited over the life of the worker process.
     assert total_entries <= limiter._MAX_ENTRIES_PER_SHARD * limiter._SHARDS
+
+
+class HugeBodyHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        return
+
+    def do_GET(self):
+        # 32 MiB body — large enough that the old ``resp.content[:cap]``
+        # pattern would buffer the whole thing before slicing, and small
+        # enough for a unit test to finish quickly.
+        payload = b"A" * (32 * 1024 * 1024)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def test_huge_response_body_is_hard_capped():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), HugeBodyHandler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    client = HttpClient(timeout=10.0, retries=0, max_body_bytes=4096)
+
+    resp = client.get(base + "/blob")
+    assert resp.status_code == 200
+    assert len(resp.content) == 4096
+    assert resp.content == b"A" * 4096
+
+    client.close()
+    httpd.shutdown()
