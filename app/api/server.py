@@ -49,6 +49,8 @@ LOG_LINE = re.compile(
 
 
 def _is_useless_secret(kind: str, value: str) -> bool:
+    from app.extractors.validators import is_placeholder, looks_like_js_expression
+
     kind_l = (kind or "").lower()
     value_s = value or ""
     if kind_l in IGNORED_SECRET_KINDS or kind_l.startswith("generic"):
@@ -59,6 +61,12 @@ def _is_useless_secret(kind: str, value: str) -> bool:
     if value_s.startswith("eyJ") and value_s.count(".") >= 2:
         return True
     if "google_api" in kind_l or kind_l == "jwt":
+        return True
+    # Stored env rows are ``KEY=VALUE``; reject JS member-expr / placeholder RHS.
+    rhs = value_s.split("=", 1)[1] if kind_l == "env" and "=" in value_s else value_s
+    if looks_like_js_expression(rhs) or is_placeholder(rhs):
+        return True
+    if kind_l == "env" and re.search(r"(?i)^(?:token|keyword[qa]?)=", value_s):
         return True
     return False
 

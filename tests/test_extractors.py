@@ -97,3 +97,21 @@ def test_marker_keys_with_real_credentials_still_flagged():
     assert "env" in kinds
     assert "SuperSecretPassw0rd" in values
     assert "abcdef0123456789ghijklmn" not in values
+
+
+def test_js_member_expr_and_local_placeholders_are_not_env_secrets():
+    # Live Results noise: env-line parser matching JS assignments / WP local .env
+    text = """
+token=_ref.token,
+keywordQ=product.post_title
+keywordA=product.article_number
+WORDPRESS_DB_PASSWORD=wp_local_password
+DB_PASSWORD=N7!vKp9xmQ2xR4sL
+"""
+    secrets = extract_secrets(text, redact_values=False)
+    values = [str(s.get("value")) for s in secrets]
+    assert not any("_ref.token" in v for v in values)
+    assert not any("product.post_title" in v for v in values)
+    assert not any("product.article_number" in v for v in values)
+    assert not any("wp_local_password" in v for v in values)
+    assert any("N7!vKp9xmQ2xR4sL" in v for v in values)

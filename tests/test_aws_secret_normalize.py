@@ -49,3 +49,20 @@ def test_extract_secrets_skips_google_jwt_generic():
     assert "bearer" not in kinds
     assert not any(str(s["value"]).startswith("AIza") for s in secrets)
     assert not any(str(s["value"]).startswith("eyJ") for s in secrets)
+
+
+def test_normalize_drops_js_env_noise_and_local_placeholders():
+    secrets = [
+        {"kind": "env", "value": "token=_ref.token,", "provider": "other"},
+        {"kind": "env", "value": "keywordQ=product.post_title", "provider": "other"},
+        {"kind": "env", "value": "WORDPRESS_DB_PASSWORD=wp_local_password", "provider": "other"},
+        {"kind": "env", "value": "DB_PASSWORD=N7!vKp9xmQ2xR4sL", "provider": "other"},
+        {"kind": "github_token", "value": "ghp_" + ("a" * 36), "provider": "github"},
+    ]
+    out = normalize_result_secrets(secrets)
+    values = [s["value"] for s in out]
+    assert "DB_PASSWORD=N7!vKp9xmQ2xR4sL" in values
+    assert any(s["kind"] == "github_token" for s in out)
+    assert not any("_ref.token" in v for v in values)
+    assert not any("product.post_title" in v for v in values)
+    assert not any("wp_local_password" in v for v in values)

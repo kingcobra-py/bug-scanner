@@ -8,7 +8,13 @@ import re
 from typing import Any
 
 from app.extractors import patterns as P
-from app.extractors.validators import confidence_for, is_placeholder, looks_like_secret, redact
+from app.extractors.validators import (
+    confidence_for,
+    is_placeholder,
+    looks_like_js_expression,
+    looks_like_secret,
+    redact,
+)
 from app.utils.dedupe import value_hash
 
 
@@ -71,7 +77,7 @@ def _looks_like_sentence_or_code(value: str) -> bool:
 _GENERIC_KV_NAMES = {
     "api_key", "apikey", "api-key", "api_token", "token", "access_token",
     "auth_token", "authorization", "key", "secret", "password", "passwd",
-    "bearer", "jwt", "id_token",
+    "bearer", "jwt", "id_token", "keyword", "keywordq", "keyworda",
 }
 
 _KV_MARKERS = (
@@ -84,14 +90,21 @@ _KV_MARKERS = (
 
 def _interesting_kv(key: str, value: str) -> bool:
     key_l = key.strip().lower()
-    if key_l in _NON_SECRET_KEYS or _looks_like_sentence_or_code(value):
+    value = (value or "").strip().strip("'\"")
+    if key_l in _NON_SECRET_KEYS:
         return False
-    if key_l in _GENERIC_KV_NAMES:
+    if key_l in _GENERIC_KV_NAMES or key_l.startswith("keyword"):
         return False
-    # Require a provider/credential-shaped key name — not bare api_key/token.
-    return any(m in key_l for m in _KV_MARKERS) and (
-        looks_like_secret(value, min_len=6) or len(value) >= 8
-    )
+    if _looks_like_sentence_or_code(value) or looks_like_js_expression(value):
+        return False
+    if is_placeholder(value):
+        return False
+    # Require a provider/credential-shaped key name AND a value that actually
+    # looks like a secret. The old ``len >= 8`` escape hatch is what let
+    # ``wp_local_password`` and other low-entropy placeholders through.
+    if not any(m in key_l for m in _KV_MARKERS):
+        return False
+    return looks_like_secret(value, min_len=8)
 
 
 def extract_secrets(text: str, source_url: str = "", redact_values: bool = True) -> list[dict[str, Any]]:
@@ -108,6 +121,10 @@ def extract_secrets(text: str, source_url: str = "", redact_values: bool = True)
             return
         # Drop public Google API keys / JWTs even when they arrive via env/JSON KV.
         if value.startswith("AIza") or (value.startswith("eyJ") and value.count(".") >= 2):
+            return
+        # env rows are stored as KEY=VALUE — validate the RHS too.
+        rhs = value.split("=", 1)[1] if kind_l == "env" and "=" in value else value
+        if looks_like_js_expression(rhs) or is_placeholder(rhs):
             return
         h = value_hash(f"{kind}:{value}:{source_url}")
         if h in seen:
