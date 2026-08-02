@@ -17,14 +17,12 @@ PROVIDERS: dict[str, dict[str, str]] = {
     "slack": {"label": "Slack", "color": "#36c5f0", "logo": "https://cdn.simpleicons.org/slack/36c5f0"},
     "openai": {"label": "OpenAI", "color": "#10a37f", "logo": "https://cdn.simpleicons.org/openai/10a37f"},
     "anthropic": {"label": "Anthropic", "color": "#d4a27f", "logo": "https://cdn.simpleicons.org/anthropic/d4a27f"},
-    "google": {"label": "Google", "color": "#4285f4", "logo": "https://cdn.simpleicons.org/google/4285f4"},
     "azure": {"label": "Azure", "color": "#0089d6", "logo": "/static/img/providers/azure.svg"},
     "twilio": {"label": "Twilio", "color": "#f22f46", "logo": "/static/img/providers/twilio.svg"},
     "tencent": {"label": "Tencent", "color": "#00a4ff", "logo": "https://cdn.simpleicons.org/tencentqq/00a4ff"},
     "aliyun": {"label": "Alibaba Cloud", "color": "#ff6a00", "logo": "https://cdn.simpleicons.org/alibabacloud/ff6a00"},
     "smtp": {"label": "SMTP", "color": "#22d3ee", "logo": ""},
-    "jwt": {"label": "JWT", "color": "#d63aff", "logo": "https://cdn.simpleicons.org/jsonwebtokens/d63aff"},
-    "generic": {"label": "Other API", "color": "#94a3b8", "logo": ""},
+    "other": {"label": "Other", "color": "#94a3b8", "logo": ""},
 }
 
 
@@ -42,20 +40,18 @@ def provider_for_kind(kind: str) -> str:
         ("slack", ("slack",)),
         ("openai", ("openai",)),
         ("anthropic", ("anthropic",)),
-        ("google", ("google", "firebase")),
         ("azure", ("azure",)),
         ("twilio", ("twilio",)),
         ("tencent", ("tencent",)),
         ("aliyun", ("aliyun", "alibaba")),
-        ("jwt", ("jwt",)),
         ("smtp", ("smtp", "mail_", "mail-")),
     )
     for provider, markers in rules:
         if any(marker in value for marker in markers):
             return provider
-    return "generic"
+    return "other"
 
 
 def provider_metadata(provider: str, count: int = 0) -> dict[str, Any]:
-    key = provider if provider in PROVIDERS else "generic"
+    key = provider if provider in PROVIDERS else "other"
     return {"id": key, **PROVIDERS[key], "count": count}

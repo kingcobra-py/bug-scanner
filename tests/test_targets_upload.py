@@ -157,7 +157,7 @@ def test_provider_kind_mapping():
     assert provider_for_kind("aws_access_key") == "aws"
     assert provider_for_kind("stripe_live") == "stripe"
     assert provider_for_kind("github_token") == "github"
-    assert provider_for_kind("unknown_vendor_key") == "generic"
+    assert provider_for_kind("unknown_vendor_key") == "other"
     assert provider_metadata("twilio")["logo"] == "/static/img/providers/twilio.svg"
     assert provider_metadata("sendgrid")["logo"] == "/static/img/providers/sendgrid.png"
 

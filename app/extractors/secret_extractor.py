@@ -67,17 +67,31 @@ def _looks_like_sentence_or_code(value: str) -> bool:
     return bool(re.search(r"[(){};]|=>|function\s*\(", value))
 
 
+# Bare generic names produce endless public "api_key=" / "token=" noise.
+_GENERIC_KV_NAMES = {
+    "api_key", "apikey", "api-key", "api_token", "token", "access_token",
+    "auth_token", "authorization", "key", "secret", "password", "passwd",
+    "bearer", "jwt", "id_token",
+}
+
+_KV_MARKERS = (
+    "aws", "github", "gitlab", "stripe", "sendgrid", "brevo", "mailgun",
+    "postmark", "slack", "openai", "anthropic", "twilio", "azure", "tencent",
+    "aliyun", "smtp", "mail_", "mail-", "password", "passwd", "secret",
+    "private", "credential", "access_key", "secret_key",
+)
+
+
 def _interesting_kv(key: str, value: str) -> bool:
     key_l = key.strip().lower()
     if key_l in _NON_SECRET_KEYS or _looks_like_sentence_or_code(value):
         return False
-    markers = (
-        "key", "token", "secret", "password", "passwd", "auth", "api",
-        "smtp", "mail", "aws", "private", "credential", "bearer",
+    if key_l in _GENERIC_KV_NAMES:
+        return False
+    # Require a provider/credential-shaped key name — not bare api_key/token.
+    return any(m in key_l for m in _KV_MARKERS) and (
+        looks_like_secret(value, min_len=6) or len(value) >= 8
     )
-    # Bare KEY=VALUE / JSON fields only carry a credential when the key name
-    # itself signals one; unconstrained entropy checks flag ordinary strings.
-    return any(m in key_l for m in markers) and (looks_like_secret(value, min_len=6) or len(value) >= 8)
 
 
 def extract_secrets(text: str, source_url: str = "", redact_values: bool = True) -> list[dict[str, Any]]:
@@ -89,7 +103,11 @@ def extract_secrets(text: str, source_url: str = "", redact_values: bool = True)
         value = (value or "").strip().strip("'\"")
         if not value or is_placeholder(value):
             return
-        if kind.startswith("generic") and not looks_like_secret(value):
+        kind_l = (kind or "").lower()
+        if kind_l in P.IGNORED_SECRET_KINDS or kind_l.startswith("generic"):
+            return
+        # Drop public Google API keys / JWTs even when they arrive via env/JSON KV.
+        if value.startswith("AIza") or (value.startswith("eyJ") and value.count(".") >= 2):
             return
         h = value_hash(f"{kind}:{value}:{source_url}")
         if h in seen:

@@ -41,7 +41,8 @@ def test_js_api_and_secrets():
     apis = extract_apis(text, source_url="https://app.example-corp.com/")
     secrets = extract_secrets(text, redact_values=True)
     assert any("/api/v1" in str(a["value"]) or "base_url" == a["kind"] for a in apis)
-    assert any(s["kind"] in ("github_token", "sendgrid", "slack", "generic_api_key") for s in secrets)
+    assert any(s["kind"] in ("github_token", "sendgrid", "slack") for s in secrets)
+    assert not any(s["kind"] in ("generic_api_key", "jwt", "google_api", "bearer") for s in secrets)
     assert not any("your-password" in str(s["value"]) for s in secrets)
 
 
@@ -85,9 +86,14 @@ def test_manifest_and_js_statements_are_not_flagged_as_secrets():
 
 
 def test_marker_keys_with_real_credentials_still_flagged():
-    text = "DB_PASSWORD=SuperSecretPassw0rd!\nAPI_KEY=abcdef0123456789ghijklmn\n"
+    text = (
+        "DB_PASSWORD=SuperSecretPassw0rd!\n"
+        "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+        "api_key=abcdef0123456789ghijklmn\n"  # bare generic — ignored
+    )
     secrets = extract_secrets(text, redact_values=False)
     kinds = {s["kind"] for s in secrets}
     values = " ".join(str(s.get("value")) for s in secrets)
     assert "env" in kinds
-    assert "SuperSecretPassw0rd" in values or "abcdef0123456789" in values
+    assert "SuperSecretPassw0rd" in values
+    assert "abcdef0123456789ghijklmn" not in values

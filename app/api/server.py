@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from app.core.engine import ScanEngine
 from app.core.providers import provider_for_kind, provider_metadata
+from app.extractors.patterns import IGNORED_SECRET_KINDS
 from app.core.uploads import (
     DIRECT_UPLOAD_BYTES,
     complete_chunk_upload,
@@ -47,18 +48,36 @@ LOG_LINE = re.compile(
 )
 
 
+def _is_useless_secret(kind: str, value: str) -> bool:
+    kind_l = (kind or "").lower()
+    value_s = value or ""
+    if kind_l in IGNORED_SECRET_KINDS or kind_l.startswith("generic"):
+        return True
+    # Legacy rows / env KV that still carry public Google keys or JWTs.
+    if value_s.startswith("AIza"):
+        return True
+    if value_s.startswith("eyJ") and value_s.count(".") >= 2:
+        return True
+    if "google_api" in kind_l or kind_l == "jwt":
+        return True
+    return False
+
+
 def normalize_result_secrets(secrets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Prefer ``AKIA...:secret`` pairs and drop duplicate standalone access keys.
 
     Legacy extractors stored pairs as ``access|secret``; normalize those to
     colon form for the Results UI. When both a paired cred and a bare
     ``aws_access_key`` exist for the same access key, keep only the pair.
+    Also strips Google / JWT / generic noise so Results stays high-signal.
     """
     normalized: list[dict[str, Any]] = []
     paired_access: set[str] = set()
     for item in secrets:
         kind = str(item.get("kind") or "")
         value = str(item.get("value") or "")
+        if _is_useless_secret(kind, value):
+            continue
         if "|" in value and (kind.startswith("aws") or value.startswith("AKIA")):
             left, right = value.split("|", 1)
             if left.startswith("AKIA") and right:
