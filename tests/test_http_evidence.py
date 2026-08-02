@@ -32,12 +32,41 @@ def test_save_http_response_writes_full_transcript(tmp_path):
     )
     path = Path(save_http_response(ctx, "config__.env", resp))
     assert path.suffix == ".http"
+    assert "example.test" in path.name
     text = path.read_text(encoding="utf-8")
     assert "GET https://example.test/.env HTTP/1.1" in text
     assert "HTTP/1.1 200" in text
     assert "content-type: text/plain" in text
     assert "AWS_ACCESS_KEY_ID=AKIATEST" in text
     assert path.with_suffix(".txt").exists()
+
+
+def test_save_http_response_does_not_clobber_across_hosts(tmp_path):
+    ctx = _ctx(tmp_path)
+    a = HttpResponse(
+        url="https://alpha.test/.git/config",
+        status_code=200,
+        headers={"content-type": "text/plain"},
+        text='url = https://user:ghp_ALPHATOKEN000000000000000000000000@github.com/a/a.git\n',
+        content=b'url = https://user:ghp_ALPHATOKEN000000000000000000000000@github.com/a/a.git\n',
+        elapsed=0.1,
+        method="GET",
+    )
+    b = HttpResponse(
+        url="https://beta.test/.git/config",
+        status_code=403,
+        headers={"content-type": "text/html"},
+        text="<html>403 Forbidden</html>",
+        content=b"<html>403 Forbidden</html>",
+        elapsed=0.1,
+        method="GET",
+    )
+    path_a = Path(save_http_response(ctx, "git__.git_config", a))
+    path_b = Path(save_http_response(ctx, "git__.git_config", b))
+    assert path_a != path_b
+    assert "ghp_ALPHATOKEN" in path_a.with_suffix(".txt").read_text(encoding="utf-8")
+    assert "403 Forbidden" in path_b.with_suffix(".txt").read_text(encoding="utf-8")
+    assert "ghp_ALPHATOKEN" in path_a.read_text(encoding="utf-8")
 
 
 def test_save_method_responses_bundle(tmp_path):

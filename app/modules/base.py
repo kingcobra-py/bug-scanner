@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Protocol, runtim
 
 from app.extractors import extract_all
 from app.storage.models import Finding, ScanContext, TargetContext
-from app.utils.normalize import safe_filename
+from app.utils.normalize import host_key, safe_filename
 
 if TYPE_CHECKING:
     from app.core.http_client import HttpResponse
@@ -102,18 +102,23 @@ def save_http_response(ctx: ScanContext, name: str, resp: "HttpResponse") -> str
     Persist the full HTTP response for a vuln/hit.
 
     Writes:
-      - ``{name}.http`` — request line, status, headers, body (text)
-      - ``{name}.bin`` — raw bytes when the body looks binary
-      - ``{name}.txt`` — raw text body companion for quick grepping
+      - ``{host}_{name}.http`` — request line, status, headers, body (text)
+      - ``{host}_{name}.bin`` — raw bytes when the body looks binary
+      - ``{host}_{name}.txt`` — raw text body companion for quick grepping
     Returns the path to the ``.http`` transcript (used as ``raw_ref``).
+
+    Evidence names are host-prefixed so concurrent targets probing the same
+    path (e.g. ``/.git/config``, ``/.env``) do not clobber each other's bodies.
     """
-    http_path = save_evidence(ctx, name, format_http_response(resp), ext="http")
+    host = host_key(resp.url or "")
+    keyed = f"{host}_{name}" if host else name
+    http_path = save_evidence(ctx, keyed, format_http_response(resp), ext="http")
     if resp.content and not _is_probably_text(resp):
-        save_evidence(ctx, name, resp.content, ext="bin")
+        save_evidence(ctx, keyed, resp.content, ext="bin")
     elif resp.text:
-        save_evidence(ctx, name, resp.text, ext="txt")
+        save_evidence(ctx, keyed, resp.text, ext="txt")
     elif resp.content:
-        save_evidence(ctx, name, resp.content, ext="bin")
+        save_evidence(ctx, keyed, resp.content, ext="bin")
     return http_path
 
 
