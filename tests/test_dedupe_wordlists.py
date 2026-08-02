@@ -36,3 +36,14 @@ def test_merge_paths_modes():
     built = merge_paths(custom, mode="builtin_only", builtin_kinds=["git"])
     assert "/.git/HEAD" in built
     assert "/admin" not in built
+
+
+def test_common_builtins_include_extended_default_paths():
+    # Path module uses builtin_kinds=["common"], which must include both the
+    # short common_sensitive list and the extended default_paths wordlist.
+    built = merge_paths([], mode="builtin_only", builtin_kinds=["common"])
+    assert "/admin" in built
+    assert "/.env" in built or "/wp-config.php" in built
+    assert "/secrets/secrets.env" in built or "/secrets/apikeys.txt" in built
+    assert "/config/aws/prod/config.json" in built
+    assert len(built) > 10_000

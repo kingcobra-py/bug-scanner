@@ -38,17 +38,21 @@ def dedupe_paths(paths: Iterable[str]) -> list[str]:
 
 
 def builtin_paths(kinds: Iterable[str] | None = None) -> list[str]:
-    mapping = {
-        "git": WORDLIST_DIR / "git.txt",
-        "js": WORDLIST_DIR / "js_paths.txt",
-        "config": WORDLIST_DIR / "config_env.txt",
-        "common": WORDLIST_DIR / "common_sensitive.txt",
+    mapping: dict[str, list[Path]] = {
+        "git": [WORDLIST_DIR / "git.txt"],
+        "js": [WORDLIST_DIR / "js_paths.txt"],
+        "config": [WORDLIST_DIR / "config_env.txt"],
+        # common_sensitive + large default discovery set used by the path module
+        "common": [
+            WORDLIST_DIR / "common_sensitive.txt",
+            WORDLIST_DIR / "default_paths.txt",
+        ],
     }
     selected = list(kinds) if kinds else list(mapping.keys())
     paths: list[str] = []
     for kind in selected:
-        if kind in mapping:
-            paths.extend(load_wordlist(mapping[kind]))
+        for path in mapping.get(kind, []):
+            paths.extend(load_wordlist(path))
     return dedupe_paths(paths)
 
 
