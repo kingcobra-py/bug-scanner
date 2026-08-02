@@ -708,16 +708,6 @@ async function copyText(value) {
   input.remove();
 }
 
-$("secretsBox").addEventListener("click", async (event) => {
-  const button = event.target.closest(".copy-secret");
-  if (!button) return;
-  const secret = state._secrets?.[Number(button.dataset.index)];
-  if (!secret) return;
-  await copyText(String(secret.value || ""));
-  button.textContent = "Copied";
-  setTimeout(() => { button.textContent = "Copy full value"; }, 1200);
-});
-
 async function reloadLogs() {
   if (!state.scanId) {
     $("logs").innerHTML = '<div class="text-slate-500">Select a job first.</div>';
@@ -779,34 +769,72 @@ async function purgeSelectedJob() {
   }
 }
 
+function on(id, event, handler) {
+  const el = $(id);
+  if (!el) return;
+  el[event] = handler;
+}
+
 function bindEvents() {
-  document.querySelectorAll(".nav-tab").forEach((button) => button.onclick = () => showTab(button.dataset.tab));
-  $("uploadBtn").onclick = uploadFile;
-  $("refreshUploads").onclick = refreshUploads;
-  $("createJobBtn").onclick = openJobModal;
-  $("openJobFromUploads").onclick = openJobModal;
-  $("closeJobModal").onclick = closeJobModal;
-  $("cancelJob").onclick = closeJobModal;
-  $("startBtn").onclick = startJob;
-  $("jobForm").onsubmit = startJob;
-  $("jobModal").onclick = (event) => { if (event.target === $("jobModal")) closeJobModal(); };
-  $("resultScanSelect").onchange = () => { selectScan($("resultScanSelect").value); reloadResults(); };
-  $("logScanSelect").onchange = () => { selectScan($("logScanSelect").value); reloadLogs(); };
-  $("refreshResults").onclick = () => reloadResults(true);
-  $("purgeResults").onclick = purgeSelectedJob;
-  $("logLevel").onchange = reloadLogs;
-  $("clearLogs").onclick = () => { $("logs").innerHTML = ""; };
-  $("exportJson").onclick = () => exportFormat("json");
-  $("exportCsv").onclick = () => exportFormat("csv");
-  $("exportVulns").onclick = () => exportFormat("vulns_csv");
-  $("exportHosts").onclick = () => exportFormat("hosts");
+  document.querySelectorAll(".nav-tab").forEach((button) => {
+    button.onclick = () => showTab(button.dataset.tab);
+  });
+  on("uploadBtn", "onclick", uploadFile);
+  on("refreshUploads", "onclick", refreshUploads);
+  on("createJobBtn", "onclick", openJobModal);
+  on("openJobFromUploads", "onclick", openJobModal);
+  on("closeJobModal", "onclick", closeJobModal);
+  on("cancelJob", "onclick", closeJobModal);
+  on("startBtn", "onclick", startJob);
+  on("jobForm", "onsubmit", startJob);
+  on("jobModal", "onclick", (event) => {
+    if (event.target === $("jobModal")) closeJobModal();
+  });
+  on("resultScanSelect", "onchange", () => {
+    selectScan($("resultScanSelect").value);
+    reloadResults();
+  });
+  on("logScanSelect", "onchange", () => {
+    selectScan($("logScanSelect").value);
+    reloadLogs();
+  });
+  on("refreshResults", "onclick", () => reloadResults(true));
+  on("purgeResults", "onclick", purgeSelectedJob);
+  on("logLevel", "onchange", reloadLogs);
+  on("clearLogs", "onclick", () => {
+    if ($("logs")) $("logs").innerHTML = "";
+  });
+  on("exportJson", "onclick", () => exportFormat("json"));
+  on("exportCsv", "onclick", () => exportFormat("csv"));
+  on("exportVulns", "onclick", () => exportFormat("vulns_csv"));
+  on("exportHosts", "onclick", () => exportFormat("hosts"));
+  const secretsBox = $("secretsBox");
+  if (secretsBox) {
+    secretsBox.addEventListener("click", async (event) => {
+      const button = event.target.closest(".copy-secret");
+      if (!button) return;
+      const secret = state._secrets?.[Number(button.dataset.index)];
+      if (!secret) return;
+      await copyText(String(secret.value || ""));
+      button.textContent = "Copied";
+      setTimeout(() => { button.textContent = "Copy full value"; }, 1200);
+    });
+  }
 }
 
 async function init() {
-  initModules();
-  setupUploadDropzone();
-  bindEvents();
-  await Promise.all([refreshUploads(), refreshJobs()]);
+  try {
+    initModules();
+    setupUploadDropzone();
+    bindEvents();
+  } catch (error) {
+    console.error("UI bootstrap failed", error);
+  }
+  try {
+    await Promise.all([refreshUploads(), refreshJobs()]);
+  } catch (error) {
+    console.error("Initial data load failed", error);
+  }
   if (state.scanId) connectWs(state.scanId);
   setInterval(refreshJobs, 4000);
   setInterval(() => {

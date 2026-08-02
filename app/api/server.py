@@ -209,7 +209,23 @@ def create_app() -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
         html = (UI_DIR / "templates" / "index.html").read_text(encoding="utf-8")
-        return HTMLResponse(html)
+        # Bust browser caches whenever JS/CSS change — a stale app.js that still
+        # bound removed Results DOM nodes was crashing init() and freezing tabs.
+        asset_version = "1"
+        try:
+            asset_version = str(
+                int(max(
+                    (UI_DIR / "static" / "js" / "app.js").stat().st_mtime,
+                    (UI_DIR / "static" / "css" / "app.css").stat().st_mtime,
+                ))
+            )
+        except Exception:
+            pass
+        html = html.replace("__ASSET_VERSION__", asset_version)
+        return HTMLResponse(
+            html,
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
     @app.get("/api/health")
     async def health() -> dict[str, str]:
