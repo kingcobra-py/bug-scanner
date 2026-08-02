@@ -7,6 +7,7 @@ import random
 import string
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 from urllib.parse import quote
@@ -53,22 +54,36 @@ class HostRateLimiter:
     """
 
     _SHARDS = 64
+    _MAX_ENTRIES_PER_SHARD = 5_000
 
     def __init__(self, per_host: float = 10.0) -> None:
         self.per_host = max(per_host, 0.1)
         self._shard_locks = [threading.Lock() for _ in range(self._SHARDS)]
-        self._next: dict[str, float] = {}
+        # One OrderedDict per shard (not one shared dict) so eviction in a
+        # busy shard never has to scan/compete with the timestamps of hosts
+        # that hash elsewhere. Scanning hundreds of thousands of distinct
+        # hosts previously grew this without any bound for the life of the
+        # worker process -- small per-entry, but unbounded is unbounded.
+        self._next: list["OrderedDict[str, float]"] = [OrderedDict() for _ in range(self._SHARDS)]
+
+    def _shard_index(self, host: str) -> int:
+        return hash(host) % self._SHARDS
 
     def _shard(self, host: str) -> threading.Lock:
-        return self._shard_locks[hash(host) % self._SHARDS]
+        return self._shard_locks[self._shard_index(host)]
 
     def wait(self, host: str) -> None:
         min_interval = 1.0 / self.per_host
-        with self._shard(host):
+        idx = self._shard_index(host)
+        with self._shard_locks[idx]:
+            bucket = self._next[idx]
             now = time.monotonic()
-            nxt = self._next.get(host, 0.0)
+            nxt = bucket.get(host, 0.0)
             delay = max(0.0, nxt - now)
-            self._next[host] = max(now, nxt) + min_interval
+            bucket[host] = max(now, nxt) + min_interval
+            bucket.move_to_end(host)
+            while len(bucket) > self._MAX_ENTRIES_PER_SHARD:
+                bucket.popitem(last=False)
         if delay:
             time.sleep(delay)
 
@@ -100,7 +115,13 @@ class HttpClient:
         self.max_redirects = max_redirects
         self.limiter = HostRateLimiter(rate_limit_per_host)
         self.on_request = on_request
-        self._soft404: dict[str, dict[str, Any]] = {}
+        # Bounded LRU-ish cache: unbounded growth here was the other half
+        # of the same OOM (one entry per unique host, kept for the life of
+        # the worker process). A few thousand hosts' worth of profiles is
+        # enough locality for the soft-404 check to still help; anything
+        # older than that is evicted rather than kept forever.
+        self._soft404: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._soft404_max_entries = 20_000
         self._soft404_lock = threading.Lock()
         # Connections must scale with worker threads, or extra threads just
         # queue behind the pool's semaphore instead of doing real work.
@@ -126,6 +147,16 @@ class HttpClient:
         try:
             return self._shared_client.request(method, url, **kwargs)
         finally:
+            # This is a stateless recon scanner hitting a huge number of
+            # unrelated hosts, never authenticated/session-based crawling
+            # that needs cookie continuity. httpx's cookie jar has no size
+            # cap and accumulates one entry per unique host for the life of
+            # this shared client -- across hundreds of thousands of hosts in
+            # a large scan that alone reached ~18GB RSS in one worker
+            # process and got it OOM-killed. Wiping it after every request
+            # costs nothing (we never read it back) and bounds growth to
+            # zero regardless of scan size.
+            self._shared_client.cookies.clear()
             if self.on_request:
                 try:
                     self.on_request()
@@ -329,13 +360,20 @@ class HttpClient:
             "title": self._extract_title(resp.text),
         }
         with self._soft404_lock:
-            self._soft404[httpx.URL(base_url).host or base_url] = profile
+            host = httpx.URL(base_url).host or base_url
+            self._soft404[host] = profile
+            self._soft404.move_to_end(host)
+            while len(self._soft404) > self._soft404_max_entries:
+                self._soft404.popitem(last=False)
         return profile
 
     def get_soft404_profile(self, url: str) -> Optional[dict[str, Any]]:
         host = httpx.URL(url).host or ""
         with self._soft404_lock:
-            return self._soft404.get(host)
+            profile = self._soft404.get(host)
+            if profile is not None:
+                self._soft404.move_to_end(host)
+            return profile
 
     @staticmethod
     def is_soft404(resp: HttpResponse, profile: dict[str, Any]) -> bool:
