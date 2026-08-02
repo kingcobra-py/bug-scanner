@@ -6,6 +6,17 @@ After=network.target
 Type=simple
 WorkingDirectory=/opt/bb-scanner
 Environment=PATH=/opt/bb-scanner/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+# glibc creates one malloc "arena" per thread by default and almost never
+# shrinks them back to the OS. With 50-300 threads per scan worker process,
+# a burst of large allocations (2MB response bodies) permanently grows that
+# thread's arena -- confirmed live via /proc/[pid]/smaps_rollup showing
+# dozens of ~64MB anonymous regions per worker (one process reached ~18GB
+# RSS and was OOM-killed). These two settings are the standard fix for this
+# well-known pattern in heavily multi-threaded Python/Java/Ruby services:
+# cap the number of arenas, and force allocations above 128KB (every
+# response body we buffer) through mmap, which *does* get released on free.
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_MMAP_THRESHOLD_=131072
 ExecStart=/opt/bb-scanner/.venv/bin/python main.py serve --host 0.0.0.0 --port 8080
 Restart=always
 RestartSec=3
