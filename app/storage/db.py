@@ -295,6 +295,10 @@ class ScanStore:
             return self._scan_dict(row, compact=compact) if row else None
 
     def delete_scan(self, scan_id: str) -> bool:
+        # Log writes are queued asynchronously (see add_log); flush first so
+        # a write already in flight when this is called can't land after
+        # the delete and leave an orphaned row behind.
+        self.flush_logs(timeout=2.0)
         with self._lock, Session(self.engine) as s:
             row = s.get(ScanRow, scan_id)
             if not row:

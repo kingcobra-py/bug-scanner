@@ -68,6 +68,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     cfg = ScanConfig(
         targets=targets,
         threads=args.threads or scanner.get("threads", 20),
+        worker_processes=max(1, int(args.processes or 1)),
         timeout=args.timeout or scanner.get("timeout", 8.0),
         modules=modules,
         paths_mode=args.paths_mode or yml.get("paths", {}).get("mode", "merge"),
@@ -122,6 +123,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-t", "--target", action="append", default=[], help="Target URL/host or list file (repeatable)")
     s.add_argument("--targets-file", help="File with targets")
     s.add_argument("--threads", type=int, default=None)
+    s.add_argument(
+        "--processes",
+        type=int,
+        default=1,
+        help="Run across N OS processes instead of one (bypasses Python's single-core GIL ceiling for large scans)",
+    )
     s.add_argument("--timeout", type=float, default=None)
     s.add_argument("--modules", default="git,js,config,path,methods,wordpress,joomla,react")
     s.add_argument("--paths", help="Custom path wordlist .txt")

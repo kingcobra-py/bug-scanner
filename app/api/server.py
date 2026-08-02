@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import threading
@@ -129,6 +130,7 @@ class ScanCreate(BaseModel):
         default_factory=lambda: ["git", "js", "config", "path", "methods", "wordpress", "joomla", "react"]
     )
     threads: int = 20
+    worker_processes: int = 1
     timeout: float = 8.0
     connect_timeout: float = 0.0
     retries: int = 2
@@ -210,6 +212,10 @@ def create_app() -> FastAPI:
             targets_upload_id=body.targets_upload_id,
             wordlist_upload_id=body.wordlist_upload_id,
             threads=max(1, min(int(body.threads or 20), 500)),
+            # Each process runs its own GIL; 300+ threads in one process
+            # measurably reduces throughput (see engine.SAFE_THREADS_PER_PROCESS),
+            # so cap this modestly rather than letting one job hog every core.
+            worker_processes=max(1, min(int(body.worker_processes or 1), os.cpu_count() or 4, 16)),
             timeout=body.timeout,
             # Dead/filtered hosts dominate large recon lists; failing to
             # connect quickly (rather than waiting the full read timeout)
@@ -259,6 +265,7 @@ def create_app() -> FastAPI:
                 "targets_upload_id": cfg.targets_upload_id,
                 "wordlist_upload_id": cfg.wordlist_upload_id,
                 "threads": cfg.threads,
+                "worker_processes": cfg.worker_processes,
                 "timeout": cfg.timeout,
                 "connect_timeout": cfg.connect_timeout,
                 "retries": cfg.retries,

@@ -96,6 +96,7 @@ class ScanConfig:
     targets_upload_id: str = ""
     wordlist_upload_id: str = ""
     threads: int = 20
+    worker_processes: int = 1
     timeout: float = 8.0
     connect_timeout: float = 5.0
     retries: int = 2

@@ -1,9 +1,12 @@
-"""Thread-based scan orchestrator."""
+"""Thread-based scan orchestrator, with an opt-in multi-process mode."""
 
 from __future__ import annotations
 
 import csv
 import json
+import multiprocessing
+import os
+import queue as queue_mod
 import threading
 import time
 import traceback
@@ -28,10 +31,17 @@ from app.modules.path_bruteforce import PathBruteforceModule
 from app.modules.react2shell import ReactModule
 from app.modules.wordpress import WordPressModule
 from app.storage.db import ScanStore
-from app.storage.models import Finding, ScanConfig, ScanContext, TargetContext
+from app.storage.models import Finding, ProgressSnapshot, ScanConfig, ScanContext, TargetContext
 from app.utils.dedupe import dedupe_findings
 from app.utils.logger import get_scan_logger, add_log_subscriber, remove_log_subscriber
 from app.utils.normalize import normalize_target, origin_variants
+
+# Measured live on the target box: raising *thread* count past ~300-400 in a
+# single Python process reduced throughput (GIL contention) and, at 800
+# threads, twice made the dashboard's own API hang for 10+ seconds. Multiple
+# OS *processes* is the real fix -- each gets its own GIL, so this is the
+# per-process thread ceiling multi-process mode is built around.
+SAFE_THREADS_PER_PROCESS = 300
 
 
 MODULE_ORDER = [
@@ -67,8 +77,25 @@ class ScanEngine:
         self._lock = threading.Lock()
         self._artifact_lock = threading.Lock()
         self._last_artifact_write: dict[str, float] = {}
+        # Multi-process bookkeeping is kept separate from the single-process
+        # dicts above so stop()/is_active() can support either mode without
+        # the two ever being confused for the same scan_id.
+        self._process_stop_events: dict[str, "multiprocessing.synchronize.Event"] = {}
+        self._processes: dict[str, list[multiprocessing.Process]] = {}
 
     def stop(self, scan_id: str) -> bool:
+        proc_stop = self._process_stop_events.get(scan_id)
+        if proc_stop is not None:
+            # Signal only and return immediately. Joining worker processes
+            # here would block this call for however long they take to wind
+            # down (up to several seconds per process) -- and this method is
+            # invoked directly from an async API handler, so any blocking
+            # here freezes the whole dashboard, not just this request. The
+            # actual join/terminate happens in _run_multiprocess's own
+            # background thread, which is where blocking is safe.
+            proc_stop.set()
+            self.store.update_status(scan_id, "stopping")
+            return True
         ev = self._stop_events.get(scan_id)
         if not ev:
             # A server restart can leave a persisted "running" row with no
@@ -91,18 +118,34 @@ class ScanEngine:
         return True
 
     def is_active(self, scan_id: str) -> bool:
+        if scan_id in self._process_stop_events:
+            # Presence alone spans the full lifetime (registered before the
+            # thread starts, removed only after run() fully completes), so
+            # this stays correct even in the brief window before individual
+            # worker processes have actually been spawned.
+            return True
         thread = self._threads.get(scan_id)
         return bool(thread and thread.is_alive() and scan_id in self._stop_events)
 
     def start_async(self, config: ScanConfig) -> str:
         t = threading.Thread(target=self.run, args=(config,), daemon=True, name=f"scan-{config.scan_id}")
         with self._lock:
-            self._stop_events[config.scan_id] = threading.Event()
+            if config.worker_processes > 1:
+                # Pre-register the multiprocessing stop event before the
+                # thread starts, mirroring the threading.Event case below —
+                # otherwise a stop() call racing with thread startup could
+                # find neither bookkeeping dict populated yet and be lost.
+                self._process_stop_events[config.scan_id] = multiprocessing.get_context("spawn").Event()
+                self._processes[config.scan_id] = []
+            else:
+                self._stop_events[config.scan_id] = threading.Event()
             self._threads[config.scan_id] = t
         t.start()
         return config.scan_id
 
     def run(self, config: ScanConfig) -> dict[str, Any]:
+        if config.worker_processes > 1:
+            return self._run_multiprocess(config)
         scan_id = config.scan_id
         out_dir = Path(config.output_dir) / scan_id
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -229,41 +272,19 @@ class ScanEngine:
                 # Keep only a small window of futures. A 500MB target file can
                 # contain millions of lines; submitting them all freezes/OOMs.
                 max_inflight = max(config.threads * 3, config.threads)
-                source = iter(self._ingest_targets(config))
-                inflight: dict[Future, str] = {}
-                exhausted = False
-                while (inflight or not exhausted) and not stop_event.is_set():
-                    while len(inflight) < max_inflight and not exhausted:
-                        try:
-                            turl = next(source)
-                        except StopIteration:
-                            exhausted = True
-                            break
-                        future = pool.submit(
-                            self._run_target_pipeline,
-                            turl,
-                            modules,
-                            ctx,
-                            _live_finding,
-                            logger,
-                        )
-                        inflight[future] = turl
-                    if not inflight:
-                        continue
-                    done, _ = wait(inflight, return_when=FIRST_COMPLETED)
-                    for future in done:
-                        turl = inflight.pop(future)
-                        try:
-                            findings = future.result()
-                            self._persist_findings_live(
-                                scan_id,
-                                findings,
-                                out_dir,
-                                persisted_ids,
-                            )
-                        except Exception as e:
-                            logger.error("target failed %s: %s", turl, e)
-                            logger.debug(traceback.format_exc())
+                self._drain_pipeline(
+                    targets=iter(self._ingest_targets(config)),
+                    modules=modules,
+                    ctx=ctx,
+                    pool=pool,
+                    max_inflight=max_inflight,
+                    stop_event=stop_event,
+                    on_finding=_live_finding,
+                    on_target_done=lambda findings: self._persist_findings_live(
+                        scan_id, findings, out_dir, persisted_ids
+                    ),
+                    logger=logger,
+                )
             finally:
                 pool.shutdown(wait=not stop_event.is_set(), cancel_futures=stop_event.is_set())
                 with self._lock:
@@ -311,6 +332,253 @@ class ScanEngine:
                 self._clients.pop(scan_id, None)
                 self._last_artifact_write.pop(scan_id, None)
 
+    def _run_multiprocess(self, config: ScanConfig) -> dict[str, Any]:
+        """Fan a scan out across multiple OS processes.
+
+        Each process gets its own GIL (the actual fix for the throughput
+        ceiling measured with high thread counts in one process) and its own
+        HttpClient/ProgressManager/ScanStore, built fresh via the spawn start
+        method so nothing unsafe (live SQLAlchemy engine, background log
+        writer thread, asyncio loop) is inherited across a fork(). Workers
+        persist findings/logs/progress directly to the shared SQLite file
+        (safe under WAL) and additionally relay lightweight copies through a
+        queue purely so this process can keep pushing live websocket
+        updates; losing that queue never loses data.
+        """
+        from app.core import process_worker  # local import: avoid a cycle at module load
+
+        scan_id = config.scan_id
+        out_dir = Path(config.output_dir) / scan_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        logger = get_scan_logger(scan_id, out_dir, module="engine", level="DEBUG" if config.verbose else "INFO")
+
+        cpu_cap = os.cpu_count() or 4
+        num_workers = max(1, min(int(config.worker_processes), cpu_cap, 32, max(1, int(config.threads))))
+        threads_per_process = max(1, min(SAFE_THREADS_PER_PROCESS, -(-int(config.threads) // num_workers)))
+
+        if not config.targets_path:
+            (out_dir / "targets.txt").write_text(
+                "\n".join(config.targets) + ("\n" if config.targets else ""),
+                encoding="utf-8",
+            )
+        if config.custom_paths and not config.wordlist_path:
+            (out_dir / "custom_paths.txt").write_text(
+                "\n".join(config.custom_paths) + "\n",
+                encoding="utf-8",
+            )
+        cfg_dict = asdict(config)
+        inline_targets = cfg_dict.pop("targets", []) or []
+        inline_paths = cfg_dict.pop("custom_paths", []) or []
+        cfg_dict.pop("targets_path", None)
+        cfg_dict.pop("wordlist_path", None)
+        cfg_dict["target_count"] = config.target_count or len(inline_targets)
+        cfg_dict["custom_path_count"] = config.custom_path_count or len(inline_paths)
+        self.store.create_scan(scan_id, cfg_dict, str(out_dir))
+
+        mp_ctx = multiprocessing.get_context("spawn")
+        stop_event = self._process_stop_events.get(scan_id) or mp_ctx.Event()
+        notify_queue: multiprocessing.Queue = mp_ctx.Queue()
+        with self._lock:
+            self._process_stop_events[scan_id] = stop_event
+            self._processes[scan_id] = []
+        self.store.update_status(scan_id, "stopping" if stop_event.is_set() else "running")
+
+        target_count = config.target_count or len(config.targets)
+        logger.info(
+            "scan start id=%s targets=%d processes=%d threads_per_process=%d",
+            scan_id, target_count, num_workers, threads_per_process,
+        )
+
+        processes: list[multiprocessing.Process] = []
+        try:
+            for worker_id in range(num_workers):
+                p = mp_ctx.Process(
+                    target=process_worker.run_worker,
+                    args=(
+                        config,
+                        worker_id,
+                        num_workers,
+                        threads_per_process,
+                        str(self.store.db_path),
+                        notify_queue,
+                        stop_event,
+                    ),
+                    daemon=True,
+                    name=f"scan-{scan_id}-w{worker_id}",
+                )
+                p.start()
+                processes.append(p)
+            with self._lock:
+                self._processes[scan_id] = processes
+
+            aggregate = self._drain_multiprocess_queue(
+                scan_id=scan_id,
+                out_dir=out_dir,
+                processes=processes,
+                notify_queue=notify_queue,
+                num_workers=num_workers,
+                logger=logger,
+            )
+
+            findings_dicts = dedupe_findings(self.store.get_findings(scan_id))
+            final_snap_dict = {
+                "total": aggregate.get("total", 0),
+                "done": aggregate.get("done", 0),
+                "failed": aggregate.get("failed", 0),
+                "queued": max(aggregate.get("total", 0) - aggregate.get("done", 0) - aggregate.get("failed", 0), 0),
+                "hits": len(findings_dicts),
+                "secrets": aggregate.get("secrets", 0),
+                "timeouts": aggregate.get("timeouts", 0),
+                "requests": aggregate.get("requests", 0),
+                "rps": aggregate.get("rps", 0.0),
+                "current_target": "",
+                "current_module": "",
+                "percent": 100.0,
+                "eta_seconds": 0.0,
+                "module_progress": {},
+            }
+            report = self._write_reports(out_dir, config, findings_dicts, ProgressSnapshot(**final_snap_dict))
+            status = "stopped" if stop_event.is_set() else "completed"
+            self.store.update_status(scan_id, status)
+            self.store.update_summary(scan_id, report.get("summary", {}))
+            self.store.update_progress(scan_id, final_snap_dict)
+            logger.info("scan %s findings=%d", status, len(findings_dicts))
+            return report
+        except Exception as e:
+            logger.error("scan failed: %s", e)
+            logger.debug(traceback.format_exc())
+            self.store.update_status(scan_id, "failed")
+            return {"error": str(e), "scan_id": scan_id}
+        finally:
+            stop_event.set()
+            for p in processes:
+                if p.is_alive():
+                    p.join(timeout=5.0)
+                if p.is_alive():
+                    p.terminate()
+            with self._lock:
+                self._process_stop_events.pop(scan_id, None)
+                self._processes.pop(scan_id, None)
+
+    def _drain_multiprocess_queue(
+        self,
+        scan_id: str,
+        out_dir: Path,
+        processes: list[multiprocessing.Process],
+        notify_queue: multiprocessing.Queue,
+        num_workers: int,
+        logger,
+    ) -> dict[str, Any]:
+        """Relay worker events to the dashboard and return the final
+        aggregated progress snapshot once every worker process has exited."""
+        worker_snapshots: dict[int, dict[str, Any]] = {}
+        last_persist = {"t": 0.0}
+        start_time = time.monotonic()
+        pending_artifact_refresh = {"dirty": False, "t": 0.0}
+
+        def _aggregate() -> dict[str, Any]:
+            snaps = list(worker_snapshots.values())
+            agg = {
+                "total": sum(s.get("total", 0) for s in snaps),
+                "done": sum(s.get("done", 0) for s in snaps),
+                "failed": sum(s.get("failed", 0) for s in snaps),
+                "hits": sum(s.get("hits", 0) for s in snaps),
+                "secrets": sum(s.get("secrets", 0) for s in snaps),
+                "timeouts": sum(s.get("timeouts", 0) for s in snaps),
+                "requests": sum(s.get("requests", 0) for s in snaps),
+                "rps": sum(s.get("rps", 0.0) for s in snaps),
+            }
+            finished = agg["done"] + agg["failed"]
+            agg["queued"] = max(agg["total"] - finished, 0)
+            agg["percent"] = (finished / agg["total"] * 100.0) if agg["total"] else 0.0
+            agg["current_target"] = next((s.get("current_target", "") for s in snaps if s.get("current_target")), "")
+            agg["current_module"] = next((s.get("current_module", "") for s in snaps if s.get("current_module")), "")
+            elapsed = max(time.monotonic() - start_time, 0.001)
+            rate = finished / elapsed
+            remaining = max(agg["total"] - finished, 0)
+            agg["eta_seconds"] = (remaining / rate) if rate > 0 else None
+            module_progress: dict[str, dict[str, int]] = {}
+            for snap in snaps:
+                for name, mp in (snap.get("module_progress") or {}).items():
+                    entry = module_progress.setdefault(name, {"done": 0, "total": 0, "hits": 0})
+                    entry["done"] += mp.get("done", 0)
+                    entry["total"] += mp.get("total", 0)
+                    entry["hits"] += mp.get("hits", 0)
+            agg["module_progress"] = module_progress
+            return agg
+
+        def _persist_aggregate(force: bool = False) -> dict[str, Any]:
+            agg = _aggregate()
+            now = time.monotonic()
+            if force or (now - last_persist["t"]) >= 0.5:
+                last_persist["t"] = now
+                try:
+                    self.store.update_progress(scan_id, agg)
+                except Exception:
+                    pass
+                if self.on_progress:
+                    try:
+                        self.on_progress(scan_id, agg)
+                    except Exception:
+                        pass
+            return agg
+
+        while True:
+            try:
+                message = notify_queue.get(timeout=0.5)
+            except queue_mod.Empty:
+                message = None
+            except Exception:
+                message = None
+
+            if message is not None:
+                mtype = message.get("type")
+                if mtype == "log":
+                    try:
+                        if self.on_log:
+                            self.on_log(scan_id, message.get("data") or {})
+                    except Exception:
+                        pass
+                elif mtype == "finding":
+                    try:
+                        if self.on_finding:
+                            self.on_finding(scan_id, message.get("data") or {})
+                    except Exception:
+                        pass
+                    pending_artifact_refresh["dirty"] = True
+                elif mtype == "worker_progress":
+                    worker_snapshots[message.get("worker_id")] = message.get("data") or {}
+                    _persist_aggregate()
+
+            # Findings arrive from up to num_workers processes concurrently;
+            # rebuilding the vulns/ export tree on every single one would be
+            # wasteful, so this mirrors the single-process throttle (~2s) and
+            # runs in this one orchestrator thread only, avoiding the
+            # cross-process races a full delete+rebuild would hit if done
+            # inside multiple worker processes at once.
+            now = time.monotonic()
+            if pending_artifact_refresh["dirty"] and (now - pending_artifact_refresh["t"]) >= 2.0:
+                pending_artifact_refresh["dirty"] = False
+                pending_artifact_refresh["t"] = now
+                try:
+                    write_vuln_artifacts(out_dir, self.store.get_findings(scan_id))
+                except Exception:
+                    pass
+
+            if not any(p.is_alive() for p in processes):
+                # Drain whatever is left in the queue without blocking forever.
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    try:
+                        message = notify_queue.get(timeout=0.1)
+                    except Exception:
+                        break
+                    if message and message.get("type") == "worker_progress":
+                        worker_snapshots[message.get("worker_id")] = message.get("data") or {}
+                break
+
+        return _persist_aggregate(force=True)
+
     def _ingest_targets(self, config: ScanConfig) -> Iterator[str]:
         """Yield normalized targets lazily; memory stays flat for huge uploads."""
         for target in config.targets:
@@ -322,6 +590,46 @@ class ScanEngine:
                 normalized = normalize_target(target)
                 if normalized:
                     yield normalized
+
+    def _drain_pipeline(
+        self,
+        targets: Iterator[str],
+        modules: list[Any],
+        ctx: ScanContext,
+        pool: ThreadPoolExecutor,
+        max_inflight: int,
+        stop_event: Any,
+        on_finding: Optional[Callable[[Finding], None]],
+        on_target_done: Callable[[list[Finding]], None],
+        logger,
+    ) -> None:
+        """Feed a bounded window of targets through the pipeline pool.
+
+        Shared by the single-process run() loop and each multi-process
+        worker, so both modes exercise exactly the same submission/backoff
+        logic instead of two copies that could silently drift apart.
+        """
+        inflight: dict[Future, str] = {}
+        exhausted = False
+        while (inflight or not exhausted) and not stop_event.is_set():
+            while len(inflight) < max_inflight and not exhausted:
+                try:
+                    turl = next(targets)
+                except StopIteration:
+                    exhausted = True
+                    break
+                future = pool.submit(self._run_target_pipeline, turl, modules, ctx, on_finding, logger)
+                inflight[future] = turl
+            if not inflight:
+                continue
+            done, _ = wait(inflight, return_when=FIRST_COMPLETED)
+            for future in done:
+                turl = inflight.pop(future)
+                try:
+                    on_target_done(future.result())
+                except Exception as e:
+                    logger.error("target failed %s: %s", turl, e)
+                    logger.debug(traceback.format_exc())
 
     def _run_target_pipeline(
         self,

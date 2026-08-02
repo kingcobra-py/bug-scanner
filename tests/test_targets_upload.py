@@ -193,3 +193,24 @@ def test_thread_cap_matches_measured_safe_ceiling(tmp_path, monkeypatch):
 
     client.post("/api/scans", json={"targets": ["a.example"], "threads": 5000})
     assert started[-1].threads == 500
+
+
+def test_worker_processes_defaults_to_one_and_is_capped(tmp_path, monkeypatch):
+    # Multi-process mode is opt-in: existing jobs that never set this field
+    # must behave exactly as before (single process, unchanged code path).
+    monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(server.os, "cpu_count", lambda: 8)
+    started = []
+    monkeypatch.setattr(server.engine, "start_async", lambda config: started.append(config))
+    client = TestClient(create_app())
+
+    client.post("/api/scans", json={"targets": ["a.example"]})
+    assert started[-1].worker_processes == 1
+
+    client.post("/api/scans", json={"targets": ["b.example"], "worker_processes": 4})
+    assert started[-1].worker_processes == 4
+
+    # Capped at both an absolute ceiling and the box's CPU count, so one job
+    # can't be configured to hog every core on the host.
+    client.post("/api/scans", json={"targets": ["c.example"], "worker_processes": 1000})
+    assert started[-1].worker_processes == 8

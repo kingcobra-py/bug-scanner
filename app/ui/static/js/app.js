@@ -370,6 +370,7 @@ async function startJob(event) {
     wordlist_upload_id: $("jobWordlistUpload").value,
     modules: selectedModules(),
     threads: Number($("threads").value || 100),
+    worker_processes: Number($("workerProcesses").value || 1),
     timeout: Number($("timeout").value || 8),
     retries: Number($("retries").value || 1),
     rate_limit_per_host: Number($("rateLimit").value || 50),
@@ -496,7 +497,7 @@ function jobCard(job) {
   return `
     <article class="job-card ${esc(job.status)}">
       <div class="job-card-head">
-        <div class="min-w-0"><div class="job-title truncate">${esc(name)}</div><div class="job-id">${esc(job.id)} · ${formatNumber(config.target_count ?? (config.targets || []).length)} targets · ${esc(formatHitTime(job.updated_at || job.created_at))}</div></div>
+        <div class="min-w-0"><div class="job-title truncate">${esc(name)}</div><div class="job-id">${esc(job.id)} · ${formatNumber(config.target_count ?? (config.targets || []).length)} targets${Number(config.worker_processes) > 1 ? ` · ${config.worker_processes} processes` : ""} · ${esc(formatHitTime(job.updated_at || job.created_at))}</div></div>
         <span class="status-badge ${esc(job.status)}" title="${esc(job.status)}">${esc(statusLabel)}</span>
       </div>
       <div class="flex justify-between text-[11px] text-slate-500 mt-4 mb-1.5"><span>${pct.toFixed(1)}%</span><span>ETA ${formatEta(progress.eta_seconds)}</span></div>
