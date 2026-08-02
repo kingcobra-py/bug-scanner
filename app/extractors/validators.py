@@ -88,16 +88,40 @@ def is_placeholder(value: str) -> bool:
     return False
 
 
+# Bare LHS names that are almost never credentials when seen as KEY=VALUE in JS.
+GENERIC_ENV_KV_NAMES = frozenset({
+    "api_key", "apikey", "api-key", "api_token", "token", "access_token",
+    "auth_token", "authorization", "key", "secret", "password", "passwd",
+    "bearer", "jwt", "id_token", "keyword", "keywordq", "keyworda",
+})
+
+
 def looks_like_js_expression(value: str) -> bool:
     """True for JS member/expr noise the env-line parser pulls from .js files."""
     v = (value or "").strip().strip("'\"")
     if not v:
         return True
-    if v.endswith(",") or v.endswith(";"):
+    # Trailing ``?`` is almost always a ternary leftover (``key = method ?``).
+    if v.endswith(",") or v.endswith(";") or v.endswith("?"):
         return True
     if re.search(r"[(){}\[\]`$]|=>|\bthis\b|\bfunction\b|\breturn\b", v):
         return True
     if re.fullmatch(r"[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)+", v.rstrip(",;")):
+        return True
+    return False
+
+
+def is_useless_env_assignment(value: str) -> bool:
+    """True for stored ``KEY=VALUE`` env rows that are JS/query noise."""
+    raw = (value or "").strip()
+    if not raw or "=" not in raw:
+        return False
+    lhs, rhs = raw.split("=", 1)
+    lhs_l = lhs.strip().lower()
+    rhs_s = rhs.strip().strip("'\"")
+    if lhs_l in GENERIC_ENV_KV_NAMES or lhs_l.startswith("keyword"):
+        return True
+    if looks_like_js_expression(rhs_s) or is_placeholder(rhs_s):
         return True
     return False
 

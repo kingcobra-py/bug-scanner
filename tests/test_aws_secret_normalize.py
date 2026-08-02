@@ -56,6 +56,8 @@ def test_normalize_drops_js_env_noise_and_local_placeholders():
         {"kind": "env", "value": "token=_ref.token,", "provider": "other"},
         {"kind": "env", "value": "keywordQ=product.post_title", "provider": "other"},
         {"kind": "env", "value": "WORDPRESS_DB_PASSWORD=wp_local_password", "provider": "other"},
+        {"kind": "env", "value": "key=method ?", "provider": "other"},
+        {"kind": "env", "value": "key=method", "provider": "other"},
         {"kind": "env", "value": "DB_PASSWORD=N7!vKp9xmQ2xR4sL", "provider": "other"},
         {"kind": "github_token", "value": "ghp_" + ("a" * 36), "provider": "github"},
     ]
@@ -66,3 +68,4 @@ def test_normalize_drops_js_env_noise_and_local_placeholders():
     assert not any("_ref.token" in v for v in values)
     assert not any("product.post_title" in v for v in values)
     assert not any("wp_local_password" in v for v in values)
+    assert not any(v.startswith("key=") for v in values)

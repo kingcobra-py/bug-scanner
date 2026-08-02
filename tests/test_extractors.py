@@ -115,3 +115,21 @@ DB_PASSWORD=N7!vKp9xmQ2xR4sL
     assert not any("product.article_number" in v for v in values)
     assert not any("wp_local_password" in v for v in values)
     assert any("N7!vKp9xmQ2xR4sL" in v for v in values)
+
+
+def test_wp_google_map_ternary_key_method_not_env_secret():
+    # Live FP: wpgmp_frontend.js / DataTables ``key = method ?``
+    text = """
+			key = method ?
+				'camelCase' :
+				'Hungarian';
+			struct = method ?
+				{ a: 1 } :
+				null;
+DB_PASSWORD=N7!vKp9xmQ2xR4sL
+"""
+    secrets = extract_secrets(text, redact_values=False)
+    values = [str(s.get("value")) for s in secrets]
+    assert not any(v.lower().startswith("key=") for v in values)
+    assert not any("method ?" in v or v.endswith("=method") for v in values)
+    assert any("N7!vKp9xmQ2xR4sL" in v for v in values)

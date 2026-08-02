@@ -9,8 +9,10 @@ from typing import Any
 
 from app.extractors import patterns as P
 from app.extractors.validators import (
+    GENERIC_ENV_KV_NAMES,
     confidence_for,
     is_placeholder,
+    is_useless_env_assignment,
     looks_like_js_expression,
     looks_like_secret,
     redact,
@@ -73,13 +75,6 @@ def _looks_like_sentence_or_code(value: str) -> bool:
     return bool(re.search(r"[(){};]|=>|function\s*\(", value))
 
 
-# Bare generic names produce endless public "api_key=" / "token=" noise.
-_GENERIC_KV_NAMES = {
-    "api_key", "apikey", "api-key", "api_token", "token", "access_token",
-    "auth_token", "authorization", "key", "secret", "password", "passwd",
-    "bearer", "jwt", "id_token", "keyword", "keywordq", "keyworda",
-}
-
 _KV_MARKERS = (
     "aws", "github", "gitlab", "stripe", "sendgrid", "brevo", "mailgun",
     "postmark", "slack", "openai", "anthropic", "twilio", "azure", "tencent",
@@ -93,7 +88,7 @@ def _interesting_kv(key: str, value: str) -> bool:
     value = (value or "").strip().strip("'\"")
     if key_l in _NON_SECRET_KEYS:
         return False
-    if key_l in _GENERIC_KV_NAMES or key_l.startswith("keyword"):
+    if key_l in GENERIC_ENV_KV_NAMES or key_l.startswith("keyword"):
         return False
     if _looks_like_sentence_or_code(value) or looks_like_js_expression(value):
         return False
@@ -122,7 +117,9 @@ def extract_secrets(text: str, source_url: str = "", redact_values: bool = True)
         # Drop public Google API keys / JWTs even when they arrive via env/JSON KV.
         if value.startswith("AIza") or (value.startswith("eyJ") and value.count(".") >= 2):
             return
-        # env rows are stored as KEY=VALUE — validate the RHS too.
+        # env rows are stored as KEY=VALUE — validate the RHS / generic LHS too.
+        if kind_l == "env" and is_useless_env_assignment(value):
+            return
         rhs = value.split("=", 1)[1] if kind_l == "env" and "=" in value else value
         if looks_like_js_expression(rhs) or is_placeholder(rhs):
             return

@@ -131,7 +131,11 @@ function setupUploadDropzone() {
   });
   const zone = $("dropZone");
   const input = $("uploadFile");
-  input.onchange = () => { $("chosenFile").textContent = input.files[0]?.name || "No file selected"; };
+  if (!zone || !input) return;
+  input.onchange = () => {
+    const label = $("chosenFile");
+    if (label) label.textContent = input.files[0]?.name || "No file selected";
+  };
   ["dragenter", "dragover"].forEach((event) => zone.addEventListener(event, (ev) => {
     ev.preventDefault();
     zone.classList.add("dragging");
@@ -143,7 +147,8 @@ function setupUploadDropzone() {
   zone.addEventListener("drop", (ev) => {
     if (!ev.dataTransfer.files.length) return;
     input.files = ev.dataTransfer.files;
-    $("chosenFile").textContent = input.files[0].name;
+    const label = $("chosenFile");
+    if (label) label.textContent = input.files[0].name;
   });
 }
 
