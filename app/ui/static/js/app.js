@@ -435,14 +435,14 @@ async function refreshJobs() {
 function renderJobs() {
   const running = state.jobs.filter((job) => ["running", "pending", "stopping"].includes(job.status));
   const completed = state.jobs.filter((job) => job.status === "completed");
-  const totalHits = state.jobs.reduce((sum, job) => sum + Number(job.summary?.finding_count ?? job.progress?.hits ?? 0), 0);
+  const totalSecrets = state.jobs.reduce((sum, job) => sum + Number(job.progress?.secrets ?? job.summary?.secret_count ?? 0), 0);
   $("runningBadge").textContent = running.length;
   $("runningBadge").classList.toggle("hidden", !running.length);
   $("jobsOverview").innerHTML = `
     <div class="stat-card"><span>Total jobs</span><b>${state.jobs.length}</b></div>
     <div class="stat-card"><span>Running</span><b class="text-cyan-300">${running.length}</b></div>
     <div class="stat-card"><span>Completed</span><b class="text-emerald-300">${completed.length}</b></div>
-    <div class="stat-card"><span>Total hit signals</span><b>${formatNumber(totalHits)}</b></div>`;
+    <div class="stat-card"><span>Secret credentials</span><b>${formatNumber(totalSecrets)}</b></div>`;
   $("jobsEmpty").classList.toggle("hidden", Boolean(state.jobs.length));
   $("jobsGrid").innerHTML = state.jobs.map(jobCard).join("");
   $("jobsGrid").querySelectorAll(".view-results").forEach((button) => {
