@@ -212,9 +212,9 @@ def create_app() -> FastAPI:
             targets_upload_id=body.targets_upload_id,
             wordlist_upload_id=body.wordlist_upload_id,
             threads=max(1, min(int(body.threads or 20), 500)),
-            # Each process runs its own GIL; 300+ threads in one process
-            # measurably reduces throughput (see engine.SAFE_THREADS_PER_PROCESS),
-            # so cap this modestly rather than letting one job hog every core.
+            # Each process runs its own GIL and its own full Threads budget
+            # (threads is per-process). Cap process count by CPU so one job
+            # cannot spawn more workers than the box can usefully run.
             worker_processes=max(1, min(int(body.worker_processes or 1), os.cpu_count() or 4, 16)),
             timeout=body.timeout,
             # Dead/filtered hosts dominate large recon lists; failing to

@@ -117,12 +117,11 @@ def write_vuln_artifacts(out_dir: Path | str, findings: list[dict[str, Any]]) ->
     vulns_dir = root / "vulns"
     if vulns_dir.exists():
         # Rewrite cleanly each pass so API refresh does not duplicate JSONL rows.
-        for path in vulns_dir.rglob("*"):
-            if path.is_file():
-                try:
-                    path.unlink()
-                except Exception:
-                    pass
+        # shutil.rmtree is O(dirents) in C; the previous per-file pathlib
+        # unlink loop burned a full core for minutes once a live scan had
+        # ~90k vuln JSON files, blocking the multiprocess notify drain and
+        # freezing Done/RPS on the dashboard even while workers kept scanning.
+        shutil.rmtree(vulns_dir, ignore_errors=True)
     vulns_dir.mkdir(parents=True, exist_ok=True)
 
     by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)

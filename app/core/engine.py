@@ -353,8 +353,11 @@ class ScanEngine:
         logger = get_scan_logger(scan_id, out_dir, module="engine", level="DEBUG" if config.verbose else "INFO")
 
         cpu_cap = os.cpu_count() or 4
-        num_workers = max(1, min(int(config.worker_processes), cpu_cap, 32, max(1, int(config.threads))))
-        threads_per_process = max(1, min(SAFE_THREADS_PER_PROCESS, -(-int(config.threads) // num_workers)))
+        # Threads is per-process (UI: 300 threads + 3 processes => 300 each,
+        # ~900 total concurrent targets). Dividing the thread budget across
+        # processes was surprising and not what operators expect.
+        num_workers = max(1, min(int(config.worker_processes), cpu_cap, 32))
+        threads_per_process = max(1, min(SAFE_THREADS_PER_PROCESS, int(config.threads)))
 
         if not config.targets_path:
             (out_dir / "targets.txt").write_text(
@@ -474,7 +477,12 @@ class ScanEngine:
         worker_snapshots: dict[int, dict[str, Any]] = {}
         last_persist = {"t": 0.0}
         start_time = time.monotonic()
+        # Artifact rebuilds can take tens of seconds once vulns/ grows large.
+        # Never do that on this thread — it must keep draining the notify
+        # queue or worker progress (Done/RPS) freezes on the dashboard.
         pending_artifact_refresh = {"dirty": False, "t": 0.0}
+        artifact_thread: dict[str, Optional[threading.Thread]] = {"t": None}
+        artifact_lock = threading.Lock()
 
         def _aggregate() -> dict[str, Any]:
             snaps = list(worker_snapshots.values())
@@ -550,20 +558,34 @@ class ScanEngine:
                     worker_snapshots[message.get("worker_id")] = message.get("data") or {}
                     _persist_aggregate()
 
-            # Findings arrive from up to num_workers processes concurrently;
-            # rebuilding the vulns/ export tree on every single one would be
-            # wasteful, so this mirrors the single-process throttle (~2s) and
-            # runs in this one orchestrator thread only, avoiding the
-            # cross-process races a full delete+rebuild would hit if done
-            # inside multiple worker processes at once.
+            # Findings arrive from up to num_workers processes concurrently.
+            # Rebuild vulns/ off-thread and infrequently so the notify drain
+            # (live Done/RPS) never blocks behind a multi-minute rmtree+rewrite.
             now = time.monotonic()
-            if pending_artifact_refresh["dirty"] and (now - pending_artifact_refresh["t"]) >= 2.0:
+            existing_art = artifact_thread["t"]
+            art_busy = bool(existing_art and existing_art.is_alive())
+            if (
+                pending_artifact_refresh["dirty"]
+                and not art_busy
+                and (now - pending_artifact_refresh["t"]) >= 30.0
+            ):
                 pending_artifact_refresh["dirty"] = False
                 pending_artifact_refresh["t"] = now
-                try:
-                    write_vuln_artifacts(out_dir, self.store.get_findings(scan_id))
-                except Exception:
-                    pass
+
+                def _refresh_artifacts() -> None:
+                    with artifact_lock:
+                        try:
+                            write_vuln_artifacts(out_dir, self.store.get_findings(scan_id))
+                        except Exception:
+                            pass
+
+                t = threading.Thread(
+                    target=_refresh_artifacts,
+                    daemon=True,
+                    name=f"vulns-{scan_id[:8]}",
+                )
+                artifact_thread["t"] = t
+                t.start()
 
             if not any(p.is_alive() for p in processes):
                 # Drain whatever is left in the queue without blocking forever.
@@ -577,6 +599,9 @@ class ScanEngine:
                         worker_snapshots[message.get("worker_id")] = message.get("data") or {}
                 break
 
+        art = artifact_thread["t"]
+        if art is not None and art.is_alive():
+            art.join(timeout=10.0)
         return _persist_aggregate(force=True)
 
     def _ingest_targets(self, config: ScanConfig) -> Iterator[str]:

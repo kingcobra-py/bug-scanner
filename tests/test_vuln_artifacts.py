@@ -117,3 +117,11 @@ def test_write_vuln_artifacts_tree(tmp_path):
     assert any(h["host"] == "wp.victim.test" and "wp2shell" in h["methods"] for h in bundle["vulnerable_hosts"])
     # raw body copied into category folder
     assert any(p.name.startswith("env.victim.test__body__") for p in (vulns / "env").glob("*"))
+
+    # Second rewrite must replace the tree (rmtree), not accumulate duplicates.
+    stale = vulns / "git" / "stale-should-vanish.json"
+    stale.write_text("{}", encoding="utf-8")
+    write_vuln_artifacts(tmp_path, findings[:1])
+    assert not stale.exists()
+    assert (vulns / "git" / "index.jsonl").exists()
+    assert not (vulns / "wordpress" / "index.jsonl").exists()
