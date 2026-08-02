@@ -157,16 +157,17 @@ def extract_secrets(text: str, source_url: str = "", redact_values: bool = True)
         except Exception:
             continue
 
-    # AWS access + nearby secret
+    # AWS access + nearby secret as one ``access:secret`` value.
     for am in P.AWS_ACCESS_KEY.finditer(text):
         ak = am.group(1)
         window = text[max(0, am.start() - 300) : am.end() + 300]
         secrets = P.AWS_SECRET_KEY.findall(window)
-        if secrets:
-            for sk in secrets:
-                if re.search(r"[A-Z]", sk) and re.search(r"[0-9]", sk):
-                    add("aws_cred", f"{ak}|{sk}", evidence=P.context_window(text, am.start(), am.end()), conf=0.92)
-        else:
+        paired = False
+        for sk in secrets:
+            if re.search(r"[A-Z]", sk) and re.search(r"[0-9]", sk):
+                add("aws_cred", f"{ak}:{sk}", evidence=P.context_window(text, am.start(), am.end()), conf=0.92)
+                paired = True
+        if not paired:
             add("aws_access_key", ak, evidence=P.context_window(text, am.start(), am.end()), conf=0.88)
 
     return findings

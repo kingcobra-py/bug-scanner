@@ -114,7 +114,7 @@ class ScanConfig:
     proxy: Optional[str] = None
     headers: dict[str, str] = field(default_factory=dict)
     scope_notes: str = ""
-    redact_secrets: bool = True
+    redact_secrets: bool = False
     method_test_trace: bool = False
     probe_both_schemes: bool = True
     max_body_bytes: int = 2_097_152

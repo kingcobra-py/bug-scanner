@@ -47,6 +47,36 @@ LOG_LINE = re.compile(
 )
 
 
+def normalize_result_secrets(secrets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prefer ``AKIA...:secret`` pairs and drop duplicate standalone access keys.
+
+    Legacy extractors stored pairs as ``access|secret``; normalize those to
+    colon form for the Results UI. When both a paired cred and a bare
+    ``aws_access_key`` exist for the same access key, keep only the pair.
+    """
+    normalized: list[dict[str, Any]] = []
+    paired_access: set[str] = set()
+    for item in secrets:
+        kind = str(item.get("kind") or "")
+        value = str(item.get("value") or "")
+        if "|" in value and (kind.startswith("aws") or value.startswith("AKIA")):
+            left, right = value.split("|", 1)
+            if left.startswith("AKIA") and right:
+                value = f"{left}:{right}"
+                kind = "aws_cred"
+                item = {**item, "kind": kind, "value": value}
+        if kind == "aws_cred" and ":" in value:
+            paired_access.add(value.split(":", 1)[0])
+        normalized.append(item)
+
+    out: list[dict[str, Any]] = []
+    for item in normalized:
+        if item.get("kind") == "aws_access_key" and item.get("value") in paired_access:
+            continue
+        out.append(item)
+    return out
+
+
 def read_file_logs(
     output_dir: str | Path,
     *,
@@ -139,7 +169,9 @@ class ScanCreate(BaseModel):
     custom_paths: list[str] = Field(default_factory=list)
     scope_notes: str = ""
     verify_tls: bool = False
-    redact_secrets: bool = True
+    # Always store full secret values so Results can show complete API keys
+    # (not last-4 redaction). The create handler forces this False as well.
+    redact_secrets: bool = False
     method_test_trace: bool = False
     verbose: bool = False
 
@@ -229,7 +261,7 @@ def create_app() -> FastAPI:
             custom_paths=custom_paths,
             custom_path_count=len(custom_paths) + int((wordlist_upload or {}).get("item_count") or 0),
             scope_notes=body.scope_notes,
-            redact_secrets=body.redact_secrets,
+            redact_secrets=False,
             verify_tls=body.verify_tls,
             method_test_trace=body.method_test_trace,
             verbose=body.verbose,
@@ -623,7 +655,14 @@ def create_app() -> FastAPI:
                 }
             )
 
-        secrets = list(secret_index.values())
+        secrets = normalize_result_secrets(list(secret_index.values()))
+        # Provider counts must reflect the post-normalized secret list
+        # (paired AWS rows collapse two kinds into one).
+        provider_counts = {}
+        for item in secrets:
+            provider_id = item.get("provider") or provider_for_kind(str(item.get("kind") or ""))
+            item["provider"] = provider_id
+            provider_counts[provider_id] = provider_counts.get(provider_id, 0) + 1
         if provider:
             secrets = [item for item in secrets if item.get("provider") == provider]
 
