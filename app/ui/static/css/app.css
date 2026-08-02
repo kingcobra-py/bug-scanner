@@ -245,6 +245,37 @@ tr.find-row { transition: background .12s var(--ease); }
 .secret-actions { display: flex; align-items: center; justify-content: flex-end; gap: .4rem; white-space: nowrap; }
 .sensitive-option span { color: #f59e0b; font-size: .65rem; }
 .table-wrap { max-height: 420px; overflow: auto; }
+
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: .65rem .9rem;
+  color: #94a3b8;
+  font-size: .75rem;
+}
+.pager-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .45rem;
+}
+.pager-meta { color: #64748b; }
+.pager-page {
+  min-width: 5.5rem;
+  text-align: center;
+  color: #cbd5e1;
+}
+.pager select.input { width: 4.5rem; }
+.pager .btn-ghost {
+  padding: .28rem .65rem;
+  font-size: .72rem;
+}
+.pager .btn-ghost:disabled {
+  opacity: .35;
+  cursor: not-allowed;
+}
 .hit-time { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: .68rem; color: #94a3b8; white-space: nowrap; }
 table { width: 100%; font-size: .75rem; }
 th { position: sticky; top: 0; z-index: 2; text-align: left; color: #64748b; font-size: .63rem; text-transform: uppercase; letter-spacing: .07em; padding: .65rem .55rem; background: #0b1224; }

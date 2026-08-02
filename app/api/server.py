@@ -312,8 +312,29 @@ def create_app() -> FastAPI:
         type: Optional[str] = None,
         module: Optional[str] = None,
         q: Optional[str] = None,
-    ) -> list[dict[str, Any]]:
-        return store.get_findings(scan_id, severity=severity, ftype=type, module=module, q=q)
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]:
+        if not store.get_scan(scan_id, compact=True):
+            raise HTTPException(status_code=404, detail="scan not found")
+        size = max(1, min(int(page_size or 20), 100))
+        page_n = max(1, int(page or 1))
+        items, total = store.query_findings(
+            scan_id,
+            severity=severity,
+            ftype=type,
+            module=module,
+            q=q,
+            limit=size,
+            offset=(page_n - 1) * size,
+        )
+        return {
+            "items": items,
+            "total": total,
+            "page": page_n,
+            "page_size": size,
+            "pages": max(1, (total + size - 1) // size) if total else 1,
+        }
 
     @app.get("/api/scans/{scan_id}/findings/{finding_id}")
     async def get_finding(scan_id: str, finding_id: str) -> dict[str, Any]:
@@ -527,6 +548,8 @@ def create_app() -> FastAPI:
         scan_id: str,
         provider: Optional[str] = None,
         include_findings: bool = False,
+        hosts_page: int = 1,
+        hosts_page_size: int = 20,
     ) -> dict[str, Any]:
         row = store.get_scan(scan_id, compact=True)
         if not row:
@@ -619,6 +642,12 @@ def create_app() -> FastAPI:
                 }
             )
 
+        host_size = max(1, min(int(hosts_page_size or 20), 100))
+        host_page = max(1, int(hosts_page or 1))
+        host_total = len(vulnerable_hosts)
+        host_start = (host_page - 1) * host_size
+        hosts_page_items = vulnerable_hosts[host_start : host_start + host_size]
+
         # Report the on-disk vulns/ tree if one already exists, without
         # rewriting it here. This endpoint is polled on every filter click,
         # and regenerating dozens of per-category files on each read made
@@ -646,11 +675,15 @@ def create_app() -> FastAPI:
                 provider_metadata(provider_id, count)
                 for provider_id, count in sorted(provider_counts.items())
             ],
-            "vulnerable_hosts": vulnerable_hosts,
+            "vulnerable_hosts": hosts_page_items,
+            "vulnerable_host_count": host_total,
+            "hosts_page": host_page,
+            "hosts_page_size": host_size,
+            "hosts_pages": max(1, (host_total + host_size - 1) // host_size) if host_total else 1,
             "vuln_files": vuln_files,
         }
-        # Findings are loaded via /findings (newest-first). Including them here
-        # duplicated ~0.5MB+ on every Results poll and contributed to fetch failures.
+        # Findings are loaded via paginated /findings. Including them here
+        # duplicated large payloads on every Results poll.
         if include_findings:
             payload["findings"] = [
                 {
@@ -663,7 +696,7 @@ def create_app() -> FastAPI:
                     "timestamp": finding.get("timestamp"),
                     "validated": finding.get("validated"),
                 }
-                for finding in findings
+                for finding in findings[:100]
             ]
         return payload
 

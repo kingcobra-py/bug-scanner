@@ -1,4 +1,6 @@
 const MODULES = ["git", "js", "config", "path", "methods", "wordpress", "joomla", "react"];
+const PAGE_SIZES = [10, 20, 50, 100];
+
 const state = {
   tab: "uploads",
   uploadKind: "targets",
@@ -9,6 +11,16 @@ const state = {
   provider: "",
   results: null,
   findings: [],
+  findingsTotal: 0,
+  findingsPage: 1,
+  findingsPageSize: 20,
+  findingsPages: 1,
+  hostsPage: 1,
+  hostsPageSize: 20,
+  hostsTotal: 0,
+  hostsPages: 1,
+  findingsRefreshPending: false,
+  findingsController: null,
   logs: [],
   ws: null,
   pingTimer: null,
@@ -535,16 +547,27 @@ function syncScanSelectors() {
 }
 
 function selectScan(id, connect = true) {
-  if (state.scanId !== id && state.resultsController) {
-    state.resultsController.abort();
-    state.resultsController = null;
-    state.resultsRefreshPending = false;
+  if (state.scanId !== id) {
+    if (state.resultsController) {
+      state.resultsController.abort();
+      state.resultsController = null;
+      state.resultsRefreshPending = false;
+    }
+    if (state.findingsController) {
+      state.findingsController.abort();
+      state.findingsController = null;
+      state.findingsRefreshPending = false;
+    }
+    state.findingsPage = 1;
+    state.hostsPage = 1;
+    state.findings = [];
+    state.findingsTotal = 0;
+    state.results = null;
   }
   state.scanId = id;
   state.provider = "";
   syncScanSelectors();
-  if (connect) connectWs(id);
-  else connectWs(id);
+  connectWs(id);
 }
 
 function connectWs(id) {
@@ -577,7 +600,8 @@ function connectWs(id) {
       if (state.tab === "jobs") renderJobs();
     }
     if (message.type === "finding") {
-      state.findings.unshift(withSearchText(message.data));
+      // Keep the current page coherent via a throttled reload instead of
+      // splicing live rows into a paginated list.
       if (state.tab === "results") scheduleResultsReload();
     }
     if (message.type === "log") {
@@ -598,15 +622,43 @@ function scheduleResultsReload() {
 
 function applyResultsPayload(results) {
   state.results = results;
-  const seen = new Set();
-  state.findings = (results.findings || []).filter((finding) => {
-    const key = finding.id || `${finding.type}|${finding.url}|${finding.title}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  }).map(withSearchText).sort((a, b) => String(b.timestamp || "").localeCompare(String(a.timestamp || "")));
+  state.hostsTotal = Number(results.vulnerable_host_count ?? (results.vulnerable_hosts || []).length) || 0;
+  state.hostsPage = Number(results.hosts_page || state.hostsPage) || 1;
+  state.hostsPageSize = Number(results.hosts_page_size || state.hostsPageSize) || 20;
+  state.hostsPages = Number(results.hosts_pages || Math.max(1, Math.ceil(state.hostsTotal / state.hostsPageSize))) || 1;
   renderResults();
-  renderFindings();
+}
+
+function renderPager(elementId, page, pageSize, total, pages, onChange) {
+  const el = $(elementId);
+  if (!el) return;
+  const safeTotal = Number(total) || 0;
+  const safeSize = Number(pageSize) || 20;
+  const safePage = Math.min(Math.max(1, Number(page) || 1), Math.max(1, Number(pages) || 1));
+  const safePages = Math.max(1, Number(pages) || 1);
+  const start = safeTotal ? (safePage - 1) * safeSize + 1 : 0;
+  const end = Math.min(safeTotal, safePage * safeSize);
+  el.innerHTML = `
+    <div class="pager-meta">${formatNumber(start)}–${formatNumber(end)} of ${formatNumber(safeTotal)}</div>
+    <div class="pager-controls">
+      <label class="flex items-center gap-2">Per page
+        <select class="input input-sm pager-size">
+          ${PAGE_SIZES.map((size) => `<option value="${size}" ${size === safeSize ? "selected" : ""}>${size}</option>`).join("")}
+        </select>
+      </label>
+      <button type="button" class="btn-ghost pager-prev" ${safePage <= 1 ? "disabled" : ""}>Prev</button>
+      <span class="pager-page">Page ${formatNumber(safePage)} / ${formatNumber(safePages)}</span>
+      <button type="button" class="btn-ghost pager-next" ${safePage >= safePages ? "disabled" : ""}>Next</button>
+    </div>`;
+  el.querySelector(".pager-size").onchange = (event) => {
+    onChange({ page: 1, pageSize: Number(event.target.value) || 20 });
+  };
+  el.querySelector(".pager-prev").onclick = () => {
+    if (safePage > 1) onChange({ page: safePage - 1, pageSize: safeSize });
+  };
+  el.querySelector(".pager-next").onclick = () => {
+    if (safePage < safePages) onChange({ page: safePage + 1, pageSize: safeSize });
+  };
 }
 
 async function reloadResults(force = false) {
@@ -615,11 +667,15 @@ async function reloadResults(force = false) {
     return;
   }
   const scanId = state.scanId;
-  const cached = state.resultsCache.get(scanId);
+  const cacheKey = `${scanId}:h${state.hostsPage}:${state.hostsPageSize}`;
+  const cached = state.resultsCache.get(cacheKey);
   if (cached) applyResultsPayload(cached);
   const job = state.allScans.find((item) => item.id === scanId);
   const active = ["running", "pending", "stopping"].includes(job?.status);
-  if (cached && !force && !active) return;
+  if (cached && !force && !active) {
+    loadFindingsPage();
+    return;
+  }
   if (state.resultsRefreshPending && state.resultsRequestScan === scanId) return;
   if (state.resultsController) state.resultsController.abort();
   const controller = new AbortController();
@@ -627,14 +683,19 @@ async function reloadResults(force = false) {
   state.resultsRequestScan = scanId;
   state.resultsRefreshPending = true;
   try {
-    // One compact response replaces the old /results + /findings pair.
+    // Findings load separately via paginated /findings so this payload stays small.
+    const params = new URLSearchParams({
+      hosts_page: String(state.hostsPage),
+      hosts_page_size: String(state.hostsPageSize),
+    });
     const results = await api(
-      `/api/scans/${encodeURIComponent(scanId)}/results?include_findings=true`,
+      `/api/scans/${encodeURIComponent(scanId)}/results?${params}`,
       { signal: controller.signal },
     );
     if (state.scanId !== scanId) return;
-    state.resultsCache.set(scanId, results);
+    state.resultsCache.set(cacheKey, results);
     applyResultsPayload(results);
+    await loadFindingsPage();
   } catch (error) {
     if (error?.name !== "AbortError" && state.scanId === scanId && !cached) {
       $("resultSummary").innerHTML = `<div class="text-red-300">${esc(error.message)}</div>`;
@@ -648,13 +709,59 @@ async function reloadResults(force = false) {
   }
 }
 
+async function loadFindingsPage() {
+  if (!state.scanId) return;
+  const scanId = state.scanId;
+  if (state.findingsController) state.findingsController.abort();
+  const controller = new AbortController();
+  state.findingsController = controller;
+  state.findingsRefreshPending = true;
+  const params = new URLSearchParams({
+    page: String(state.findingsPage),
+    page_size: String(state.findingsPageSize),
+  });
+  const severity = $("sevFilter").value;
+  const moduleName = $("modFilter").value;
+  const query = $("findQ").value.trim();
+  if (severity) params.set("severity", severity);
+  if (moduleName) params.set("module", moduleName);
+  if (query) params.set("q", query);
+  try {
+    const data = await api(
+      `/api/scans/${encodeURIComponent(scanId)}/findings?${params}`,
+      { signal: controller.signal },
+    );
+    if (state.scanId !== scanId) return;
+    const items = Array.isArray(data) ? data : (data.items || []);
+    state.findings = items.map(withSearchText);
+    state.findingsTotal = Array.isArray(data) ? items.length : Number(data.total || 0);
+    state.findingsPage = Array.isArray(data) ? 1 : Number(data.page || state.findingsPage) || 1;
+    state.findingsPageSize = Array.isArray(data) ? state.findingsPageSize : Number(data.page_size || state.findingsPageSize) || 20;
+    state.findingsPages = Array.isArray(data)
+      ? 1
+      : Number(data.pages || Math.max(1, Math.ceil(state.findingsTotal / state.findingsPageSize))) || 1;
+    renderFindings();
+  } catch (error) {
+    if (error?.name !== "AbortError" && state.scanId === scanId) {
+      $("findingsBody").innerHTML = `<tr><td colspan="5" class="text-red-300">${esc(error.message)}</td></tr>`;
+      $("findingsCount").textContent = "Failed to load findings";
+    }
+  } finally {
+    if (state.findingsController === controller) {
+      state.findingsController = null;
+      state.findingsRefreshPending = false;
+    }
+  }
+}
+
 function renderResults() {
   const data = state.results || {};
   const severity = data.by_severity || {};
   const hosts = data.vulnerable_hosts || [];
+  const hostTotal = Number(data.vulnerable_host_count ?? hosts.length) || 0;
   $("resultSummary").innerHTML = `
     <div class="stat-card"><span>Unique findings</span><b>${formatNumber(data.finding_count)}</b></div>
-    <div class="stat-card"><span>Vulnerable hosts</span><b>${formatNumber(hosts.length)}</b></div>
+    <div class="stat-card"><span>Vulnerable hosts</span><b>${formatNumber(hostTotal)}</b></div>
     <div class="stat-card"><span>Critical</span><b class="sev-critical">${formatNumber(severity.critical)}</b></div>
     <div class="stat-card"><span>High</span><b class="sev-high">${formatNumber(severity.high)}</b></div>
     <div class="stat-card"><span>Unique secrets</span><b>${formatNumber((data.secrets || []).length)}</b></div>`;
@@ -670,6 +777,14 @@ function renderResults() {
       <td>${esc((host.severities || []).join(", "))}</td>
       <td>${formatNumber(host.finding_count)}</td>
     </tr>`).join("") : '<tr><td colspan="4" class="text-slate-500">No vulnerable hosts yet.</td></tr>';
+  $("vulnHostsCount").textContent = hostTotal
+    ? `${formatNumber(hostTotal)} host${hostTotal === 1 ? "" : "s"} · page ${formatNumber(state.hostsPage)}`
+    : "No vulnerable hosts yet";
+  renderPager("vulnHostsPager", state.hostsPage, state.hostsPageSize, state.hostsTotal, state.hostsPages, ({ page, pageSize }) => {
+    state.hostsPage = page;
+    state.hostsPageSize = pageSize;
+    reloadResults(true);
+  });
 }
 
 function renderProviderFilters(providers) {
@@ -723,22 +838,8 @@ async function copyText(value) {
   input.remove();
 }
 
-const FINDINGS_RENDER_CAP = 400;
-
 function renderFindings() {
-  const query = $("findQ").value.trim().toLowerCase();
-  const severity = $("sevFilter").value;
-  const moduleName = $("modFilter").value;
-  const matches = state.findings.filter((finding) => {
-    if (severity && finding.severity !== severity) return false;
-    if (moduleName && finding.module !== moduleName) return false;
-    // _search is precomputed once per finding in reloadResults, so typing
-    // in the search box no longer re-serializes every row on each keystroke.
-    return !query || finding._search.includes(query);
-  });
-  // Newest hits stay on top after filtering.
-  matches.sort((a, b) => String(b.timestamp || "").localeCompare(String(a.timestamp || "")));
-  const rows = matches.slice(0, FINDINGS_RENDER_CAP);
+  const rows = state.findings || [];
   $("findingsBody").innerHTML = rows.length ? rows.map((finding, index) => `
     <tr class="find-row finding-row" data-index="${index}">
       <td class="sev-${esc(finding.severity)}">${esc(finding.severity)}</td>
@@ -747,10 +848,27 @@ function renderFindings() {
       <td class="max-w-[190px] truncate" title="${esc(finding.title)}">${esc(finding.title)}</td>
       <td class="max-w-[210px] truncate font-mono text-cyan-200" title="${esc(finding.url)}">${esc(finding.url)}</td>
     </tr>`).join("") : '<tr><td colspan="5" class="text-slate-500">No findings for this filter.</td></tr>';
-  $("findingsCount").textContent = matches.length > FINDINGS_RENDER_CAP
-    ? `Showing newest ${FINDINGS_RENDER_CAP.toLocaleString()} of ${matches.length.toLocaleString()} — refine your search`
-    : `${matches.length.toLocaleString()} finding${matches.length === 1 ? "" : "s"} · newest first`;
+  $("findingsCount").textContent = state.findingsTotal
+    ? `${formatNumber(state.findingsTotal)} finding${state.findingsTotal === 1 ? "" : "s"} · newest first`
+    : "No findings for this filter";
   state._findingsRows = rows;
+  renderPager(
+    "findingsPager",
+    state.findingsPage,
+    state.findingsPageSize,
+    state.findingsTotal,
+    state.findingsPages,
+    ({ page, pageSize }) => {
+      state.findingsPage = page;
+      state.findingsPageSize = pageSize;
+      loadFindingsPage();
+    },
+  );
+}
+
+function resetFindingsFiltersToFirstPage() {
+  state.findingsPage = 1;
+  loadFindingsPage();
 }
 
 // Delegated once: works for every re-render without re-attaching per-row
@@ -878,11 +996,11 @@ function bindEvents() {
   $("logScanSelect").onchange = () => { selectScan($("logScanSelect").value); reloadLogs(); };
   $("refreshResults").onclick = () => reloadResults(true);
   $("purgeResults").onclick = purgeSelectedJob;
-  $("sevFilter").onchange = renderFindings;
-  $("modFilter").onchange = renderFindings;
+  $("sevFilter").onchange = resetFindingsFiltersToFirstPage;
+  $("modFilter").onchange = resetFindingsFiltersToFirstPage;
   $("findQ").oninput = () => {
     clearTimeout(state._searchDebounce);
-    state._searchDebounce = setTimeout(renderFindings, 180);
+    state._searchDebounce = setTimeout(resetFindingsFiltersToFirstPage, 220);
   };
   $("logLevel").onchange = reloadLogs;
   $("clearLogs").onclick = () => { $("logs").innerHTML = ""; };

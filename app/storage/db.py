@@ -18,6 +18,8 @@ from sqlalchemy import (
     Text,
     create_engine,
     delete,
+    func,
+    or_,
     select,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -350,6 +352,53 @@ class ScanStore:
                 s.commit()
         return changed
 
+    def query_findings(
+        self,
+        scan_id: str,
+        severity: Optional[str] = None,
+        ftype: Optional[str] = None,
+        module: Optional[str] = None,
+        q: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return ``(page_items, total_matching)`` with SQL filters + LIMIT.
+
+        Used by the Results dashboard so a scan with hundreds of thousands of
+        findings does not force the API (or browser) to materialize every row
+        just to show one page of 10/20/50/100.
+        """
+        filters = [FindingRow.scan_id == scan_id]
+        if severity:
+            filters.append(FindingRow.severity == severity)
+        if ftype:
+            filters.append(FindingRow.type == ftype)
+        if module:
+            filters.append(FindingRow.module == module)
+        if q:
+            like = f"%{q.strip()}%"
+            filters.append(
+                or_(
+                    FindingRow.title.like(like),
+                    FindingRow.url.like(like),
+                    FindingRow.target.like(like),
+                    FindingRow.evidence.like(like),
+                    FindingRow.module.like(like),
+                )
+            )
+        with Session(self.engine) as s:
+            total = int(s.scalar(select(func.count()).select_from(FindingRow).where(*filters)) or 0)
+            stmt = (
+                select(FindingRow)
+                .where(*filters)
+                .order_by(FindingRow.timestamp.desc(), FindingRow.id.desc())
+                .offset(max(0, int(offset or 0)))
+            )
+            if limit is not None:
+                stmt = stmt.limit(max(0, int(limit)))
+            rows = s.scalars(stmt).all()
+            return [self._finding_dict(r) for r in rows], total
+
     def get_findings(
         self,
         scan_id: str,
@@ -357,28 +406,19 @@ class ScanStore:
         ftype: Optional[str] = None,
         module: Optional[str] = None,
         q: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
-        with Session(self.engine) as s:
-            rows = s.scalars(
-                select(FindingRow).where(FindingRow.scan_id == scan_id)
-            ).all()
-            out = []
-            for r in rows:
-                if severity and r.severity != severity:
-                    continue
-                if ftype and r.type != ftype:
-                    continue
-                if module and r.module != module:
-                    continue
-                item = self._finding_dict(r)
-                if q:
-                    blob = json.dumps(item).lower()
-                    if q.lower() not in blob:
-                        continue
-                out.append(item)
-            # Newest hits first for the Results dashboard.
-            out.sort(key=lambda item: item.get("timestamp") or "", reverse=True)
-            return out
+        items, _total = self.query_findings(
+            scan_id,
+            severity=severity,
+            ftype=ftype,
+            module=module,
+            q=q,
+            limit=limit,
+            offset=offset,
+        )
+        return items
 
     def get_finding(self, scan_id: str, finding_id: str) -> Optional[dict[str, Any]]:
         with Session(self.engine) as s:
