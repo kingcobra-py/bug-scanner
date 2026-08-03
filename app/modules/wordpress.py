@@ -2,14 +2,14 @@
 WordPress detection module (SAFE).
 
 Does NOT integrate or execute wp2shell / RCE exploit payloads.
-Performs fingerprinting, version exposure scoring, sensitive path checks,
-and priority secret packs only: AWS, GitHub, Stripe, SendGrid, Brevo.
+Fingerprints targets, scores version exposure, and extracts SMTP / API keys /
+secrets from reachable WordPress artifacts (wp-config, debug.log, REST, etc.).
 """
 
 from __future__ import annotations
 
-from app.extractors.priority_secrets import priority_extractions
-from app.modules.base import finding_from_hit, save_http_response
+from app.exploits.wp2shell.detector import Wp2ShellDetector
+from app.modules.base import cms_body_extractions, emit_credential_findings, finding_from_hit, save_http_response
 from app.modules.vulnerability_intel import executable_upload_paths, wordpress_exposure, wordpress_version
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
@@ -119,7 +119,7 @@ class WordPressModule:
             if path.startswith("/wp-config") and resp.status_code == 200 and (
                 "DB_NAME" in body or "DB_PASSWORD" in body or "<?php" in body
             ):
-                extracted = priority_extractions(body, source_url=url, redact_values=ctx.config.redact_secrets)
+                extracted = cms_body_extractions(ctx, resp.url or url, body)
                 raw_ref = save_http_response(ctx, f"wp_config_{path}", resp)
                 findings.append(
                     finding_from_hit(
@@ -133,31 +133,25 @@ class WordPressModule:
                         confidence=0.95,
                         extracted=extracted,
                         raw_ref=raw_ref,
-                        tags=["wordpress", "config", "priority-secrets"],
+                        tags=["wordpress", "config", "extract"],
                         validated=True,
                     )
                 )
                 ctx.progress.add_hit(secrets=len(extracted.get("secrets", [])), module=self.name)
-                if extracted.get("secrets"):
-                    kinds = sorted({s.get("kind", "") for s in extracted["secrets"] if s.get("kind")})
-                    findings.append(
-                        finding_from_hit(
-                            module=self.name,
-                            ftype="js_secret",
-                            severity="critical",
-                            target=target,
-                            url=resp.url or url,
-                            title="Priority secrets extracted from wp-config",
-                            evidence=", ".join(kinds),
-                            confidence=0.92,
-                            extracted=extracted,
-                            raw_ref=raw_ref,
-                            tags=["wordpress", "priority-secrets", "aws", "github", "stripe", "sendgrid", "brevo"],
-                            validated=True,
-                        )
-                    )
+                emit_credential_findings(
+                    findings=findings,
+                    target=target,
+                    ctx=ctx,
+                    module=self.name,
+                    url=resp.url or url,
+                    path=path,
+                    body=body,
+                    extracted=extracted,
+                    source_label=f"wp-config ({path})",
+                    include_apis=False,
+                )
             if path == "/wp-content/debug.log" and resp.status_code == 200 and len(body) > 50:
-                extracted = priority_extractions(body, source_url=url, redact_values=ctx.config.redact_secrets)
+                extracted = cms_body_extractions(ctx, resp.url or url, body)
                 raw_ref = save_http_response(ctx, "wp_debug_log", resp)
                 findings.append(
                     finding_from_hit(
@@ -171,28 +165,22 @@ class WordPressModule:
                         confidence=0.85,
                         extracted=extracted,
                         raw_ref=raw_ref,
-                        tags=["wordpress", "log", "priority-secrets"],
+                        tags=["wordpress", "log", "extract"],
                     )
                 )
                 ctx.progress.add_hit(secrets=len(extracted.get("secrets", [])), module=self.name)
-                if extracted.get("secrets"):
-                    kinds = sorted({s.get("kind", "") for s in extracted["secrets"] if s.get("kind")})
-                    findings.append(
-                        finding_from_hit(
-                            module=self.name,
-                            ftype="js_secret",
-                            severity="critical",
-                            target=target,
-                            url=resp.url or url,
-                            title="Priority secrets extracted from debug.log",
-                            evidence=", ".join(kinds),
-                            confidence=0.9,
-                            extracted=extracted,
-                            raw_ref=raw_ref,
-                            tags=["wordpress", "priority-secrets", "aws", "github", "stripe", "sendgrid", "brevo"],
-                            validated=True,
-                        )
-                    )
+                emit_credential_findings(
+                    findings=findings,
+                    target=target,
+                    ctx=ctx,
+                    module=self.name,
+                    url=resp.url or url,
+                    path=path,
+                    body=body,
+                    extracted=extracted,
+                    source_label="debug.log",
+                    include_apis=False,
+                )
             if path == "/xmlrpc.php" and resp.status_code == 200 and (
                 "XML-RPC" in body
                 or "methodResponse" in body
@@ -214,7 +202,7 @@ class WordPressModule:
                 ctx.progress.add_hit(module=self.name)
             if path == "/wp-json/" and resp.status_code == 200 and ("namespaces" in body or "name" in body):
                 is_wp = True
-                extracted = priority_extractions(body, source_url=url, redact_values=ctx.config.redact_secrets)
+                extracted = cms_body_extractions(ctx, resp.url or url, body)
                 findings.append(
                     finding_from_hit(
                         module=self.name,
@@ -226,30 +214,22 @@ class WordPressModule:
                         evidence=body[:200],
                         confidence=0.8,
                         extracted=extracted,
-                        tags=["wordpress", "api", "priority-secrets"],
+                        tags=["wordpress", "api", "extract"],
                     )
                 )
                 ctx.progress.add_hit(module=self.name)
-                if extracted.get("secrets"):
-                    raw_ref = save_http_response(ctx, "wp_json_priority_secrets", resp)
-                    kinds = sorted({s.get("kind", "") for s in extracted["secrets"] if s.get("kind")})
-                    findings.append(
-                        finding_from_hit(
-                            module=self.name,
-                            ftype="js_secret",
-                            severity="critical",
-                            target=target,
-                            url=resp.url or url,
-                            title="Priority secrets extracted from wp-json",
-                            evidence=", ".join(kinds),
-                            confidence=0.9,
-                            extracted=extracted,
-                            raw_ref=raw_ref,
-                            tags=["wordpress", "priority-secrets", "aws", "github", "stripe", "sendgrid", "brevo"],
-                            validated=True,
-                        )
-                    )
-                    ctx.progress.add_hit(secrets=len(extracted["secrets"]), module=self.name)
+                emit_credential_findings(
+                    findings=findings,
+                    target=target,
+                    ctx=ctx,
+                    module=self.name,
+                    url=resp.url or url,
+                    path=path,
+                    body=body,
+                    extracted=extracted,
+                    source_label="wp-json",
+                    include_apis=False,
+                )
             if path in {"/wp-json/batch/v1", "/?rest_route=/batch/v1"} and resp.status_code in (
                 200,
                 400,
@@ -364,6 +344,72 @@ class WordPressModule:
                     evidence=",".join(target.tech),
                     confidence=0.7,
                     tags=["wordpress", "fingerprint"],
+                )
+            )
+
+        detector = Wp2ShellDetector(http, target.url)
+        scan = detector.scan(home if home.status_code == 200 else None)
+        probe = scan.get("probe") or {}
+        if probe.get("batch_reachable"):
+            severity = "critical" if probe.get("route_confusion") else "medium"
+            title = (
+                "wp2shell batch route-confusion markers detected (Icex0/wp2shell-poc check)"
+                if probe.get("route_confusion")
+                else "WordPress REST batch endpoint reachable (wp2shell surface)"
+            )
+            findings.append(
+                finding_from_hit(
+                    module=self.name,
+                    ftype="vuln" if probe.get("route_confusion") else "other",
+                    severity=severity,
+                    target=target,
+                    url=probe.get("endpoint") or join_url(target.url, "/?rest_route=/batch/v1"),
+                    title=title,
+                    evidence=(
+                        f"status={probe.get('status_code')}; markers={','.join(probe.get('marker_codes') or [])}; "
+                        f"poc={scan.get('poc_source')}"
+                    ),
+                    confidence=0.95 if probe.get("route_confusion") else 0.82,
+                    extracted=scan,
+                    tags=["wordpress", "wp2shell", "batch-endpoint", "detection-only"],
+                    validated=bool(probe.get("route_confusion")),
+                )
+            )
+            ctx.progress.add_hit(module=self.name)
+
+        for hint in scan.get("version_hints") or []:
+            if not hint.get("affected"):
+                continue
+            findings.append(
+                finding_from_hit(
+                    module=self.name,
+                    ftype="vuln",
+                    severity="critical",
+                    target=target,
+                    url=target.url,
+                    title=f"WordPress {hint['version']} in wp2shell affected range ({hint['source']})",
+                    evidence=f"{hint['detail'][:180]}; poc={scan.get('poc_source')}",
+                    confidence=0.88,
+                    extracted={"version_hint": hint, "poc_source": scan.get("poc_source")},
+                    tags=["wordpress", "wp2shell", "version-check", "detection-only"],
+                    validated=True,
+                )
+            )
+            ctx.progress.add_hit(module=self.name)
+
+        if scan.get("markers"):
+            findings.append(
+                finding_from_hit(
+                    module=self.name,
+                    ftype="other",
+                    severity="info",
+                    target=target,
+                    url=target.url,
+                    title="WordPress public markers (wp2shell PoC fingerprint)",
+                    evidence=" / ".join(scan["markers"]),
+                    confidence=0.8,
+                    extracted={"markers": scan["markers"], "poc_source": scan.get("poc_source")},
+                    tags=["wordpress", "wp2shell", "fingerprint", "detection-only"],
                 )
             )
         return findings
