@@ -166,6 +166,10 @@ def run_worker(
         store=worker_store,
         http=http,
         logger=logger,
+        # ===== NEW: pass exploit flags from config =====
+        exploit_enabled=config.exploit_enabled,
+        exploit_command=config.exploit_command,
+        exploit_all=config.exploit_all,
     )
 
     try:
