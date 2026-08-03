@@ -251,6 +251,8 @@ def normalize_result_secrets(secrets: list[dict[str, Any]]) -> list[dict[str, An
         access = bucket.get("access") or ""
         secret = bucket.get("secret") or ""
         meta = bucket.get("_meta") or {"provider": "aws", "source_url": source, "occurrences": 1}
+        # Only emit AWS when both access + secret are present.
+        # Bare ASIA/AKIA from presigned URLs / HTML are not usable credentials.
         if access and secret:
             paired_access.add(access)
             kept.append(
@@ -259,16 +261,6 @@ def normalize_result_secrets(secrets: list[dict[str, Any]]) -> list[dict[str, An
                     "kind": "aws_cred",
                     "provider": "aws",
                     "value": f"{access}:{secret}",
-                    "source_url": source or meta.get("source_url") or "",
-                }
-            )
-        elif access:
-            kept.append(
-                {
-                    **meta,
-                    "kind": "aws_access_key",
-                    "provider": "aws",
-                    "value": access,
                     "source_url": source or meta.get("source_url") or "",
                 }
             )
@@ -305,13 +297,13 @@ def normalize_result_secrets(secrets: list[dict[str, Any]]) -> list[dict[str, An
             }
         )
 
-    # Drop bare access keys already represented as pairs, and dedupe values.
+    # Drop bare access keys (paired or not), and dedupe values.
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in kept:
         kind = str(item.get("kind") or "")
         value = str(item.get("value") or "")
-        if kind == "aws_access_key" and value in paired_access:
+        if kind == "aws_access_key":
             continue
         if kind == "aws_cred" and ":" in value:
             paired_access.add(value.split(":", 1)[0])

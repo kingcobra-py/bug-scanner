@@ -2,49 +2,90 @@ from app.core.result_secrets import normalize_result_secrets
 from app.extractors.secret_extractor import extract_secrets
 from app.extractors.smtp_extractor import extract_smtp
 
+# AWS docs-style fixtures (not real credentials).
+FAKE_ASIA = "ASIAIOSFODNN7EXAMPLE"
+FAKE_AKIA = "AKIAIOSFODNN7EXAMPLE"
+FAKE_SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+FAKE_ASIA_B = "ASIATESTACCESSKEY01"
+FAKE_AKIA_B = "AKIATESTACCESSKEY01"
+
 
 def test_normalize_pairs_aws_env_access_and_secret():
     secrets = [
         {
             "kind": "env",
-            "value": "AWS_ACCESS_KEY_ID=ASIA5FTZEPR4EGGPBUPF",
-            "source_url": "https://inspiringyoungminds.org",
+            "value": f"AWS_ACCESS_KEY_ID={FAKE_ASIA}",
+            "source_url": "https://example.test",
             "occurrences": 1,
         },
         {
             "kind": "env",
-            "value": "AWS_SECRET_ACCESS_KEY=hRKLkWlcds1B0Z+sTdzC7Q0sy/ZF/GlzYXhqu16P",
-            "source_url": "https://inspiringyoungminds.org",
+            "value": f"AWS_SECRET_ACCESS_KEY={FAKE_SECRET}",
+            "source_url": "https://example.test",
             "occurrences": 1,
         },
         {
             "kind": "aws_access_key",
-            "value": "ASIA5FTZEPR4EGGPBUPF",
-            "source_url": "https://inspiringyoungminds.org",
+            "value": FAKE_ASIA,
+            "source_url": "https://example.test",
             "occurrences": 1,
         },
         {
             "kind": "env",
             "value": "AWS_LAMBDA_METADATA_TOKEN=ff19351f-4b12-4a8e-aa4f-f179701366e6",
-            "source_url": "https://inspiringyoungminds.org",
+            "source_url": "https://example.test",
             "occurrences": 1,
         },
         {
             "kind": "env",
             "value": "__NEXT_PRIVATE_ORIGIN=http://localhost:8000",
-            "source_url": "https://inspiringyoungminds.org",
+            "source_url": "https://example.test",
             "occurrences": 3,
         },
     ]
     out = normalize_result_secrets(secrets)
     values = [s["value"] for s in out]
     assert any(s["kind"] == "aws_cred" for s in out)
-    assert "ASIA5FTZEPR4EGGPBUPF:hRKLkWlcds1B0Z+sTdzC7Q0sy/ZF/GlzYXhqu16P" in values
-    assert "ASIA5FTZEPR4EGGPBUPF" not in values
+    assert f"{FAKE_ASIA}:{FAKE_SECRET}" in values
+    assert FAKE_ASIA not in values
+    assert not any(s["kind"] == "aws_access_key" for s in out)
     assert not any("AWS_LAMBDA" in v for v in values)
     assert not any("__NEXT_PRIVATE" in v for v in values)
     assert not any(v.startswith("AWS_ACCESS_KEY_ID=") for v in values)
     assert not any(v.startswith("AWS_SECRET_ACCESS_KEY=") for v in values)
+
+
+def test_normalize_drops_unpaired_aws_access_keys():
+    secrets = [
+        {
+            "kind": "aws_access_key",
+            "value": FAKE_ASIA_B,
+            "source_url": "https://a.example/.env.production",
+            "occurrences": 1,
+        },
+        {
+            "kind": "aws_access_key",
+            "value": FAKE_AKIA_B,
+            "source_url": "https://b.example",
+            "occurrences": 1,
+        },
+        {
+            "kind": "env",
+            "value": f"AWS_ACCESS_KEY_ID={FAKE_ASIA}",
+            "source_url": "https://c.example",
+            "occurrences": 1,
+        },
+        {
+            "kind": "env",
+            "value": f"AWS_SECRET_ACCESS_KEY={FAKE_SECRET}",
+            "source_url": "https://c.example",
+            "occurrences": 1,
+        },
+    ]
+    out = normalize_result_secrets(secrets)
+    assert [s["kind"] for s in out] == ["aws_cred"]
+    assert out[0]["value"].startswith(f"{FAKE_ASIA}:")
+    assert not any(s["value"] in {FAKE_ASIA_B, FAKE_AKIA_B} for s in out)
 
 
 def test_normalize_builds_smtp_from_env_and_drops_duplicates():
@@ -82,25 +123,25 @@ def test_normalize_builds_smtp_from_env_and_drops_duplicates():
 
 
 def test_extract_secrets_pairs_unquoted_aws_env():
-    text = """
-AWS_ACCESS_KEY_ID=ASIARHQBNX6HX7C6FUNT
-AWS_SECRET_ACCESS_KEY=W2HxANSB7D2K2mIkw+f4A6aamK5xX8+WxxnGPWgb
-AWS_LAMBDA_FUNCTION_NAME=explodeme-com-prod-www
+    text = f"""
+AWS_ACCESS_KEY_ID={FAKE_ASIA}
+AWS_SECRET_ACCESS_KEY={FAKE_SECRET}
+AWS_LAMBDA_FUNCTION_NAME=example-app-prod-www
 __NEXT_PRIVATE_ORIGIN=http://localhost:8000
 """
-    secrets = extract_secrets(text, source_url="https://explodeme.com", redact_values=False)
+    secrets = extract_secrets(text, source_url="https://example.test", redact_values=False)
     kinds = {s["kind"] for s in secrets}
     values = [s["value"] for s in secrets]
     assert "aws_cred" in kinds
-    assert any(v.startswith("ASIARHQBNX6HX7C6FUNT:") for v in values)
+    assert any(v.startswith(f"{FAKE_ASIA}:") for v in values)
     assert not any("AWS_LAMBDA" in v for v in values)
     assert not any("__NEXT_PRIVATE" in v for v in values)
 
 
 def test_extract_smtp_from_scattered_env_and_skips_host_only():
     text = """
-SMTP_USER=contacto@zenthor.cl
-APPSETTING_SMTP_PASS=Twist.2905
+SMTP_USER=user@example.com
+APPSETTING_SMTP_PASS=AppPassExample123!
 SMTP_HOST=smtp.hostinger.com
 SMTP_PORT=465
 random smtp.gmail.com mention without creds
@@ -108,7 +149,7 @@ random smtp.gmail.com mention without creds
     smtp = extract_smtp(text, redact_values=False)
     assert smtp
     assert any(
-        item["value"].get("pass") == "Twist.2905" and item["value"].get("host") == "smtp.hostinger.com"
+        item["value"].get("pass") == "AppPassExample123!" and item["value"].get("host") == "smtp.hostinger.com"
         for item in smtp
     )
     assert not any(
