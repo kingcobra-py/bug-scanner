@@ -14,7 +14,7 @@ from app.utils.dedupe import value_hash
 # secret as a single ``access:secret`` value instead of two separate rows.
 PRIORITY_PACKS: dict[str, list[tuple[str, re.Pattern]]] = {
     "github_token": [("github_token", P.GITHUB_TOKEN)],
-    "stripe": [("stripe_live", P.STRIPE_LIVE), ("stripe_test", P.STRIPE_TEST)],
+    "stripe": [("stripe_live", P.STRIPE_LIVE)],
     "sendgrid": [("sendgrid", P.SENDGRID_KEY)],
     "brevo": [("brevo", P.BREVO_KEY), ("xsmtp", P.XSMTP_KEY)],
 }

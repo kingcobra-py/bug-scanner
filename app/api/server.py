@@ -75,9 +75,15 @@ def _is_useless_secret(kind: str, value: str) -> bool:
         return True
     if "google_api" in kind_l or kind_l == "jwt":
         return True
+    if kind_l in {"stripe_test", "paystack", "emailjs", "sanity"}:
+        return True
+    if value_s.lower().startswith("sk_test_"):
+        return True
     if kind_l == "env" and "=" in value_s:
-        env_key = value_s.split("=", 1)[0].strip()
-        if is_noise_env_key(env_key):
+        env_key, env_rhs = value_s.split("=", 1)
+        if is_noise_env_key(env_key.strip()):
+            return True
+        if env_rhs.strip().lower().startswith("sk_test_"):
             return True
     # Stored env rows are ``KEY=VALUE``; drop JS ternary / generic LHS noise
     # (e.g. ``key=method ?`` from minified map-plugin JS).

@@ -119,20 +119,31 @@ def _looks_like_sentence_or_code(value: str) -> bool:
 
 
 _KV_MARKERS = (
-    "aws", "github", "gitlab", "stripe", "paystack", "sendgrid", "brevo",
+    "aws", "github", "gitlab", "stripe", "sendgrid", "brevo",
     "mailgun", "postmark", "slack", "openai", "anthropic", "twilio", "azure",
-    "tencent", "aliyun", "sanity", "emailjs", "smtp", "mail_", "mail-",
+    "tencent", "aliyun", "smtp", "mail_", "mail-",
     "password", "passwd", "secret", "private", "credential", "access_key",
-    "secret_key", "nextauth",
+    "secret_key",
+)
+
+
+_IGNORED_ENV_KEY_MARKERS = (
+    "nextauth", "emailjs", "sanity", "paystack", "msi_secret",
 )
 
 
 def _interesting_kv(key: str, value: str) -> bool:
     key_l = key.strip().lower()
+    if key_l.startswith("appsetting_"):
+        key_l = key_l[len("appsetting_") :]
     value = (value or "").strip().replace("\r", "").strip().strip("'\"")
     if key_l in _NON_SECRET_KEYS:
         return False
     if _is_noise_env_key(key):
+        return False
+    if any(marker in key_l for marker in _IGNORED_ENV_KEY_MARKERS):
+        return False
+    if value.lower().startswith("sk_test_"):
         return False
     # SMTP/mail blocks are handled by extract_smtp — avoid duplicate env rows.
     if _SMTP_ENV_RE.match(key):
@@ -210,8 +221,7 @@ def extract_secrets(text: str, source_url: str = "", redact_values: bool = True)
             if isinstance(v, (str, int, float)) and _interesting_kv(str(k), str(v)):
                 add("env", f"{k}={v}", evidence=f"{k}=***")
 
-    # Regex packs. Paystack is listed before Stripe so 40-hex sk_test_ keys
-    # are not double-emitted as stripe_test.
+    # Regex packs — sk_test_ is never emitted.
     seen_token_values: set[str] = set()
     for _, pack in P.PATTERN_PACKS.items():
         for kind, regex in pack:
@@ -219,7 +229,7 @@ def extract_secrets(text: str, source_url: str = "", redact_values: bool = True)
                 val = P.first_group(m)
                 if not val:
                     continue
-                if kind in {"stripe_live", "stripe_test"} and P.PAYSTACK_SECRET.fullmatch(val):
+                if val.lower().startswith("sk_test_") or kind == "stripe_test":
                     continue
                 if val in seen_token_values:
                     continue

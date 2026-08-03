@@ -156,6 +156,7 @@ def looks_like_secret(value: str, min_entropy: float = 3.0, min_len: int = 12) -
     # structured keys can be shorter entropy but strong format
     if re.match(r"^(AKIA|ASIA|ghp_|gho_|glpat-|SG\.|sk_live_|sk-ant-|xox)", v):
         return True
+    # sk_test_ intentionally excluded — test keys are not reported.
     return shannon_entropy(v) >= min_entropy
 
 

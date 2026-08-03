@@ -7,7 +7,7 @@ from collections import defaultdict
 from typing import Any
 
 from app.core.providers import classify_env_assignment, provider_for_kind
-from app.extractors.patterns import IGNORED_SECRET_KINDS, PAYSTACK_SECRET
+from app.extractors.patterns import IGNORED_SECRET_KINDS
 from app.extractors.validators import (
     is_boolish_value,
     is_placeholder,
@@ -33,6 +33,8 @@ _NOISE_ENV_EXACT = frozenset({
     "msi_secret", "msi_endpoint", "identity_endpoint", "identity_header",
     "windowshide", "dd_logs_injection", "dd_trace_enabled", "dd_runtime_metrics_enabled",
     "node_env", "rails_env", "app_env", "environment", "debug", "ci",
+    # Low-value app/config secrets — not actionable cloud credentials
+    "nextauth_secret", "nextauth_url", "auth_secret",
 })
 _NOISE_ENV_PREFIXES = (
     "__next_private_",
@@ -43,6 +45,10 @@ _NOISE_ENV_PREFIXES = (
     "website_",
     "ecs_",
     "dd_",
+    "nextauth_",
+    "emailjs_",
+    "sanity_",
+    "paystack_",
 )
 _NOISE_ENV_SUFFIXES = (
     "_enabled", "_enable", "_disabled", "_injection", "_debug", "_verbose",
@@ -131,9 +137,13 @@ def _smtp_field(key: str) -> str | None:
 
 def _is_noise_env_value(key: str, rhs: str) -> bool:
     key_l = _strip_appsetting(key).lower()
+    rhs_l = (rhs or "").lower()
     if is_boolish_value(rhs):
         return True
     if is_placeholder(rhs):
+        return True
+    # Test payment keys are never kept.
+    if rhs_l.startswith("sk_test_"):
         return True
     # Azure MSI / identity UUIDs are not usable credentials.
     if key_l in {"msi_secret", "msi_endpoint"} or key_l.startswith("identity_"):
@@ -165,6 +175,11 @@ def _is_useless_result(kind: str, value: str) -> bool:
         return True
     if "google_api" in kind_l or kind_l == "jwt":
         return True
+    # Never surface Stripe/Paystack test keys.
+    if kind_l == "stripe_test" or value_s.lower().startswith("sk_test_"):
+        return True
+    if "=" in value_s and value_s.split("=", 1)[1].strip().lower().startswith("sk_test_"):
+        return True
     if kind_l == "env":
         parts = _env_parts(value_s)
         if parts and (is_noise_env_key(parts[0]) or _is_noise_env_value(parts[0], parts[1])):
@@ -183,8 +198,6 @@ def _canonical_token_kind(kind: str, value: str) -> tuple[str, str, str]:
     """Normalize provider/kind/value for token-shaped secrets (dedupe key)."""
     kind_l = (kind or "").lower()
     value_s = _clean(value)
-    if kind_l in {"stripe_live", "stripe_test"} and PAYSTACK_SECRET.fullmatch(value_s):
-        return "paystack", "paystack", value_s
     provider = provider_for_kind(kind_l)
     return provider, kind_l, value_s
 
