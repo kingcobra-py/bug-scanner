@@ -54,10 +54,16 @@ def _is_useless_secret(kind: str, value: str) -> bool:
         is_useless_env_assignment,
         looks_like_js_expression,
     )
+    from app.modules.base import _looks_like_credential_line
 
     kind_l = (kind or "").lower()
-    value_s = value or ""
+    value_s = (value or "").strip()
     if kind_l in IGNORED_SECRET_KINDS or kind_l.startswith("generic"):
+        return True
+    # Legacy exploit dumps put bash_history timestamps / bare numbers into Results.
+    if kind_l in {"exploit", "bash_history", "dotenv", "next_config", "wp_config", "config"} and not _looks_like_credential_line(value_s):
+        return True
+    if value_s.isdigit():
         return True
     # Legacy rows / env KV that still carry public Google keys or JWTs.
     if value_s.startswith("AIza"):
@@ -747,10 +753,14 @@ def create_app() -> FastAPI:
                     finding_id=f.get("id") or "",
                 )
             if not (extracted.get("secrets") or extracted.get("smtp")):
+                # Legacy active-exploit findings stored dump lines in evidence
+                # only. Keep credential-looking lines; skip bash timestamps.
+                from app.modules.base import _looks_like_credential_line
+
                 ftype = str(f.get("type") or "")
                 if ftype == "secrets" and f.get("evidence"):
                     for line in str(f.get("evidence") or "").splitlines():
-                        if not line.strip():
+                        if not _looks_like_credential_line(line):
                             continue
                         _index_credential(
                             secret_index,

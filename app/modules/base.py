@@ -178,19 +178,50 @@ def body_extractions(ctx: ScanContext, url: str, body: str) -> dict:
     return extract_all(body, source_url=url, redact_values=ctx.config.redact_secrets)
 
 
+def _looks_like_credential_line(value: str) -> bool:
+    """Reject bash-history timestamps and other raw dump noise."""
+    text = (value or "").strip()
+    if not text or len(text) < 6:
+        return False
+    if text.isdigit():
+        return False
+    if text.startswith("#") and text[1:].strip().isdigit():
+        return False
+    # Prefer KEY=VALUE / KEY:VALUE style credentials from dumps.
+    if "=" in text or (":" in text and not text.startswith("http")):
+        return True
+    lowered = text.lower()
+    markers = (
+        "password", "secret", "token", "api_key", "apikey", "access_key",
+        "private_key", "aws_", "akia", "ghp_", "sk_live", "xox",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def exploit_lines_to_extracted(
     category: str,
     lines: list[Any],
     *,
     source_url: str = "",
 ) -> dict[str, Any]:
-    """Normalize exploit file dumps into Results-compatible extracted payloads."""
+    """Normalize exploit extractor output into Results-compatible payloads.
+
+    Only keep already-parsed secret/smtp dicts (or credential-looking lines).
+    Raw bash_history / env dump lines are ignored — they inflate Results with
+    timestamps and shell noise.
+    """
     secrets: list[dict[str, Any]] = []
     smtp: list[dict[str, Any]] = []
-    kind_hint = category.replace("_secrets", "").replace("_apis", "api") or "env"
+    kind_hint = (
+        category.replace("_secrets", "")
+        .replace("_smtp", "")
+        .replace("_apis", "api")
+        or "env"
+    )
+    prefer_smtp = category.endswith("_smtp") or kind_hint == "smtp"
     for item in lines or []:
         if isinstance(item, dict):
-            kind = str(item.get("kind") or kind_hint)
+            kind = str(item.get("kind") or ("smtp" if prefer_smtp else kind_hint))
             payload = {
                 **item,
                 "source_url": item.get("source_url") or source_url,
@@ -200,10 +231,10 @@ def exploit_lines_to_extracted(
             else:
                 secrets.append(payload)
             continue
-        if isinstance(item, str) and item.strip():
+        if isinstance(item, str) and _looks_like_credential_line(item):
             secrets.append(
                 {
-                    "kind": kind_hint,
+                    "kind": kind_hint if kind_hint != "smtp" else "env",
                     "value": item.strip(),
                     "source_url": source_url,
                 }

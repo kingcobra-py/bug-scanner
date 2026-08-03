@@ -87,7 +87,7 @@ def test_get_results_legacy_exploit_evidence_fallback(tmp_path, monkeypatch):
             "url": "https://a.example",
             "title": "Secret extraction: env (wp2shell)",
             "module": "wordpress",
-            "evidence": "DB_PASSWORD=legacy-password\nAPP_KEY=legacy-key",
+            "evidence": "DB_PASSWORD=legacy-password\nAPP_KEY=legacy-key\n1819577869\n#1654678059",
         },
     )
 
@@ -95,4 +95,6 @@ def test_get_results_legacy_exploit_evidence_fallback(tmp_path, monkeypatch):
     values = {item["value"] for item in data["secrets"]}
     assert "DB_PASSWORD=legacy-password" in values
     assert "APP_KEY=legacy-key" in values
+    assert "1819577869" not in values
+    assert "#1654678059" not in values
     server.store.delete_scan(scan_id)
