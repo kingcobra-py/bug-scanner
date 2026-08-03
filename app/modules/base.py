@@ -178,6 +178,16 @@ def body_extractions(ctx: ScanContext, url: str, body: str) -> dict:
     return extract_all(body, source_url=url, redact_values=ctx.config.redact_secrets)
 
 
+_NON_SECRET_ENV_KEYS = {
+    "path", "home", "pwd", "user", "shell", "shlvl", "term", "lang", "lc_all",
+    "hostname", "host", "port", "node_version", "yarn_version", "npm_config_user_agent",
+    "npm_config_cache", "colorterm", "editor", "pager", "tmpdir", "tmp", "temp",
+    "logname", "mail", "oldpwd", "underscore", "_", "ps1", "ps2", "ls_colors",
+    "xdg_runtime_dir", "xdg_session_id", "xdg_session_type", "display",
+    "ssh_connection", "ssh_client", "ssh_tty", "debian_frontend",
+}
+
+
 def _looks_like_credential_line(value: str) -> bool:
     """Reject bash-history timestamps and other raw dump noise."""
     text = (value or "").strip()
@@ -187,15 +197,25 @@ def _looks_like_credential_line(value: str) -> bool:
         return False
     if text.startswith("#") and text[1:].strip().isdigit():
         return False
-    # Prefer KEY=VALUE / KEY:VALUE style credentials from dumps.
-    if "=" in text or (":" in text and not text.startswith("http")):
-        return True
     lowered = text.lower()
     markers = (
-        "password", "secret", "token", "api_key", "apikey", "access_key",
-        "private_key", "aws_", "akia", "ghp_", "sk_live", "xox",
+        "password", "passwd", "secret", "token", "api_key", "apikey", "access_key",
+        "private_key", "aws_", "akia", "ghp_", "sk_live", "xox", "smtp", "mail_",
+        "database_url", "db_pass", "db_password", "auth", "credential", "bearer",
     )
-    return any(marker in lowered for marker in markers)
+    if any(marker in lowered for marker in markers):
+        return True
+    if "=" not in text:
+        return ":" in text and not text.startswith("http")
+    key = text.split("=", 1)[0].strip().lower()
+    if not key or key in _NON_SECRET_ENV_KEYS:
+        return False
+    # Generic process env (PATH, HOME, …) is not a credential.
+    if key.isidentifier() and not any(
+        part in key for part in ("pass", "secret", "token", "key", "auth", "cred", "smtp", "mail")
+    ):
+        return False
+    return True
 
 
 def exploit_lines_to_extracted(
