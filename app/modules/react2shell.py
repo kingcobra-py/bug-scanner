@@ -7,6 +7,7 @@ Fingerprints Next/React, checks exposed assets, and scores known vulnerable pack
 
 from __future__ import annotations
 
+from app.exploits.react2shell.detector import React2ShellDetector
 from app.modules.base import body_extractions, finding_from_hit, save_http_response
 from app.modules.vulnerability_intel import package_versions, react2shell_exposure
 from app.storage.models import Finding, ScanContext, TargetContext
@@ -232,4 +233,28 @@ class ReactModule:
                         )
                     )
                     ctx.progress.add_hit(secrets=len(extracted.get("secrets", [])), module=self.name)
+
+        detector = React2ShellDetector(http, target.url)
+        scan = detector.scan(home if home.status_code == 200 else None)
+        if scan.get("rsc_surface_active"):
+            findings.append(
+                finding_from_hit(
+                    module=self.name,
+                    ftype="other",
+                    severity="medium",
+                    target=target,
+                    url=home.url or target.url,
+                    title="React2Shell RSC action surface active (next.txt PoC fingerprint)",
+                    evidence=(
+                        f"headers={','.join(scan.get('rsc_headers') or [])}; "
+                        f"next_action={scan.get('next_action_accepts')}; "
+                        f"markers={','.join(scan.get('response_markers') or [])}; "
+                        f"poc={scan.get('poc_source')}"
+                    ),
+                    confidence=0.86,
+                    extracted=scan,
+                    tags=["nextjs", "react2shell", "rsc", "detection-only"],
+                )
+            )
+            ctx.progress.add_hit(module=self.name)
         return findings

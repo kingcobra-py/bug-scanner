@@ -1,5 +1,6 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import json
 import threading
 from urllib.parse import unquote, urlparse
 
@@ -17,6 +18,38 @@ FIX = Path(__file__).parent / "fixtures"
 class CMSFixtureHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
+
+    def _respond(self, code: int, body: bytes, extra_headers: dict | None = None):
+        self.send_response(code)
+        if extra_headers:
+            for key, value in extra_headers.items():
+                self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        query = parsed.query
+
+        if path == "/" and "rest_route=/batch/v1" in query:
+            payload = {
+                "responses": [
+                    {"body": {"code": "parse_path_failed"}},
+                    {"body": {"code": "block_cannot_read"}},
+                    {"body": {"code": "rest_batch_not_allowed"}},
+                ]
+            }
+            self._respond(207, json.dumps(payload).encode())
+            return
+
+        if path == "/":
+            self._respond(500, b'{"digest":"NEXT_REDIRECT probe"}')
+            return
+
+        self.send_response(404)
+        self.end_headers()
+        self.wfile.write(b"missing")
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -44,14 +77,21 @@ class CMSFixtureHandler(BaseHTTPRequestHandler):
             "/configuration.php": (
                 b"<?php class JConfig { public $secret='a1b2c3d4e5f6g7h8i9j0'; "
                 b"public $password='SuperSecretPass1'; "
-                b"public $live_site='https://cms.nightwatch.local'; }\n"
+                b"public $live_site='https://cms.nightwatch.local'; "
+                b"public $smtphost='smtp.sendgrid.net'; "
+                b"public $smtpport='587'; "
+                b"public $smtpuser='apikey'; "
+                b"public $smtppass='SG." + (b"a" * 22) + b"." + (b"b" * 43) + b"'; }\n"
                 b"// ghp_" + (b"a" * 36) + b"\n"
-                b"// SG." + (b"a" * 22) + b"." + (b"b" * 43) + b"\n"
             ),
             "/wp-config.php": (
                 b"<?php define('DB_NAME','wp');\n"
                 b"define('AWS_KEY','AKIA" + (b"F" * 16) + b"');\n"
                 b"define('STRIPE','sk_live_" + (b"c" * 24) + b"');\n"
+                b"define('SMTP_HOST','smtp.sendgrid.net');\n"
+                b"define('SMTP_PORT','587');\n"
+                b"define('SMTP_USER','apikey');\n"
+                b"define('SMTP_PASS','SG." + (b"a" * 22) + b"." + (b"b" * 43) + b"');\n"
             ),
             "/api/index.php/v1": b'{"routes":["/api/index.php/v1/content/articles","/api/index.php/v1/users"]}',
             "/api/index.php/v1/content/articles": b'{"data":[{"type":"articles","links":{"self":"/api/index.php/v1/content/articles"}}]}',
@@ -104,6 +144,7 @@ def test_react_module_version_and_rsc(tmp_path):
     titles = " | ".join(f.title for f in findings)
     assert "React2Shell affected package version: next@15.0.3" in titles
     assert "React Server Components surface headers present" in titles
+    assert "React2Shell RSC action surface active" in titles
     assert any("cve-2025-55182" in f.tags for f in findings)
 
 
@@ -116,9 +157,13 @@ def test_wordpress_module_wp2shell_signals(tmp_path):
     titles = " | ".join(f.title for f in findings)
     assert "WordPress 6.9.2 matches wp2shell pre-authentication RCE chain" in titles
     assert "WordPress REST batch endpoint reachable" in titles
+    assert "wp2shell batch route-confusion markers detected" in titles
     assert any("Executable file listed under wp-content/uploads" in f.title for f in findings)
-    assert "Priority secrets extracted from wp-config" in titles
-    assert any("priority-secrets" in f.tags for f in findings)
+    assert "Priority secrets extracted from wp-config" not in titles
+    assert "SMTP credentials extracted from wp-config" in titles
+    assert "Secrets extracted from wp-config" in titles
+    assert any("smtp" in f.tags for f in findings)
+    assert any("extract" in f.tags for f in findings)
 
 
 def test_joomla_module_jce_and_webshell_indicator(tmp_path):
@@ -130,11 +175,9 @@ def test_joomla_module_jce_and_webshell_indicator(tmp_path):
     titles = " | ".join(f.title for f in findings)
     assert "JCE 2.9.80 matches CVE-2026-48907 exposure range" in titles
     assert "JCE cpanel.feed proxy endpoint reachable" in titles
+    assert "JCE CVE-2026-48907 chain preconditions satisfied" in titles
     assert any("Executable file listed under /images" in f.title for f in findings)
-    assert "Priority secrets extracted from Joomla response" in titles
-    assert any("priority-secrets" in f.tags for f in findings)
-    assert any(
-        f.extracted.get("extractor") == "priority_secrets"
-        for f in findings
-        if f.extracted.get("secrets")
-    )
+    assert "SMTP credentials extracted from configuration.php" in titles
+    assert "Secrets extracted from configuration.php" in titles
+    assert any("smtp" in f.tags for f in findings)
+    assert any("extract" in f.tags for f in findings)
