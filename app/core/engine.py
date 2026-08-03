@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import os
 import queue as queue_mod
+import random
 import threading
 import time
 import traceback
@@ -15,6 +16,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
+from urllib.parse import urlparse
 
 from app.core.fingerprint import fingerprint_target
 from app.core.http_client import HttpClient
@@ -257,8 +259,8 @@ class ScanEngine:
         try:
             target_count = config.target_count or len(config.targets)
             logger.info("streaming targets=%d", target_count)
-            est = max(target_count * max(len(config.modules), 1) * 10, 1)
-            progress.start(est)
+            # Host-level progress: one Done unit = one domain/IP fully finished.
+            progress.start(max(int(target_count), 1))
             if config.wordlist_path:
                 config.custom_paths = list(dict.fromkeys([
                     *config.custom_paths,
@@ -424,19 +426,25 @@ class ScanEngine:
             )
 
             findings_dicts = dedupe_findings(self.store.get_findings(scan_id))
+            vuln_hosts = {
+                (urlparse(str(f.get("target") or f.get("url") or "")).netloc or "").lower()
+                for f in findings_dicts
+            }
+            vuln_hosts.discard("")
             final_snap_dict = {
                 "total": aggregate.get("total", 0),
                 "done": aggregate.get("done", 0),
                 "failed": aggregate.get("failed", 0),
                 "queued": max(aggregate.get("total", 0) - aggregate.get("done", 0) - aggregate.get("failed", 0), 0),
                 "hits": len(findings_dicts),
+                "vulnerable_hosts": len(vuln_hosts) or int(aggregate.get("vulnerable_hosts", 0) or 0),
                 "secrets": aggregate.get("secrets", 0),
                 "timeouts": aggregate.get("timeouts", 0),
                 "requests": aggregate.get("requests", 0),
                 "rps": aggregate.get("rps", 0.0),
                 "current_target": "",
                 "current_module": "",
-                "percent": 100.0,
+                "percent": 100.0 if not stop_event.is_set() else float(aggregate.get("percent") or 0.0),
                 "eta_seconds": 0.0,
                 "module_progress": {},
             }
@@ -491,6 +499,7 @@ class ScanEngine:
                 "done": sum(s.get("done", 0) for s in snaps),
                 "failed": sum(s.get("failed", 0) for s in snaps),
                 "hits": sum(s.get("hits", 0) for s in snaps),
+                "vulnerable_hosts": sum(s.get("vulnerable_hosts", 0) for s in snaps),
                 "secrets": sum(s.get("secrets", 0) for s in snaps),
                 "timeouts": sum(s.get("timeouts", 0) for s in snaps),
                 "requests": sum(s.get("requests", 0) for s in snaps),
@@ -660,6 +669,8 @@ class ScanEngine:
                 try:
                     on_target_done(future.result())
                 except Exception as e:
+                    # ``_run_target_pipeline`` already counted this host via
+                    # ``complete_target`` before re-raising.
                     logger.error("target failed %s: %s", turl, e)
                     logger.debug(traceback.format_exc())
 
@@ -672,17 +683,30 @@ class ScanEngine:
         logger,
     ) -> list[Finding]:
         findings: list[Finding] = []
-        for target in self._prepare_target(
-            ctx.http,
-            turl,
-            ctx.config,
-            ctx.progress,
-            logger,
-        ):
-            if ctx.stop_event.is_set():
-                break
-            findings.extend(self._scan_target(target, modules, ctx, on_finding))
-        return findings
+        completed = False
+        try:
+            for target in self._prepare_target(
+                ctx.http,
+                turl,
+                ctx.config,
+                ctx.progress,
+                logger,
+            ):
+                if ctx.stop_event.is_set():
+                    break
+                findings.extend(self._scan_target(target, modules, ctx, on_finding))
+            if findings:
+                ctx.progress.note_vulnerable_host(turl)
+                for finding in findings:
+                    host = getattr(finding, "target", None) or getattr(finding, "url", None) or turl
+                    ctx.progress.note_vulnerable_host(str(host))
+            ctx.progress.complete_target(success=True)
+            completed = True
+            return findings
+        except Exception:
+            if not completed:
+                ctx.progress.complete_target(success=False)
+            raise
 
     def _prepare_target(
         self,
@@ -839,7 +863,22 @@ class ScanEngine:
         # DEBUG only: these fire per target (and per module below), which at
         # 10M+ targets is the single largest source of log volume/DB writes.
         log.debug("target start %s tech=%s", target.url, ",".join(target.tech))
-        for mod in modules:
+        # Shuffle per host so heavy modules (path) do not always starve
+        # wordpress / joomla / react on every target.
+        ordered = list(modules)
+        random.shuffle(ordered)
+
+        def _on_finding_wrapped(finding: Finding) -> None:
+            try:
+                ctx.progress.note_vulnerable_host(
+                    getattr(finding, "target", "") or getattr(finding, "url", "") or target.url
+                )
+            except Exception:
+                pass
+            if on_finding:
+                on_finding(finding)
+
+        for mod in ordered:
             if ctx.stop_event.is_set():
                 break
             name = getattr(mod, "name", mod.__class__.__name__)
@@ -850,11 +889,13 @@ class ScanEngine:
             local_ctx.logger = mlog
             mlog.debug("module start on %s", target.url)
             try:
-                with stream_findings(on_finding):
+                with stream_findings(_on_finding_wrapped):
                     findings = mod.run(target, local_ctx) or []
                 out.extend(findings)
                 # share findings for later modules (method tester uses endpoints)
                 local_ctx.findings.extend(findings)
+                if findings:
+                    ctx.progress.note_vulnerable_host(target.url)
                 mlog.debug("module end hits=%d", len(findings))
             except Exception as e:
                 mlog.error("module error: %s", e)

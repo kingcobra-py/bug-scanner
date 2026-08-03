@@ -7,6 +7,7 @@ import time
 from collections import deque
 from dataclasses import asdict
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.progress import (
@@ -21,6 +22,7 @@ from rich.progress import (
 )
 
 from app.storage.models import ProgressSnapshot
+from app.utils.normalize import ensure_scheme
 
 
 class ProgressManager:
@@ -47,6 +49,7 @@ class ProgressManager:
         # with tick()/set_current()/add_hit() for the same mutex.
         self._request_lock = threading.Lock()
         self._request_times: deque[float] = deque()
+        self._vulnerable_hosts: set[str] = set()
 
     def subscribe(self, callback: Callable[[ProgressSnapshot], None]) -> None:
         with self._lock:
@@ -71,6 +74,15 @@ class ProgressManager:
             except Exception:
                 pass
 
+    def _recompute_host_progress_locked(self) -> None:
+        finished = self._snap.done + self._snap.failed
+        self._snap.queued = max(self._snap.total - finished, 0)
+        self._snap.percent = (finished / self._snap.total * 100.0) if self._snap.total else 0.0
+        elapsed = max(time.monotonic() - self._start, 0.001)
+        rate = finished / elapsed
+        remaining = max(self._snap.total - finished, 0)
+        self._snap.eta_seconds = (remaining / rate) if rate > 0 else None
+
     def start(self, total: int) -> None:
         with self._lock:
             self._snap.total = max(total, 0)
@@ -89,7 +101,7 @@ class ProgressManager:
                     transient=False,
                 )
                 self._progress.start()
-                self._overall_task = self._progress.add_task("overall", total=max(total, 1))
+                self._overall_task = self._progress.add_task("hosts", total=max(total, 1))
                 self._module_task = self._progress.add_task("module", total=1)
             snap, subs = self._dispatch_locked(force=True)
         self._fanout(snap, subs)
@@ -97,7 +109,7 @@ class ProgressManager:
     def set_total(self, total: int) -> None:
         with self._lock:
             self._snap.total = max(total, 0)
-            self._snap.queued = max(total - self._snap.done - self._snap.failed, 0)
+            self._recompute_host_progress_locked()
             if self._progress and self._overall_task is not None:
                 self._progress.update(self._overall_task, total=max(total, 1))
             snap, subs = self._dispatch_locked(force=True)
@@ -106,7 +118,7 @@ class ProgressManager:
     def add_total(self, n: int) -> None:
         with self._lock:
             self._snap.total += n
-            self._snap.queued += n
+            self._recompute_host_progress_locked()
             if self._progress and self._overall_task is not None:
                 self._progress.update(self._overall_task, total=max(self._snap.total, 1))
             snap, subs = self._dispatch_locked(force=True)
@@ -133,43 +145,46 @@ class ProgressManager:
     def module_set_total(self, module: str, total: int) -> None:
         with self._lock:
             mp = self._snap.module_progress.setdefault(module, {"done": 0, "total": 0, "hits": 0})
-            mp["total"] = total
+            # Accumulate expected work across hosts instead of resetting —
+            # otherwise Jobs module totals stay stuck at one host's path count.
+            mp["total"] += max(int(total), 0)
             if self._progress and self._module_task is not None and self._snap.current_module == module:
-                self._progress.update(self._module_task, total=max(total, 1), completed=mp["done"])
+                self._progress.update(self._module_task, total=max(mp["total"], 1), completed=mp["done"])
             snap, subs = self._dispatch_locked(force=False)
         self._fanout(snap, subs)
 
     def tick(self, success: bool = True, timeout: bool = False, module: str = "") -> None:
-        now = time.monotonic()
+        """Record one HTTP/work-unit check. Does not advance host-level Done."""
         with self._lock:
             if timeout:
                 self._snap.timeouts += 1
-            if success:
-                self._snap.done += 1
-            else:
-                self._snap.failed += 1
-            finished = self._snap.done + self._snap.failed
-            self._snap.queued = max(self._snap.total - finished, 0)
-            self._snap.percent = (finished / self._snap.total * 100.0) if self._snap.total else 0.0
-            elapsed = max(now - self._start, 0.001)
-            rate = finished / elapsed
-            remaining = max(self._snap.total - finished, 0)
-            self._snap.eta_seconds = (remaining / rate) if rate > 0 else None
             mod = module or self._snap.current_module
             if mod:
                 mp = self._snap.module_progress.setdefault(mod, {"done": 0, "total": 0, "hits": 0})
                 mp["done"] += 1
-            if self._progress and self._overall_task is not None:
-                self._progress.update(self._overall_task, completed=finished)
-                if self._module_task is not None and mod:
-                    mp = self._snap.module_progress[mod]
-                    self._progress.update(self._module_task, completed=mp["done"], total=max(mp["total"], 1))
+            if self._progress and self._module_task is not None and mod:
+                mp = self._snap.module_progress[mod]
+                self._progress.update(self._module_task, completed=mp["done"], total=max(mp["total"], 1))
             # tick() fires once per HTTP path check — by far the highest
             # frequency call in the engine. Coalescing the fanout (not the
             # counters, which are always exact) is what keeps hundreds of
             # worker threads from serializing behind snapshot+dispatch on
             # every single request.
             snap, subs = self._dispatch_locked(force=False)
+        self._fanout(snap, subs)
+
+    def complete_target(self, success: bool = True) -> None:
+        """Mark one domain/IP as fully finished (all selected modules, or dead)."""
+        with self._lock:
+            if success:
+                self._snap.done += 1
+            else:
+                self._snap.failed += 1
+            self._recompute_host_progress_locked()
+            finished = self._snap.done + self._snap.failed
+            if self._progress and self._overall_task is not None:
+                self._progress.update(self._overall_task, completed=finished)
+            snap, subs = self._dispatch_locked(force=True)
         self._fanout(snap, subs)
 
     def record_request(self) -> None:
@@ -195,6 +210,19 @@ class ProgressManager:
                 mp["hits"] += 1
             # Hits are comparatively rare and high-value; always surface
             # them immediately rather than coalescing with tick() traffic.
+            snap, subs = self._dispatch_locked(force=True)
+        self._fanout(snap, subs)
+
+    def note_vulnerable_host(self, url: str) -> None:
+        """Count a unique host that produced at least one finding."""
+        host = (urlparse(ensure_scheme(url or "")).netloc or "").lower()
+        if not host:
+            return
+        with self._lock:
+            if host in self._vulnerable_hosts:
+                return
+            self._vulnerable_hosts.add(host)
+            self._snap.vulnerable_hosts = len(self._vulnerable_hosts)
             snap, subs = self._dispatch_locked(force=True)
         self._fanout(snap, subs)
 

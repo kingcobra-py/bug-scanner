@@ -169,11 +169,10 @@ def run_worker(
     )
 
     try:
-        shard_est = max(
-            (config.target_count or len(config.targets)) // num_workers * max(len(config.modules), 1) * 10,
-            1,
-        )
-        progress.start(shard_est)
+        # Host-level progress for this shard (ceil split of the target list).
+        target_count = int(config.target_count or len(config.targets) or 0)
+        shard_hosts = max((target_count + num_workers - 1) // num_workers, 1)
+        progress.start(shard_hosts)
 
         from concurrent.futures import ThreadPoolExecutor
 

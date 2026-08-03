@@ -511,9 +511,9 @@ function jobCard(job) {
       <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
       <div class="job-stats">
         <div title="Actual completed HTTP attempts per second (including probes, retries, and redirects)">HTTP RPS<b>${Number(progress.rps || 0).toFixed(1)}</b></div>
-        <div>Done<b>${formatNumber(progress.done)}</b></div>
-        <div>Failed<b>${formatNumber(progress.failed)}</b></div>
-        <div>Hits<b>${formatNumber(progress.hits ?? job.summary?.finding_count)}</b></div>
+        <div title="Domains/IPs that finished the full selected-module pipeline">Done<b>${formatNumber(progress.done)}</b></div>
+        <div title="Domains/IPs that failed hard during their pipeline">Failed<b>${formatNumber(progress.failed)}</b></div>
+        <div title="Unique hosts that produced at least one finding">Vulnerable hosts<b>${formatNumber(progress.vulnerable_hosts ?? job.summary?.vulnerable_host_count ?? 0)}</b></div>
         <div>Secrets<b>${formatNumber(progress.secrets)}</b></div>
       </div>
       <div class="text-[11px] text-slate-500 truncate mt-3">${esc(progress.current_module || "idle")} ${progress.current_target ? `@ ${esc(progress.current_target)}` : ""}</div>

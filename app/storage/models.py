@@ -71,11 +71,15 @@ class TargetContext:
 
 @dataclass
 class ProgressSnapshot:
+    # ``total`` / ``done`` / ``failed`` / ``queued`` / ``percent`` are
+    # host-level: one unit = one domain/IP that finished its full pipeline
+    # (or failed hard). Per-request work stays in ``module_progress`` only.
     total: int = 0
     done: int = 0
     failed: int = 0
     queued: int = 0
     hits: int = 0
+    vulnerable_hosts: int = 0
     secrets: int = 0
     timeouts: int = 0
     requests: int = 0

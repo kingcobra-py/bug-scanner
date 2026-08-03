@@ -339,8 +339,8 @@ class ScanStore:
                     slim["progress"] = {
                         key: progress.get(key)
                         for key in (
-                            "total", "done", "failed", "queued", "hits", "secrets",
-                            "requests", "rps", "percent", "eta_seconds",
+                            "total", "done", "failed", "queued", "hits", "vulnerable_hosts",
+                            "secrets", "requests", "rps", "percent", "eta_seconds",
                         )
                         if key in progress
                     }
