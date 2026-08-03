@@ -77,14 +77,21 @@ class CMSFixtureHandler(BaseHTTPRequestHandler):
             "/configuration.php": (
                 b"<?php class JConfig { public $secret='a1b2c3d4e5f6g7h8i9j0'; "
                 b"public $password='SuperSecretPass1'; "
-                b"public $live_site='https://cms.nightwatch.local'; }\n"
+                b"public $live_site='https://cms.nightwatch.local'; "
+                b"public $smtphost='smtp.sendgrid.net'; "
+                b"public $smtpport='587'; "
+                b"public $smtpuser='apikey'; "
+                b"public $smtppass='SG." + (b"a" * 22) + b"." + (b"b" * 43) + b"'; }\n"
                 b"// ghp_" + (b"a" * 36) + b"\n"
-                b"// SG." + (b"a" * 22) + b"." + (b"b" * 43) + b"\n"
             ),
             "/wp-config.php": (
                 b"<?php define('DB_NAME','wp');\n"
                 b"define('AWS_KEY','AKIA" + (b"F" * 16) + b"');\n"
                 b"define('STRIPE','sk_live_" + (b"c" * 24) + b"');\n"
+                b"define('SMTP_HOST','smtp.sendgrid.net');\n"
+                b"define('SMTP_PORT','587');\n"
+                b"define('SMTP_USER','apikey');\n"
+                b"define('SMTP_PASS','SG." + (b"a" * 22) + b"." + (b"b" * 43) + b"');\n"
             ),
             "/api/index.php/v1": b'{"routes":["/api/index.php/v1/content/articles","/api/index.php/v1/users"]}',
             "/api/index.php/v1/content/articles": b'{"data":[{"type":"articles","links":{"self":"/api/index.php/v1/content/articles"}}]}',
@@ -152,8 +159,11 @@ def test_wordpress_module_wp2shell_signals(tmp_path):
     assert "WordPress REST batch endpoint reachable" in titles
     assert "wp2shell batch route-confusion markers detected" in titles
     assert any("Executable file listed under wp-content/uploads" in f.title for f in findings)
-    assert "Priority secrets extracted from wp-config" in titles
-    assert any("priority-secrets" in f.tags for f in findings)
+    assert "Priority secrets extracted from wp-config" not in titles
+    assert "SMTP credentials extracted from wp-config" in titles
+    assert "Secrets/API keys extracted from wp-config" in titles
+    assert any("smtp" in f.tags for f in findings)
+    assert any("extract" in f.tags for f in findings)
 
 
 def test_joomla_module_jce_and_webshell_indicator(tmp_path):
@@ -167,10 +177,7 @@ def test_joomla_module_jce_and_webshell_indicator(tmp_path):
     assert "JCE cpanel.feed proxy endpoint reachable" in titles
     assert "JCE CVE-2026-48907 chain preconditions satisfied" in titles
     assert any("Executable file listed under /images" in f.title for f in findings)
-    assert "Priority secrets extracted from Joomla response" in titles
-    assert any("priority-secrets" in f.tags for f in findings)
-    assert any(
-        f.extracted.get("extractor") == "priority_secrets"
-        for f in findings
-        if f.extracted.get("secrets")
-    )
+    assert "SMTP credentials extracted from configuration.php" in titles
+    assert "Secrets/API keys extracted from configuration.php" in titles
+    assert any("smtp" in f.tags for f in findings)
+    assert any("extract" in f.tags for f in findings)

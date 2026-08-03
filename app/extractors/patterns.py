@@ -91,6 +91,13 @@ PROVIDER_HOST = re.compile(
     r"(?i)\b(?:smtp\.(?:sendgrid\.net|mailgun\.org|postmarkapp\.com|gmail\.com)|email-smtp\.[a-z0-9\-]+\.amazonaws\.com|smtp\.mailchimp\.com)\b"
 )
 
+JCONFIG_SMTP_FIELD = re.compile(
+    r"(?im)\$(?P<key>smtphost|smtpuser|smtppass|smtpport|smtpsecure|mailer)\s*=\s*['\"](?P<value>[^'\"]+)['\"]"
+)
+WP_DEFINE_SMTP = re.compile(
+    r"(?im)define\s*\(\s*['\"]SMTP_(?P<key>HOST|USER|PASS|PORT)['\"]\s*,\s*['\"](?P<value>[^'\"]+)['\"]"
+)
+
 # --- Env / config assignment ---
 ENV_LINE = re.compile(
     r"(?m)^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:[\"']?)([^\"'\n#]+?)(?:[\"'])?\s*$"

@@ -110,4 +110,37 @@ def extract_smtp(text: str, source_url: str = "", redact_values: bool = True) ->
             conf=0.55,
         )
 
+    jconfig: dict[str, str] = {}
+    for m in P.JCONFIG_SMTP_FIELD.finditer(text):
+        jconfig[m.group("key").lower()] = m.group("value")
+    if jconfig.get("smtphost"):
+        add(
+            {
+                "host": jconfig.get("smtphost", ""),
+                "port": jconfig.get("smtpport", ""),
+                "user": jconfig.get("smtpuser", ""),
+                "pass": jconfig.get("smtppass", ""),
+                "secure": jconfig.get("smtpsecure", ""),
+                "mailer": jconfig.get("mailer", ""),
+            },
+            evidence="JConfig $smtphost block",
+            conf=0.92 if jconfig.get("smtppass") else 0.75,
+        )
+
+    wp_smtp: dict[str, str] = {}
+    for m in P.WP_DEFINE_SMTP.finditer(text):
+        wp_smtp[m.group("key").lower()] = m.group("value")
+    if wp_smtp.get("host"):
+        add(
+            {
+                "host": wp_smtp.get("host", ""),
+                "port": wp_smtp.get("port", ""),
+                "user": wp_smtp.get("user", ""),
+                "pass": wp_smtp.get("pass", ""),
+                "scheme": "smtp",
+            },
+            evidence="wp-config SMTP define() block",
+            conf=0.9 if wp_smtp.get("pass") else 0.72,
+        )
+
     return findings

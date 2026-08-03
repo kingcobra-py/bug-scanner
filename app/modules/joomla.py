@@ -2,14 +2,14 @@
 Joomla detection module (SAFE).
 
 Does NOT integrate Joomla RCE / webshell upload PoCs.
-Detection + priority secret packs only: AWS, GitHub, Stripe, SendGrid, Brevo.
+Fingerprints targets, scores JCE exposure, and extracts SMTP / API keys /
+secrets from reachable Joomla artifacts (configuration.php, Web Services API, etc.).
 """
 
 from __future__ import annotations
 
 from app.exploits.joomla_rce.detector import JoomlaJceDetector
-from app.extractors.priority_secrets import priority_extractions
-from app.modules.base import finding_from_hit, save_evidence
+from app.modules.base import emit_credential_findings, finding_from_hit, joomla_body_extractions, save_evidence
 from app.modules.vulnerability_intel import executable_upload_paths, jce_exposure, xml_version
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
@@ -50,40 +50,6 @@ EXTRACT_PATHS = {
 }
 
 
-def _emit_priority_secrets(
-    *,
-    findings: list[Finding],
-    target: TargetContext,
-    ctx: ScanContext,
-    url: str,
-    path: str,
-    body: str,
-    extracted: dict,
-) -> None:
-    secrets = extracted.get("secrets") or []
-    if not secrets:
-        return
-    raw_ref = save_evidence(ctx, f"joomla_priority_secrets_{path.strip('/') or 'home'}", body)
-    kinds = sorted({s.get("kind", "") for s in secrets if s.get("kind")})
-    findings.append(
-        finding_from_hit(
-            module="joomla",
-            ftype="js_secret",
-            severity="critical",
-            target=target,
-            url=url,
-            title="Priority secrets extracted from Joomla response",
-            evidence=", ".join(kinds),
-            confidence=0.9,
-            extracted=extracted,
-            raw_ref=raw_ref,
-            tags=["joomla", "priority-secrets", "aws", "github", "stripe", "sendgrid", "brevo"],
-            validated=True,
-        )
-    )
-    ctx.progress.add_hit(secrets=len(secrets), module="joomla")
-
-
 class JoomlaModule:
     name = "joomla"
 
@@ -94,8 +60,8 @@ class JoomlaModule:
         findings: list[Finding] = []
         http = ctx.http
         is_joomla = "joomla" in (target.tech or [])
+
         ctx.progress.module_set_total(self.name, len(JOOMLA_PATHS))
-        redact = ctx.config.redact_secrets
 
         for path in JOOMLA_PATHS:
             if ctx.stop_event.is_set():
@@ -108,9 +74,9 @@ class JoomlaModule:
                 continue
             body = resp.text or ""
             extracted = (
-                priority_extractions(body, source_url=resp.url or url, redact_values=redact)
+                joomla_body_extractions(ctx, resp.url or url, body)
                 if resp.status_code == 200 and body and path in EXTRACT_PATHS
-                else {"secrets": [], "apis": [], "smtp": [], "endpoints": [], "extractor": "priority_secrets"}
+                else {"secrets": [], "apis": [], "smtp": [], "endpoints": []}
             )
 
             if path in {"/", "/administrator/", "/administrator/index.php"} and resp.status_code in (200, 401, 403):
@@ -151,11 +117,22 @@ class JoomlaModule:
                         confidence=0.95,
                         extracted=extracted,
                         raw_ref=raw_ref,
-                        tags=["joomla", "config", "priority-secrets"],
+                        tags=["joomla", "config", "extract"],
                         validated=True,
                     )
                 )
                 ctx.progress.add_hit(secrets=len(extracted.get("secrets", [])), module=self.name)
+                emit_credential_findings(
+                    findings=findings,
+                    target=target,
+                    ctx=ctx,
+                    module=self.name,
+                    url=resp.url or url,
+                    path=path,
+                    body=body,
+                    extracted=extracted,
+                    source_label=f"configuration.php ({path})",
+                )
 
             if path.endswith("jce.xml") and resp.status_code == 200 and len(body) > 20:
                 is_joomla = True
@@ -279,15 +256,18 @@ class JoomlaModule:
                 )
                 ctx.progress.add_hit(module=self.name)
 
-            if resp.status_code == 200 and path in EXTRACT_PATHS:
-                _emit_priority_secrets(
+            if resp.status_code == 200 and path in EXTRACT_PATHS and not path.startswith("/configuration.php"):
+                label = "Joomla response" if path == "/" else path
+                emit_credential_findings(
                     findings=findings,
                     target=target,
                     ctx=ctx,
+                    module=self.name,
                     url=resp.url or url,
                     path=path,
                     body=body,
                     extracted=extracted,
+                    source_label=label,
                 )
 
         if is_joomla and not any("Joomla" in f.title for f in findings):
