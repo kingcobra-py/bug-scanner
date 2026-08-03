@@ -124,7 +124,7 @@ class ScanConfig:
     max_body_bytes: int = 2_097_152
     verbose: bool = False
     scan_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    exploit_enabled: bool = True
+    exploit_enabled: bool = False
     exploit_command: str = "id"
     exploit_all: bool = True   # optional
 
@@ -140,6 +140,6 @@ class ScanContext:
     logger: Any = None
     findings: list[Finding] = field(default_factory=list)
     bodies: list[tuple[str, str]] = field(default_factory=list)  # (url, body)
-    exploit_enabled: bool = True
+    exploit_enabled: bool = False
     exploit_command: str = "id"
     exploit_all: bool = True   # optional

@@ -32,7 +32,7 @@ class DetectorFixtureHandler(BaseHTTPRequestHandler):
 
         if path == "/":
             body = (
-                b'<html><head><meta name="generator" content="WordPress 6.9.2" />'
+                b'<html><head><meta name="generator" content="WordPress 6.4.3" />'
                 b'"csrf.token":"0123456789abcdef0123456789abcdef"'
                 b'</head><body>joomla</body></html>'
             )
@@ -40,11 +40,11 @@ class DetectorFixtureHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/wp-json/":
-            self._write(200, b'{"generator":"https://wordpress.org/?v=6.9.2","routes":{}}')
+            self._write(200, b'{"generator":"https://wordpress.org/?v=6.4.3","routes":{}}')
             return
 
         if path == "/readme.html":
-            self._write(200, FIX.joinpath("wp_readme.html").read_bytes())
+            self._write(200, b"<!DOCTYPE html><html><body><p>Version 6.4.3</p></body></html>")
             return
 
         if path == "/package.json":
