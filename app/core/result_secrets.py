@@ -49,7 +49,9 @@ _SMTP_ENV_KEYS = {
 
 
 def _clean(value: str) -> str:
-    return (value or "").replace("\r", "").strip().strip("'\"")
+    text = (value or "").replace("\r", "").replace("\n", "")
+    text = text.replace("\\r", "").replace("\\n", "")
+    return text.strip().strip("'\"")
 
 
 def _env_parts(value: str) -> tuple[str, str] | None:
@@ -198,7 +200,8 @@ def normalize_result_secrets(secrets: list[dict[str, Any]]) -> list[dict[str, An
                 if _AWS_KEY_RE.match(rhs):
                     aws_by_source[source]["access"] = rhs
                     aws_by_source[source].setdefault("_meta", item)
-                    continue
+                # Drop non-key leftovers like AWS_ACCESS_KEY_ID=user-prod-bucket.
+                continue
             if key_l in {"aws_secret_access_key", "aws_secret_key"}:
                 if _AWS_SECRET_RE.match(rhs) or (
                     len(rhs) >= 20 and re.search(r"[A-Za-z]", rhs) and re.search(r"[0-9/+=]", rhs)
@@ -209,6 +212,9 @@ def normalize_result_secrets(secrets: list[dict[str, Any]]) -> list[dict[str, An
                 # Odd/short secret values still surface as env rows.
             if key_l == "aws_session_token":
                 # Useful for exploit context but too noisy/huge for Results.
+                continue
+            # Recipient / from-only mail fields are not credentials.
+            if key_l.endswith(("_to", "_from", "_cc", "_bcc")) or key_l in {"smtp_email", "mail_from", "email_from"}:
                 continue
 
             display = f"{key}={rhs}"
@@ -276,8 +282,12 @@ def normalize_result_secrets(secrets: list[dict[str, Any]]) -> list[dict[str, An
             continue
         if user and is_placeholder(user) and user.lower() not in _SMTP_PLACEHOLDER_USERS:
             user = ""
-        # Results only keeps SMTP rows with a real password.
-        if not password:
+        # Results only keeps SMTP rows with a real password + identity.
+        if not password or (not host and not user):
+            continue
+        # Password-looking blobs without host/user were already rejected; also
+        # reject clearly non-host identities like bare "email_user".
+        if not host and user and "@" not in user and user.lower() not in _SMTP_PLACEHOLDER_USERS:
             continue
         host_part = f"{host}:{port}" if host and port else host
         parts = [part for part in (host_part, user, password) if part]
