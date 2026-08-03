@@ -59,15 +59,27 @@ def test_get_results_includes_exploit_extracted_secrets(tmp_path, monkeypatch):
             "title": "Secret extraction: env (React2Shell)",
             "module": "react2shell",
             "extracted": {
-                "secrets": [
-                    {"kind": "env", "value": "AWS_SECRET_ACCESS_KEY=super-secret", "source_url": "https://a.example"},
+                    "secrets": [
+                    {
+                        "kind": "env",
+                        "value": "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                        "source_url": "https://a.example",
+                    },
+                    {
+                        "kind": "env",
+                        "value": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+                        "source_url": "https://a.example",
+                    },
                 ]
             },
         },
     )
 
     data = client.get(f"/api/scans/{scan_id}/results").json()
-    assert any("super-secret" in item["value"] for item in data["secrets"])
+    assert any(
+        "AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in item["value"]
+        for item in data["secrets"]
+    )
     server.store.delete_scan(scan_id)
 
 

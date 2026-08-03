@@ -36,6 +36,7 @@ PLACEHOLDER_PATTERNS = [
         r"^1234+$",
         r"^0{6,}$",
         r"^replace[_-]?me$",
+        r"^replace[_-]?me[_-].+",
         r"^insert[_-]?.*$",
         r"^<.*>$",
         r"^\[.*\]$",

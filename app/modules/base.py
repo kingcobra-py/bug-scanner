@@ -186,11 +186,18 @@ _NON_SECRET_ENV_KEYS = {
     "xdg_runtime_dir", "xdg_session_id", "xdg_session_type", "display",
     "ssh_connection", "ssh_client", "ssh_tty", "debian_frontend",
 }
+_CRED_KEY_TOKENS = (
+    "password", "passwd", "secret", "token", "apikey", "access_key", "private_key",
+    "aws_access", "aws_secret", "akia", "asia", "smtp", "mail_pass", "mail_user",
+    "database_url", "db_pass", "db_password", "credential", "bearer", "api_key",
+)
 
 
 def _looks_like_credential_line(value: str) -> bool:
     """Reject bash-history timestamps and other raw dump noise."""
-    text = (value or "").strip()
+    from app.core.result_secrets import is_noise_env_key
+
+    text = (value or "").replace("\r", "").strip()
     if not text or len(text) < 6:
         return False
     if text.isdigit():
@@ -201,27 +208,19 @@ def _looks_like_credential_line(value: str) -> bool:
     # JS / source noise from next_config dumps.
     if any(token in lowered for token in ("process.env", "===", "=>", "const ", "let ", "function ")):
         return False
-    markers = (
-        "password", "passwd", "secret", "token", "api_key", "apikey", "access_key",
-        "private_key", "aws_", "akia", "ghp_", "sk_live", "xox", "smtp", "mail_",
-        "database_url", "db_pass", "db_password", "auth", "credential", "bearer",
-    )
-    if any(marker in lowered for marker in markers):
+    if any(marker in lowered for marker in ("akia", "asia", "ghp_", "sk_live", "xox", "sg.")):
         return True
     if "=" not in text:
-        return ":" in text and not text.startswith("http")
+        return False
     key = text.split("=", 1)[0].strip().lower()
-    if not key or key in _NON_SECRET_ENV_KEYS:
+    if not key or key in _NON_SECRET_ENV_KEYS or is_noise_env_key(key):
         return False
-    # Generic process env (PATH, HOME, …) is not a credential.
-    if key.isidentifier() and not any(
-        part in key for part in ("pass", "secret", "token", "key", "auth", "cred", "smtp", "mail")
-    ):
-        return False
-    # Require a simple KEY=VALUE left-hand side for dump lines.
-    if not key.replace("_", "").isalnum():
-        return False
-    return True
+    # Token match avoids ``pass`` matching ``private``.
+    if any(token in key for token in _CRED_KEY_TOKENS):
+        return True
+    if key.endswith(("_key", "_secret", "_token", "_password", "_passwd")):
+        return True
+    return False
 
 
 def exploit_lines_to_extracted(
@@ -236,18 +235,23 @@ def exploit_lines_to_extracted(
     Raw bash_history / env dump lines are ignored — they inflate Results with
     timestamps and shell noise.
     """
+    # API endpoint dumps are not credentials — skip *_apis categories.
+    if category.endswith("_apis") or category in {"apis", "api"}:
+        return {}
     secrets: list[dict[str, Any]] = []
     smtp: list[dict[str, Any]] = []
     kind_hint = (
         category.replace("_secrets", "")
         .replace("_smtp", "")
-        .replace("_apis", "api")
         or "env"
     )
     prefer_smtp = category.endswith("_smtp") or kind_hint == "smtp"
+    api_kinds = {"absolute_api", "base_url", "fetch_call", "joomla_absolute_api"}
     for item in lines or []:
         if isinstance(item, dict):
             kind = str(item.get("kind") or ("smtp" if prefer_smtp else kind_hint))
+            if kind in api_kinds:
+                continue
             payload = {
                 **item,
                 "source_url": item.get("source_url") or source_url,
@@ -261,7 +265,7 @@ def exploit_lines_to_extracted(
             secrets.append(
                 {
                     "kind": kind_hint if kind_hint != "smtp" else "env",
-                    "value": item.strip(),
+                    "value": item.strip().replace("\r", ""),
                     "source_url": source_url,
                 }
             )

@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from app.core.engine import ScanEngine
 from app.core.providers import provider_for_kind, provider_metadata
+from app.core.result_secrets import is_noise_env_key, normalize_result_secrets
 from app.extractors.patterns import IGNORED_SECRET_KINDS
 from app.core.uploads import (
     DIRECT_UPLOAD_BYTES,
@@ -57,8 +58,10 @@ def _is_useless_secret(kind: str, value: str) -> bool:
     from app.modules.base import _looks_like_credential_line
 
     kind_l = (kind or "").lower()
-    value_s = (value or "").strip()
+    value_s = (value or "").replace("\r", "").strip()
     if kind_l in IGNORED_SECRET_KINDS or kind_l.startswith("generic"):
+        return True
+    if kind_l in {"absolute_api", "base_url", "fetch_call", "joomla_absolute_api"}:
         return True
     # Legacy exploit dumps put bash_history timestamps / bare numbers into Results.
     if kind_l in {"exploit", "bash_history", "dotenv", "next_config", "wp_config", "config"} and not _looks_like_credential_line(value_s):
@@ -72,6 +75,10 @@ def _is_useless_secret(kind: str, value: str) -> bool:
         return True
     if "google_api" in kind_l or kind_l == "jwt":
         return True
+    if kind_l == "env" and "=" in value_s:
+        env_key = value_s.split("=", 1)[0].strip()
+        if is_noise_env_key(env_key):
+            return True
     # Stored env rows are ``KEY=VALUE``; drop JS ternary / generic LHS noise
     # (e.g. ``key=method ?`` from minified map-plugin JS).
     if kind_l == "env" and is_useless_env_assignment(value_s):
@@ -145,39 +152,6 @@ def _index_credential(
     item["occurrences"] += 1
     if source_url and source_url not in item["sources"]:
         item["sources"].append(source_url)
-
-
-def normalize_result_secrets(secrets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Prefer ``AKIA...:secret`` pairs and drop duplicate standalone access keys.
-
-    Legacy extractors stored pairs as ``access|secret``; normalize those to
-    colon form for the Results UI. When both a paired cred and a bare
-    ``aws_access_key`` exist for the same access key, keep only the pair.
-    Also strips Google / JWT / generic noise so Results stays high-signal.
-    """
-    normalized: list[dict[str, Any]] = []
-    paired_access: set[str] = set()
-    for item in secrets:
-        kind = str(item.get("kind") or "")
-        value = str(item.get("value") or "")
-        if _is_useless_secret(kind, value):
-            continue
-        if "|" in value and (kind.startswith("aws") or value.startswith("AKIA")):
-            left, right = value.split("|", 1)
-            if left.startswith("AKIA") and right:
-                value = f"{left}:{right}"
-                kind = "aws_cred"
-                item = {**item, "kind": kind, "value": value}
-        if kind == "aws_cred" and ":" in value:
-            paired_access.add(value.split(":", 1)[0])
-        normalized.append(item)
-
-    out: list[dict[str, Any]] = []
-    for item in normalized:
-        if item.get("kind") == "aws_access_key" and item.get("value") in paired_access:
-            continue
-        out.append(item)
-    return out
 
 
 def read_file_logs(
@@ -718,7 +692,7 @@ def create_app() -> FastAPI:
         by_severity: dict[str, int] = {}
         by_module: dict[str, int] = {}
         secrets: list[dict[str, Any]] = []
-        secret_index: dict[str, dict[str, Any]] = {}
+        raw_secrets: list[dict[str, Any]] = []
         provider_counts: dict[str, int] = {}
         host_map: dict[str, dict[str, Any]] = {}
         for f in findings:
@@ -729,28 +703,30 @@ def create_app() -> FastAPI:
             extracted = f.get("extracted") or {}
             source_url = f.get("url") or ""
             for secret in extracted.get("secrets") or []:
-                kind = secret.get("kind") or "secret"
-                _index_credential(
-                    secret_index,
-                    provider_counts,
-                    kind=kind,
-                    value=secret.get("value"),
-                    source_url=secret.get("source_url") or source_url,
-                    module=mod,
-                    title=f.get("title") or "",
-                    finding_id=f.get("id") or "",
+                raw_secrets.append(
+                    {
+                        "kind": secret.get("kind") or "secret",
+                        "value": secret.get("value"),
+                        "source_url": secret.get("source_url") or source_url,
+                        "sources": [secret.get("source_url") or source_url],
+                        "occurrences": 1,
+                        "module": mod,
+                        "title": f.get("title") or "",
+                        "finding_id": f.get("id") or "",
+                    }
                 )
             for smtp_item in extracted.get("smtp") or []:
-                kind = smtp_item.get("kind") or "smtp"
-                _index_credential(
-                    secret_index,
-                    provider_counts,
-                    kind=kind,
-                    value=smtp_item.get("value"),
-                    source_url=smtp_item.get("source_url") or source_url,
-                    module=mod,
-                    title=f.get("title") or "",
-                    finding_id=f.get("id") or "",
+                raw_secrets.append(
+                    {
+                        "kind": smtp_item.get("kind") or "smtp",
+                        "value": smtp_item.get("value"),
+                        "source_url": smtp_item.get("source_url") or source_url,
+                        "sources": [smtp_item.get("source_url") or source_url],
+                        "occurrences": 1,
+                        "module": mod,
+                        "title": f.get("title") or "",
+                        "finding_id": f.get("id") or "",
+                    }
                 )
             if not (extracted.get("secrets") or extracted.get("smtp")):
                 # Legacy active-exploit findings stored dump lines in evidence
@@ -762,15 +738,17 @@ def create_app() -> FastAPI:
                     for line in str(f.get("evidence") or "").splitlines():
                         if not _looks_like_credential_line(line):
                             continue
-                        _index_credential(
-                            secret_index,
-                            provider_counts,
-                            kind="exploit",
-                            value=line.strip(),
-                            source_url=source_url,
-                            module=mod,
-                            title=f.get("title") or "",
-                            finding_id=f.get("id") or "",
+                        raw_secrets.append(
+                            {
+                                "kind": "exploit",
+                                "value": line.strip(),
+                                "source_url": source_url,
+                                "sources": [source_url] if source_url else [],
+                                "occurrences": 1,
+                                "module": mod,
+                                "title": f.get("title") or "",
+                                "finding_id": f.get("id") or "",
+                            }
                         )
             if not is_vuln_worthy(f):
                 continue
@@ -805,14 +783,24 @@ def create_app() -> FastAPI:
                 }
             )
 
-        secrets = normalize_result_secrets(list(secret_index.values()))
+        secrets = normalize_result_secrets(raw_secrets)
         # Provider counts must reflect the post-normalized secret list
         # (paired AWS rows collapse two kinds into one).
         provider_counts = {}
+        cleaned: list[dict[str, Any]] = []
         for item in secrets:
-            provider_id = item.get("provider") or provider_for_kind(str(item.get("kind") or ""))
-            item["provider"] = provider_id
+            kind = str(item.get("kind") or "")
+            value = item.get("value")
+            if not isinstance(value, str):
+                value = _format_credential_value(kind, value)
+            value = str(value or "").replace("\r", "").strip()
+            if not value or _is_useless_secret(kind, value):
+                continue
+            provider_id = item.get("provider") or provider_for_kind(kind)
+            item = {**item, "kind": kind, "value": value, "provider": provider_id}
+            cleaned.append(item)
             provider_counts[provider_id] = provider_counts.get(provider_id, 0) + 1
+        secrets = cleaned
         if provider:
             secrets = [item for item in secrets if item.get("provider") == provider]
 

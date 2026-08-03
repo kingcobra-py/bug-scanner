@@ -1,4 +1,4 @@
-from app.api.server import normalize_result_secrets
+from app.core.result_secrets import normalize_result_secrets
 from app.extractors.secret_extractor import extract_secrets
 
 
