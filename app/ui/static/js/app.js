@@ -357,11 +357,29 @@ async function openJobModal() {
     return;
   }
   $("jobError").textContent = "";
+  setExploitsEnabled(false);
+  if ($("exploitCommand")) $("exploitCommand").value = "id";
+  if ($("exploitAll")) $("exploitAll").checked = true;
   $("jobModal").classList.add("open");
 }
 
 function closeJobModal() {
   $("jobModal").classList.remove("open");
+}
+
+function exploitsEnabled() {
+  return $("toggleExploits")?.classList.contains("active") ?? false;
+}
+
+function setExploitsEnabled(enabled) {
+  const button = $("toggleExploits");
+  const options = $("exploitOptions");
+  const stateLabel = $("exploitToggleState");
+  if (!button || !options || !stateLabel) return;
+  button.classList.toggle("active", enabled);
+  button.setAttribute("aria-pressed", enabled ? "true" : "false");
+  options.classList.toggle("hidden", !enabled);
+  stateLabel.textContent = enabled ? "On" : "Off";
 }
 
 async function startJob(event) {
@@ -383,6 +401,9 @@ async function startJob(event) {
     rate_limit_per_host: Number($("rateLimit").value || 50),
     paths_mode: $("pathsMode").value,
     method_test_trace: $("methodTrace").checked,
+    exploit_enabled: exploitsEnabled(),
+    exploit_command: ($("exploitCommand")?.value || "id").trim() || "id",
+    exploit_all: exploitsEnabled() && Boolean($("exploitAll")?.checked),
     redact_secrets: false,
     scope_notes: $("scope").value,
   };
@@ -792,6 +813,7 @@ function bindEvents() {
   on("cancelJob", "onclick", closeJobModal);
   on("startBtn", "onclick", startJob);
   on("jobForm", "onsubmit", startJob);
+  on("toggleExploits", "onclick", () => setExploitsEnabled(!exploitsEnabled()));
   on("jobModal", "onclick", (event) => {
     if (event.target === $("jobModal")) closeJobModal();
   });

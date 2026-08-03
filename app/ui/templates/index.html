@@ -158,6 +158,21 @@
             <label class="check-option"><input id="methodTrace" type="checkbox" /> Include HTTP TRACE method test</label>
           </div>
         </div>
+        <div class="exploit-panel">
+          <button type="button" id="toggleExploits" class="exploit-toggle" aria-pressed="false">
+            <span class="exploit-toggle-icon">⚡</span>
+            <span class="exploit-toggle-copy">
+              <b>Enable active exploits</b>
+              <small>WordPress wp2shell · Joomla JCE · React2Shell</small>
+            </span>
+            <span id="exploitToggleState" class="exploit-toggle-state">Off</span>
+          </button>
+          <div id="exploitOptions" class="exploit-options hidden">
+            <label class="label">Exploit command</label>
+            <input id="exploitCommand" class="input" value="id" placeholder="id" autocomplete="off" />
+            <label class="check-option mt-2"><input id="exploitAll" type="checkbox" checked /> Run exploits even when fingerprint is uncertain</label>
+          </div>
+        </div>
         <label class="label">Authorization / scope notes</label>
         <textarea id="scope" class="input h-20" placeholder="Program name, scope reference, operator notes"></textarea>
         <div id="jobError" class="text-sm text-red-300 min-h-5"></div>

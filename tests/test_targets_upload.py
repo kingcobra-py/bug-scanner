@@ -89,6 +89,25 @@ def test_persistent_upload_library_and_job_reference(tmp_path, monkeypatch):
     pending = client.get("/api/scans", params={"compact": True}).json()
     assert any(row["id"] == body["id"] and row["config"]["target_count"] == 2 for row in pending)
 
+    exploit_started = []
+    monkeypatch.setattr(server.engine, "start_async", lambda config: exploit_started.append(config))
+    created_exploit = client.post(
+        "/api/scans",
+        json={
+            "job_name": "Exploit run",
+            "targets_upload_id": record["id"],
+            "modules": ["wordpress", "joomla", "react"],
+            "exploit_enabled": True,
+            "exploit_command": "id",
+            "exploit_all": True,
+        },
+    )
+    assert created_exploit.status_code == 200
+    assert exploit_started
+    assert exploit_started[0].exploit_enabled is True
+    assert exploit_started[0].exploit_command == "id"
+    assert exploit_started[0].exploit_all is True
+
     deleted = client.delete(f"/api/uploads/{record['id']}")
     assert deleted.status_code == 200
     assert not Path(record["stored_path"]).exists()

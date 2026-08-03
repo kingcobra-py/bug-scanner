@@ -206,6 +206,9 @@ class ScanCreate(BaseModel):
     redact_secrets: bool = False
     method_test_trace: bool = False
     verbose: bool = False
+    exploit_enabled: bool = False
+    exploit_command: str = "id"
+    exploit_all: bool = False
 
 
 class ChunkUploadInit(BaseModel):
@@ -313,6 +316,9 @@ def create_app() -> FastAPI:
             verify_tls=body.verify_tls,
             method_test_trace=body.method_test_trace,
             verbose=body.verbose,
+            exploit_enabled=bool(body.exploit_enabled),
+            exploit_command=(body.exploit_command or "id").strip()[:200] or "id",
+            exploit_all=bool(body.exploit_all),
             output_dir=str(ROOT / "output" / "scans"),
         )
         out_dir = Path(cfg.output_dir) / cfg.scan_id
@@ -357,6 +363,9 @@ def create_app() -> FastAPI:
                 "verify_tls": cfg.verify_tls,
                 "method_test_trace": cfg.method_test_trace,
                 "verbose": cfg.verbose,
+                "exploit_enabled": cfg.exploit_enabled,
+                "exploit_command": cfg.exploit_command,
+                "exploit_all": cfg.exploit_all,
                 "output_dir": cfg.output_dir,
                 "scan_id": cfg.scan_id,
                 "target_count": cfg.target_count,
