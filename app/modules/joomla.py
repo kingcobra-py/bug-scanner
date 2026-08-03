@@ -7,6 +7,7 @@ Detection + priority secret packs only: AWS, GitHub, Stripe, SendGrid, Brevo.
 
 from __future__ import annotations
 
+from app.exploits.joomla_rce.detector import JoomlaJceDetector
 from app.extractors.priority_secrets import priority_extractions
 from app.modules.base import finding_from_hit, save_evidence
 from app.modules.vulnerability_intel import executable_upload_paths, jce_exposure, xml_version
@@ -303,4 +304,36 @@ class JoomlaModule:
                     tags=["joomla", "fingerprint"],
                 )
             )
+
+        home = http.get(target.url)
+        detector = JoomlaJceDetector(http, target.url)
+        scan = detector.scan(home if home.status_code == 200 else None)
+        pre_met = int(scan.get("preconditions_met") or 0)
+        pre_total = int(scan.get("preconditions_total") or 3)
+        if pre_met >= 2:
+            severity = "critical" if scan.get("chain_ready") else "high"
+            findings.append(
+                finding_from_hit(
+                    module=self.name,
+                    ftype="vuln" if scan.get("chain_ready") else "other",
+                    severity=severity,
+                    target=target,
+                    url=target.url,
+                    title=(
+                        "JCE CVE-2026-48907 chain preconditions satisfied (joomla PoC surface)"
+                        if scan.get("chain_ready")
+                        else f"JCE exploit preconditions {pre_met}/{pre_total} (joomla PoC surface)"
+                    ),
+                    evidence=(
+                        f"jce={scan.get('jce_present')}; proxy={scan.get('proxy_reachable')}; "
+                        f"csrf={scan.get('csrf_token_present')}; version={scan.get('jce_version')}; "
+                        f"poc={scan.get('poc_source')}"
+                    ),
+                    confidence=0.94 if scan.get("chain_ready") else 0.78,
+                    extracted=scan,
+                    tags=["joomla", "jce", "cve-2026-48907", "detection-only"],
+                    validated=bool(scan.get("chain_ready")),
+                )
+            )
+            ctx.progress.add_hit(module=self.name)
         return findings

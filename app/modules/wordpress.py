@@ -8,6 +8,7 @@ and priority secret packs only: AWS, GitHub, Stripe, SendGrid, Brevo.
 
 from __future__ import annotations
 
+from app.exploits.wp2shell.detector import Wp2ShellDetector
 from app.extractors.priority_secrets import priority_extractions
 from app.modules.base import finding_from_hit, save_evidence
 from app.modules.vulnerability_intel import executable_upload_paths, wordpress_exposure, wordpress_version
@@ -360,6 +361,72 @@ class WordPressModule:
                     evidence=",".join(target.tech),
                     confidence=0.7,
                     tags=["wordpress", "fingerprint"],
+                )
+            )
+
+        detector = Wp2ShellDetector(http, target.url)
+        scan = detector.scan(home if home.status_code == 200 else None)
+        probe = scan.get("probe") or {}
+        if probe.get("batch_reachable"):
+            severity = "critical" if probe.get("route_confusion") else "medium"
+            title = (
+                "wp2shell batch route-confusion markers detected (Icex0/wp2shell-poc check)"
+                if probe.get("route_confusion")
+                else "WordPress REST batch endpoint reachable (wp2shell surface)"
+            )
+            findings.append(
+                finding_from_hit(
+                    module=self.name,
+                    ftype="vuln" if probe.get("route_confusion") else "other",
+                    severity=severity,
+                    target=target,
+                    url=probe.get("endpoint") or join_url(target.url, "/?rest_route=/batch/v1"),
+                    title=title,
+                    evidence=(
+                        f"status={probe.get('status_code')}; markers={','.join(probe.get('marker_codes') or [])}; "
+                        f"poc={scan.get('poc_source')}"
+                    ),
+                    confidence=0.95 if probe.get("route_confusion") else 0.82,
+                    extracted=scan,
+                    tags=["wordpress", "wp2shell", "batch-endpoint", "detection-only"],
+                    validated=bool(probe.get("route_confusion")),
+                )
+            )
+            ctx.progress.add_hit(module=self.name)
+
+        for hint in scan.get("version_hints") or []:
+            if not hint.get("affected"):
+                continue
+            findings.append(
+                finding_from_hit(
+                    module=self.name,
+                    ftype="vuln",
+                    severity="critical",
+                    target=target,
+                    url=target.url,
+                    title=f"WordPress {hint['version']} in wp2shell affected range ({hint['source']})",
+                    evidence=f"{hint['detail'][:180]}; poc={scan.get('poc_source')}",
+                    confidence=0.88,
+                    extracted={"version_hint": hint, "poc_source": scan.get("poc_source")},
+                    tags=["wordpress", "wp2shell", "version-check", "detection-only"],
+                    validated=True,
+                )
+            )
+            ctx.progress.add_hit(module=self.name)
+
+        if scan.get("markers"):
+            findings.append(
+                finding_from_hit(
+                    module=self.name,
+                    ftype="other",
+                    severity="info",
+                    target=target,
+                    url=target.url,
+                    title="WordPress public markers (wp2shell PoC fingerprint)",
+                    evidence=" / ".join(scan["markers"]),
+                    confidence=0.8,
+                    extracted={"markers": scan["markers"], "poc_source": scan.get("poc_source")},
+                    tags=["wordpress", "wp2shell", "fingerprint", "detection-only"],
                 )
             )
         return findings
