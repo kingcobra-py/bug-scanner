@@ -254,6 +254,10 @@ class ScanEngine:
             store=self.store,
             http=http,
             logger=logger,
+            # ===== NEW: pass exploit flags from config =====
+            exploit_enabled=config.exploit_enabled,
+            exploit_command=config.exploit_command,
+            exploit_all=config.exploit_all,
         )
 
         try:
@@ -857,6 +861,10 @@ class ScanEngine:
             logger=ctx.logger,
             findings=[],
             bodies=[],
+            # ===== NEW: pass exploit flags from parent ctx =====
+            exploit_enabled=ctx.exploit_enabled,
+            exploit_command=ctx.exploit_command,
+            exploit_all=ctx.exploit_all,
         )
         out: list[Finding] = []
         log = get_scan_logger(ctx.config.scan_id, ctx.output_dir, module="engine")
