@@ -24,6 +24,10 @@ PLACEHOLDER_PATTERNS = [
         r"^todo$",
         r"^fix$",
         r"^secret$",
+        r"^some[-_]?secret([-_]?key)?$",
+        r"^secret[-_]?key$",
+        r"^your[-_]?secret([-_]?key)?$",
+        r"^my[-_]?secret([-_]?key)?$",
         r"^apikey$",
         r"^api_key$",
         r"^token$",
@@ -50,8 +54,18 @@ PLACEHOLDER_PATTERNS = [
         r"^local[_-]?pass(word)?$",
         r"^dev[_-]?pass(word)?$",
         r"^default[_-]?pass(word)?$",
+        r"^true$",
+        r"^false$",
+        r"^yes$",
+        r"^no$",
+        r"^on$",
+        r"^off$",
     ]
 ]
+
+BOOLISH_VALUES = frozenset({
+    "true", "false", "yes", "no", "on", "off", "1", "0", "null", "undefined",
+})
 
 LOW_VALUE_HOSTS = {
     "example.com",
@@ -112,6 +126,10 @@ def looks_like_js_expression(value: str) -> bool:
     return False
 
 
+def is_boolish_value(value: str) -> bool:
+    return (value or "").strip().strip("'\"").lower() in BOOLISH_VALUES
+
+
 def is_useless_env_assignment(value: str) -> bool:
     """True for stored ``KEY=VALUE`` env rows that are JS/query noise."""
     raw = (value or "").strip()
@@ -121,6 +139,8 @@ def is_useless_env_assignment(value: str) -> bool:
     lhs_l = lhs.strip().lower()
     rhs_s = rhs.strip().strip("'\"")
     if lhs_l in GENERIC_ENV_KV_NAMES or lhs_l.startswith("keyword"):
+        return True
+    if is_boolish_value(rhs_s):
         return True
     if looks_like_js_expression(rhs_s) or is_placeholder(rhs_s):
         return True

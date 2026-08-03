@@ -36,8 +36,11 @@ POSTMARK_TOKEN = re.compile(
     re.I | re.M,
 )
 
+# Paystack uses sk_(live|test)_ + 40 hex; check before Stripe.
+PAYSTACK_SECRET = re.compile(r"\bsk_(?:live|test)_[0-9a-f]{40}\b", re.I)
 STRIPE_LIVE = re.compile(r"\bsk_live_[0-9a-zA-Z]{24,}\b")
 STRIPE_TEST = re.compile(r"\bsk_test_[0-9a-zA-Z]{24,}\b")
+SANITY_TOKEN = re.compile(r"\bsk[A-Za-z0-9]{80,}\b")
 TWILIO_SID = re.compile(r"\b(AC[0-9a-fA-F]{32})\b")
 TWILIO_AUTH = re.compile(r"(?i)(?:TWILIO_AUTH_TOKEN|auth_token)\s*[:=]\s*['\"]?([0-9a-fA-F]{32})['\"]?")
 TWILIO_B64 = re.compile(r"\bQU[MN][A-Za-z0-9+/]{80,}={0,2}\b")
@@ -136,6 +139,7 @@ PATTERN_PACKS: dict[str, list[tuple[str, re.Pattern]]] = {
     "brevo": [("brevo", BREVO_KEY)],
     "xsmtp": [("xsmtp", XSMTP_KEY)],
     "mailgun": [("mailgun", MAILGUN_KEY)],
+    "paystack": [("paystack", PAYSTACK_SECRET)],
     "stripe": [("stripe_live", STRIPE_LIVE), ("stripe_test", STRIPE_TEST)],
     "slack": [("slack", SLACK_TOKEN)],
     "openai": [("openai", OPENAI_KEY)],

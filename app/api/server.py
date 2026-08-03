@@ -113,6 +113,13 @@ def _credential_provider(kind: str, value: Any) -> str:
         host = str(value.get("host") or "").lower()
         if host:
             return provider_for_kind(host)
+    if kind == "env" and isinstance(value, str) and "=" in value:
+        from app.core.providers import classify_env_assignment
+
+        key, rhs = value.split("=", 1)
+        classified = classify_env_assignment(key.strip(), rhs.strip())
+        if classified:
+            return classified[0]
     return provider_id
 
 

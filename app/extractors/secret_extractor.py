@@ -119,10 +119,11 @@ def _looks_like_sentence_or_code(value: str) -> bool:
 
 
 _KV_MARKERS = (
-    "aws", "github", "gitlab", "stripe", "sendgrid", "brevo", "mailgun",
-    "postmark", "slack", "openai", "anthropic", "twilio", "azure", "tencent",
-    "aliyun", "smtp", "mail_", "mail-", "password", "passwd", "secret",
-    "private", "credential", "access_key", "secret_key",
+    "aws", "github", "gitlab", "stripe", "paystack", "sendgrid", "brevo",
+    "mailgun", "postmark", "slack", "openai", "anthropic", "twilio", "azure",
+    "tencent", "aliyun", "sanity", "emailjs", "smtp", "mail_", "mail-",
+    "password", "passwd", "secret", "private", "credential", "access_key",
+    "secret_key", "nextauth",
 )
 
 
@@ -209,11 +210,20 @@ def extract_secrets(text: str, source_url: str = "", redact_values: bool = True)
             if isinstance(v, (str, int, float)) and _interesting_kv(str(k), str(v)):
                 add("env", f"{k}={v}", evidence=f"{k}=***")
 
-    # Regex packs
+    # Regex packs. Paystack is listed before Stripe so 40-hex sk_test_ keys
+    # are not double-emitted as stripe_test.
+    seen_token_values: set[str] = set()
     for _, pack in P.PATTERN_PACKS.items():
         for kind, regex in pack:
             for m in regex.finditer(text):
                 val = P.first_group(m)
+                if not val:
+                    continue
+                if kind in {"stripe_live", "stripe_test"} and P.PAYSTACK_SECRET.fullmatch(val):
+                    continue
+                if val in seen_token_values:
+                    continue
+                seen_token_values.add(val)
                 add(kind, val, evidence=P.context_window(text, m.start(), m.end()))
 
     # Azure connection string

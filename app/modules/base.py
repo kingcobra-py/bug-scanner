@@ -212,8 +212,14 @@ def _looks_like_credential_line(value: str) -> bool:
         return True
     if "=" not in text:
         return False
-    key = text.split("=", 1)[0].strip().lower()
+    key, rhs = text.split("=", 1)
+    key = key.strip().lower()
+    rhs = rhs.strip().strip("'\"")
     if not key or key in _NON_SECRET_ENV_KEYS or is_noise_env_key(key):
+        return False
+    from app.extractors.validators import is_boolish_value, is_placeholder
+
+    if is_boolish_value(rhs) or is_placeholder(rhs):
         return False
     # Token match avoids ``pass`` matching ``private``.
     if any(token in key for token in _CRED_KEY_TOKENS):
