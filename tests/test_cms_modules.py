@@ -161,7 +161,7 @@ def test_wordpress_module_wp2shell_signals(tmp_path):
     assert any("Executable file listed under wp-content/uploads" in f.title for f in findings)
     assert "Priority secrets extracted from wp-config" not in titles
     assert "SMTP credentials extracted from wp-config" in titles
-    assert "Secrets/API keys extracted from wp-config" in titles
+    assert "Secrets extracted from wp-config" in titles
     assert any("smtp" in f.tags for f in findings)
     assert any("extract" in f.tags for f in findings)
 
@@ -178,6 +178,6 @@ def test_joomla_module_jce_and_webshell_indicator(tmp_path):
     assert "JCE CVE-2026-48907 chain preconditions satisfied" in titles
     assert any("Executable file listed under /images" in f.title for f in findings)
     assert "SMTP credentials extracted from configuration.php" in titles
-    assert "Secrets/API keys extracted from configuration.php" in titles
+    assert "Secrets extracted from configuration.php" in titles
     assert any("smtp" in f.tags for f in findings)
     assert any("extract" in f.tags for f in findings)

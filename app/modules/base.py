@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from app.extractors import extract_all
+from app.extractors.cms_extractions import cms_body_extractions
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import safe_filename
 
@@ -66,11 +67,7 @@ def merge_extractions(*parts: dict) -> dict:
 
 
 def joomla_body_extractions(ctx: ScanContext, url: str, body: str) -> dict:
-    from app.extractors.joomla_api_extractor import extract_joomla_apis
-
-    base = body_extractions(ctx, url, body)
-    joomla = extract_joomla_apis(body, source_url=url, redact_values=ctx.config.redact_secrets)
-    return merge_extractions(base, joomla)
+    return cms_body_extractions(ctx, url, body, joomla=True)
 
 
 def emit_credential_findings(
@@ -84,10 +81,11 @@ def emit_credential_findings(
     body: str,
     extracted: dict,
     source_label: str,
+    include_apis: bool = True,
 ) -> None:
     secrets = extracted.get("secrets") or []
     smtp = extracted.get("smtp") or []
-    apis = extracted.get("apis") or []
+    apis = extracted.get("apis") or [] if include_apis else []
     if not (secrets or smtp or apis):
         return
 
@@ -112,7 +110,7 @@ def emit_credential_findings(
                 title=f"SMTP credentials extracted from {source_label}",
                 evidence=", ".join(hosts) or f"{len(smtp)} SMTP record(s)",
                 confidence=0.93,
-                extracted={"smtp": smtp, "secrets": secrets, "apis": apis},
+                extracted={"smtp": smtp, "secrets": secrets},
                 raw_ref=raw_ref,
                 tags=[module, "smtp", "extract"],
                 validated=True,
@@ -120,7 +118,7 @@ def emit_credential_findings(
         )
         ctx.progress.add_hit(secrets=len(smtp), module=module)
 
-    if apis:
+    if apis and include_apis:
         api_values = [str(item.get("value", "")) for item in apis[:8]]
         findings.append(
             finding_from_hit(
@@ -149,10 +147,10 @@ def emit_credential_findings(
                 severity="critical",
                 target=target,
                 url=url,
-                title=f"Secrets/API keys extracted from {source_label}",
+                title=f"Secrets extracted from {source_label}",
                 evidence=", ".join(kinds),
                 confidence=0.9,
-                extracted={"secrets": secrets, "apis": apis, "smtp": smtp},
+                extracted={"secrets": secrets, "smtp": smtp},
                 raw_ref=raw_ref,
                 tags=[module, "secrets", "extract"],
                 validated=True,

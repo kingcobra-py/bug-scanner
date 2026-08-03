@@ -132,6 +132,7 @@ class JoomlaModule:
                     body=body,
                     extracted=extracted,
                     source_label=f"configuration.php ({path})",
+                    include_apis=False,
                 )
 
             if path.endswith("jce.xml") and resp.status_code == 200 and len(body) > 20:
@@ -268,6 +269,7 @@ class JoomlaModule:
                     body=body,
                     extracted=extracted,
                     source_label=label,
+                    include_apis=False,
                 )
 
         if is_joomla and not any("Joomla" in f.title for f in findings):
