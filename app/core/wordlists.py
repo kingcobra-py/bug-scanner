@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Iterable, Iterator, Literal
 
 from app.utils.normalize import normalize_path
 
@@ -38,17 +38,21 @@ def dedupe_paths(paths: Iterable[str]) -> list[str]:
 
 
 def builtin_paths(kinds: Iterable[str] | None = None) -> list[str]:
-    mapping = {
-        "git": WORDLIST_DIR / "git.txt",
-        "js": WORDLIST_DIR / "js_paths.txt",
-        "config": WORDLIST_DIR / "config_env.txt",
-        "common": WORDLIST_DIR / "common_sensitive.txt",
+    mapping: dict[str, list[Path]] = {
+        "git": [WORDLIST_DIR / "git.txt"],
+        "js": [WORDLIST_DIR / "js_paths.txt"],
+        "config": [WORDLIST_DIR / "config_env.txt"],
+        # common_sensitive + large default discovery set used by the path module
+        "common": [
+            WORDLIST_DIR / "common_sensitive.txt",
+            WORDLIST_DIR / "default_paths.txt",
+        ],
     }
     selected = list(kinds) if kinds else list(mapping.keys())
     paths: list[str] = []
     for kind in selected:
-        if kind in mapping:
-            paths.extend(load_wordlist(mapping[kind]))
+        for path in mapping.get(kind, []):
+            paths.extend(load_wordlist(path))
     return dedupe_paths(paths)
 
 
@@ -64,6 +68,48 @@ def merge_paths(
     if mode == "builtin_only":
         return built
     return dedupe_paths([*built, *custom_list])
+
+
+def parse_target_lines(content: str | bytes) -> list[str]:
+    """Parse a domains/IPs/URLs list: one target per line, # comments ignored."""
+    if isinstance(content, bytes):
+        text = content.decode("utf-8", errors="ignore")
+    else:
+        text = content
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in text.splitlines():
+        item = (line or "").strip()
+        if not item or item.startswith("#"):
+            continue
+        # strip inline comments
+        if " #" in item:
+            item = item.split(" #", 1)[0].strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def iter_target_lines(path: Path | str) -> Iterator[str]:
+    """Stream target lines from very large files without materializing them."""
+    with Path(path).open("rb") as fh:
+        for raw in fh:
+            item = raw.decode("utf-8", errors="ignore").strip()
+            if not item or item.startswith("#"):
+                continue
+            if " #" in item:
+                item = item.split(" #", 1)[0].strip()
+            if item:
+                yield item
+
+
+def save_uploaded_targets(content: str | bytes, dest: Path) -> list[str]:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    targets = parse_target_lines(content)
+    dest.write_text("\n".join(targets) + ("\n" if targets else ""), encoding="utf-8")
+    return targets
 
 
 def save_uploaded_wordlist(content: str | bytes, dest: Path) -> list[str]:

@@ -7,7 +7,7 @@ scanner:
   max_redirects: 5
   verify_tls: false
   max_body_bytes: 2097152
-  rate_limit_per_host: 10
+  rate_limit_per_host: 50
   user_agent: "BB-Scanner/1.0 (+authorized-security-assessment)"
 
 modules:

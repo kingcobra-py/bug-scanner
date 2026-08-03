@@ -79,7 +79,8 @@ Add a detector under `app/modules/`, wire it in `app/core/engine.py` `_build_mod
 - One path per line, `#` comments ignored  
 - Normalized to leading `/`  
 - Modes: `merge` | `custom_only` | `builtin_only`  
-- Upload via CLI `--paths` or dashboard `/api/wordlists/upload`
+- Upload via CLI `--paths` or dashboard `/api/wordlists/upload`  
+- Built-in path discovery uses `wordlists/common_sensitive.txt` plus the extended `wordlists/default_paths.txt` set (~12k paths)
 
 ## Tests
 

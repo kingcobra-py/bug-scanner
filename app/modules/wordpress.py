@@ -9,7 +9,7 @@ and priority secret packs only: AWS, GitHub, Stripe, SendGrid, Brevo.
 from __future__ import annotations
 
 from app.extractors.priority_secrets import priority_extractions
-from app.modules.base import finding_from_hit, save_evidence
+from app.modules.base import finding_from_hit, save_http_response
 from app.modules.vulnerability_intel import executable_upload_paths, wordpress_exposure, wordpress_version
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
@@ -120,7 +120,7 @@ class WordPressModule:
                 "DB_NAME" in body or "DB_PASSWORD" in body or "<?php" in body
             ):
                 extracted = priority_extractions(body, source_url=url, redact_values=ctx.config.redact_secrets)
-                raw_ref = save_evidence(ctx, f"wp_config_{path}", body)
+                raw_ref = save_http_response(ctx, f"wp_config_{path}", resp)
                 findings.append(
                     finding_from_hit(
                         module=self.name,
@@ -158,7 +158,7 @@ class WordPressModule:
                     )
             if path == "/wp-content/debug.log" and resp.status_code == 200 and len(body) > 50:
                 extracted = priority_extractions(body, source_url=url, redact_values=ctx.config.redact_secrets)
-                raw_ref = save_evidence(ctx, "wp_debug_log", body)
+                raw_ref = save_http_response(ctx, "wp_debug_log", resp)
                 findings.append(
                     finding_from_hit(
                         module=self.name,
@@ -231,7 +231,7 @@ class WordPressModule:
                 )
                 ctx.progress.add_hit(module=self.name)
                 if extracted.get("secrets"):
-                    raw_ref = save_evidence(ctx, "wp_json_priority_secrets", body)
+                    raw_ref = save_http_response(ctx, "wp_json_priority_secrets", resp)
                     kinds = sorted({s.get("kind", "") for s in extracted["secrets"] if s.get("kind")})
                     findings.append(
                         finding_from_hit(
@@ -260,6 +260,7 @@ class WordPressModule:
                 body_l = body.lower()
                 if any(marker in body_l for marker in BATCH_MARKERS) or "batch" in (resp.url or url).lower():
                     is_wp = True
+                    raw_ref = save_http_response(ctx, f"wp_batch_{path}", resp)
                     findings.append(
                         finding_from_hit(
                             module=self.name,
@@ -270,11 +271,13 @@ class WordPressModule:
                             title="WordPress REST batch endpoint reachable",
                             evidence=f"status={resp.status_code}; {body[:180]}",
                             confidence=0.82,
+                            raw_ref=raw_ref,
                             tags=["wordpress", "wp2shell", "batch-endpoint", "detection-only"],
                         )
                     )
                     ctx.progress.add_hit(module=self.name)
             if path == "/wp-json/wp/v2/users" and resp.status_code == 200 and ("slug" in body or "name" in body):
+                raw_ref = save_http_response(ctx, "wp_users", resp)
                 findings.append(
                     finding_from_hit(
                         module=self.name,
@@ -285,6 +288,7 @@ class WordPressModule:
                         title="WordPress user enumeration via REST API",
                         evidence=body[:200],
                         confidence=0.8,
+                        raw_ref=raw_ref,
                         tags=["wordpress", "users", "detection-only"],
                     )
                 )

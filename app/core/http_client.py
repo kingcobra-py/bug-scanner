@@ -7,8 +7,9 @@ import random
 import string
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 import httpx
@@ -42,18 +43,47 @@ class HttpResponse:
 
 
 class HostRateLimiter:
+    """Per-host rate limiting without a single global lock.
+
+    Every HTTP attempt (including redirect hops) calls wait() once. A single
+    shared lock here means hundreds of worker threads hitting completely
+    unrelated hosts still serialize behind each other on every request —
+    measured to reduce effective throughput as thread count grows. Sharding
+    into a fixed number of lock buckets (by host hash) keeps unrelated hosts
+    independent while bounding memory.
+    """
+
+    _SHARDS = 64
+    _MAX_ENTRIES_PER_SHARD = 5_000
+
     def __init__(self, per_host: float = 10.0) -> None:
         self.per_host = max(per_host, 0.1)
-        self._lock = threading.Lock()
-        self._next: dict[str, float] = {}
+        self._shard_locks = [threading.Lock() for _ in range(self._SHARDS)]
+        # One OrderedDict per shard (not one shared dict) so eviction in a
+        # busy shard never has to scan/compete with the timestamps of hosts
+        # that hash elsewhere. Scanning hundreds of thousands of distinct
+        # hosts previously grew this without any bound for the life of the
+        # worker process -- small per-entry, but unbounded is unbounded.
+        self._next: list["OrderedDict[str, float]"] = [OrderedDict() for _ in range(self._SHARDS)]
+
+    def _shard_index(self, host: str) -> int:
+        return hash(host) % self._SHARDS
+
+    def _shard(self, host: str) -> threading.Lock:
+        return self._shard_locks[self._shard_index(host)]
 
     def wait(self, host: str) -> None:
         min_interval = 1.0 / self.per_host
-        with self._lock:
+        idx = self._shard_index(host)
+        with self._shard_locks[idx]:
+            bucket = self._next[idx]
             now = time.monotonic()
-            nxt = self._next.get(host, 0.0)
+            nxt = bucket.get(host, 0.0)
             delay = max(0.0, nxt - now)
-            self._next[host] = max(now, nxt) + min_interval
+            bucket[host] = max(now, nxt) + min_interval
+            bucket.move_to_end(host)
+            while len(bucket) > self._MAX_ENTRIES_PER_SHARD:
+                bucket.popitem(last=False)
         if delay:
             time.sleep(delay)
 
@@ -70,8 +100,10 @@ class HttpClient:
         headers: Optional[dict[str, str]] = None,
         max_body_bytes: int = 2_097_152,
         max_redirects: int = 5,
-        rate_limit_per_host: float = 10.0,
+        rate_limit_per_host: float = 50.0,
         user_agent: str = DEFAULT_UA,
+        on_request: Optional[Callable[[], None]] = None,
+        max_connections: int = 512,
     ) -> None:
         self.timeout = httpx.Timeout(timeout, connect=connect_timeout)
         self.retries = retries
@@ -82,28 +114,118 @@ class HttpClient:
         self.max_body_bytes = max_body_bytes
         self.max_redirects = max_redirects
         self.limiter = HostRateLimiter(rate_limit_per_host)
-        self._local = threading.local()
-        self._soft404: dict[str, dict[str, Any]] = {}
+        self.on_request = on_request
+        # Bounded LRU-ish cache: unbounded growth here was the other half
+        # of the same OOM (one entry per unique host, kept for the life of
+        # the worker process). A few thousand hosts' worth of profiles is
+        # enough locality for the soft-404 check to still help; anything
+        # older than that is evicted rather than kept forever.
+        self._soft404: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._soft404_max_entries = 20_000
         self._soft404_lock = threading.Lock()
-
-    def _client(self) -> httpx.Client:
-        if not getattr(self._local, "client", None):
-            kwargs: dict[str, Any] = {
-                "timeout": self.timeout,
-                "verify": self.verify_tls,
-                "follow_redirects": False,
-                "headers": self.base_headers,
-            }
-            if self.proxy:
-                kwargs["proxy"] = self.proxy
-            self._local.client = httpx.Client(**kwargs)
-        return self._local.client
+        # Connections must scale with worker threads, or extra threads just
+        # queue behind the pool's semaphore instead of doing real work.
+        max_connections = max(64, min(int(max_connections), 8000))
+        kwargs: dict[str, Any] = {
+            "timeout": self.timeout,
+            "verify": self.verify_tls,
+            "follow_redirects": False,
+            "headers": self.base_headers,
+            # httpx.Client is thread-safe. One shared pool avoids creating one
+            # TLS context/pool per worker thread (~29GB observed at 300
+            # threads before this).
+            "limits": httpx.Limits(max_connections=max_connections, max_keepalive_connections=max(64, max_connections // 8)),
+        }
+        if self.proxy:
+            kwargs["proxy"] = self.proxy
+        self._shared_client = httpx.Client(**kwargs)
 
     def close(self) -> None:
-        client = getattr(self._local, "client", None)
-        if client:
-            client.close()
-            self._local.client = None
+        self._shared_client.close()
+
+    def _read_body_capped(self, resp: httpx.Response) -> bytes:
+        """Read at most max_body_bytes, then stop.
+
+        httpx's ``resp.content`` (and non-stream ``.request()``) buffer the
+        *entire* response before we can slice it. On a large multi-host scan
+        that meant a handful of fat download/ISO/backup endpoints could push
+        a single worker past 20GB RSS and into the OOM killer, even with
+        max_body_bytes set. Streaming + early close bounds peak body memory
+        to the configured cap per in-flight request.
+        """
+        chunks: list[bytes] = []
+        total = 0
+        limit = max(0, int(self.max_body_bytes))
+        if limit == 0:
+            return b""
+        for chunk in resp.iter_bytes():
+            if total >= limit:
+                break
+            if not chunk:
+                continue
+            need = limit - total
+            if len(chunk) > need:
+                chunks.append(chunk[:need])
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return b"".join(chunks)
+
+    def _send(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        data: Any = None,
+        json_body: Any = None,
+        read_body: bool = True,
+    ) -> tuple[str, int, dict[str, str], bytes, Optional[str]]:
+        """Perform one HTTP exchange with a hard body-size cap.
+
+        Returns ``(final_url, status_code, headers, body, encoding)``.
+        """
+        try:
+            with self._shared_client.stream(
+                method,
+                url,
+                headers=headers,
+                content=data,
+                json=json_body,
+            ) as resp:
+                status = resp.status_code
+                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                resp_url = str(resp.url)
+                encoding = resp.encoding
+                # Redirect hops only need status/Location; skip body entirely.
+                if read_body and not (300 <= status < 400):
+                    body = self._read_body_capped(resp)
+                else:
+                    body = b""
+                return resp_url, status, resp_headers, body, encoding
+        finally:
+            # This is a stateless recon scanner hitting a huge number of
+            # unrelated hosts, never authenticated/session-based crawling
+            # that needs cookie continuity. httpx's cookie jar has no size
+            # cap and accumulates one entry per unique host for the life of
+            # this shared client -- across hundreds of thousands of hosts in
+            # a large scan that alone reached ~18GB RSS in one worker
+            # process and got it OOM-killed. Wiping it after every request
+            # costs nothing (we never read it back) and bounds growth to
+            # zero regardless of scan size.
+            self._shared_client.cookies.clear()
+            if self.on_request:
+                try:
+                    self.on_request()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _decode_body(body: bytes, encoding: Optional[str]) -> str:
+        try:
+            return body.decode(encoding or "utf-8", errors="replace")
+        except Exception:
+            return body.decode("utf-8", errors="replace")
 
     def request(
         self,
@@ -115,6 +237,7 @@ class HttpClient:
         json_body: Any = None,
         allow_redirects: bool = True,
         retry_on_403: bool = True,
+        retries: Optional[int] = None,
     ) -> HttpResponse:
         host = httpx.URL(url).host or ""
         self.limiter.wait(host)
@@ -123,69 +246,71 @@ class HttpClient:
         chain: list[str] = []
         current = url
         method_u = method.upper()
+        max_retries = self.retries if retries is None else max(0, retries)
 
-        for attempt in range(self.retries + 1):
+        for attempt in range(max_retries + 1):
             try:
                 t0 = time.monotonic()
-                resp = self._client().request(
+                # _send always skips bodies on 3xx hops and caps every other
+                # body at max_body_bytes, so following redirects never buffers
+                # an unbounded download along the way.
+                resp_url, status, resp_headers, body, encoding = self._send(
                     method_u,
                     current,
                     headers=hdrs,
-                    content=data,
-                    json=json_body,
+                    data=data,
+                    json_body=json_body,
+                    read_body=True,
                 )
-                # manual redirect handling
                 hops = 0
-                while allow_redirects and resp.is_redirect and hops < self.max_redirects:
-                    loc = resp.headers.get("location")
+                while allow_redirects and 300 <= status < 400 and hops < self.max_redirects:
+                    loc = resp_headers.get("location")
                     if not loc:
                         break
-                    chain.append(str(resp.url))
+                    chain.append(resp_url)
                     current = str(httpx.URL(current).join(loc))
                     hops += 1
                     self.limiter.wait(httpx.URL(current).host or "")
-                    resp = self._client().request(method_u, current, headers=hdrs)
+                    resp_url, status, resp_headers, body, encoding = self._send(
+                        method_u, current, headers=hdrs, read_body=True
+                    )
                 elapsed = time.monotonic() - t0
-                body = resp.content[: self.max_body_bytes]
-                try:
-                    text = body.decode(resp.encoding or "utf-8", errors="replace")
-                except Exception:
-                    text = body.decode("utf-8", errors="replace")
+                text = self._decode_body(body, encoding)
                 result = HttpResponse(
-                    url=str(resp.url),
-                    status_code=resp.status_code,
-                    headers={k.lower(): v for k, v in resp.headers.items()},
+                    url=resp_url,
+                    status_code=status,
+                    headers=resp_headers,
                     text=text,
                     content=body,
                     elapsed=elapsed,
                     redirected_from=chain,
                     method=method_u,
                 )
-                if resp.status_code in (429, 503) and attempt < self.retries:
+                if status in (429, 503) and attempt < max_retries:
                     time.sleep(self.retry_backoff * (2**attempt))
                     continue
-                if resp.status_code == 403 and retry_on_403:
-                    alt = self._retry_403(method_u, str(resp.url), hdrs)
+                if status == 403 and retry_on_403:
+                    alt = self._retry_403(method_u, resp_url, hdrs)
                     if alt and alt.status_code != 403:
                         return alt
                     result.forbidden_but_exists = self._looks_like_forbidden(result)
-                if resp.status_code == 404:
+                if status == 404:
                     alt = self._retry_404_variants(method_u, url, hdrs)
                     if alt and alt.status_code not in (0, 404):
                         return alt
-                profile = self.get_soft404_profile(str(resp.url))
+                profile = self.get_soft404_profile(resp_url)
                 if profile and self.is_soft404(result, profile):
                     result.soft404 = True
                 return result
             except httpx.TimeoutException as e:
                 last_err = f"timeout:{e.__class__.__name__}"
-                if attempt < self.retries:
+                if attempt < max_retries:
                     time.sleep(self.retry_backoff * (2**attempt))
                     continue
                 return HttpResponse(url=url, status_code=0, headers={}, text="", content=b"", elapsed=0.0, error=last_err, method=method_u)
             except Exception as e:
                 last_err = f"error:{e.__class__.__name__}:{e}"
-                if attempt < self.retries:
+                if attempt < max_retries:
                     time.sleep(self.retry_backoff * (2**attempt))
                     continue
                 return HttpResponse(url=url, status_code=0, headers={}, text="", content=b"", elapsed=0.0, error=last_err, method=method_u)
@@ -203,15 +328,15 @@ class HttpClient:
         for hdr in variants:
             try:
                 self.limiter.wait(httpx.URL(url).host or "")
-                resp = self._client().request(method, url, headers=hdr)
-                if resp.status_code != 403:
-                    body = resp.content[: self.max_body_bytes]
-                    text = body.decode("utf-8", errors="replace")
+                resp_url, status, resp_headers, body, encoding = self._send(
+                    method, url, headers=hdr, read_body=True
+                )
+                if status != 403:
                     return HttpResponse(
-                        url=str(resp.url),
-                        status_code=resp.status_code,
-                        headers={k.lower(): v for k, v in resp.headers.items()},
-                        text=text,
+                        url=resp_url,
+                        status_code=status,
+                        headers=resp_headers,
+                        text=self._decode_body(body, encoding),
                         content=body,
                         elapsed=0.0,
                         method=method,
@@ -222,14 +347,15 @@ class HttpClient:
         for alt_url in self._path_variants(url):
             try:
                 self.limiter.wait(httpx.URL(alt_url).host or "")
-                resp = self._client().request(method, alt_url, headers=headers)
-                if resp.status_code not in (403, 404, 0):
-                    body = resp.content[: self.max_body_bytes]
+                resp_url, status, resp_headers, body, encoding = self._send(
+                    method, alt_url, headers=headers, read_body=True
+                )
+                if status not in (403, 404, 0):
                     return HttpResponse(
-                        url=str(resp.url),
-                        status_code=resp.status_code,
-                        headers={k.lower(): v for k, v in resp.headers.items()},
-                        text=body.decode("utf-8", errors="replace"),
+                        url=resp_url,
+                        status_code=status,
+                        headers=resp_headers,
+                        text=self._decode_body(body, encoding),
                         content=body,
                         elapsed=0.0,
                         method=method,
@@ -242,14 +368,15 @@ class HttpClient:
         for alt_url in self._path_variants(url):
             try:
                 self.limiter.wait(httpx.URL(alt_url).host or "")
-                resp = self._client().request(method, alt_url, headers=headers)
-                if resp.status_code not in (404, 0):
-                    body = resp.content[: self.max_body_bytes]
+                resp_url, status, resp_headers, body, encoding = self._send(
+                    method, alt_url, headers=headers, read_body=True
+                )
+                if status not in (404, 0):
                     return HttpResponse(
-                        url=str(resp.url),
-                        status_code=resp.status_code,
-                        headers={k.lower(): v for k, v in resp.headers.items()},
-                        text=body.decode("utf-8", errors="replace"),
+                        url=resp_url,
+                        status_code=status,
+                        headers=resp_headers,
+                        text=self._decode_body(body, encoding),
                         content=body,
                         elapsed=0.0,
                         method=method,
@@ -290,7 +417,9 @@ class HttpClient:
     def build_soft404_profile(self, base_url: str) -> dict[str, Any]:
         rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
         probe = join_url(base_url, f"/bbscanner-soft404-{rand}")
-        resp = self.get(probe, retry_on_403=False)
+        # This is a synthetic self-check against an already-confirmed-live
+        # host, not a real target request — retrying it just wastes time.
+        resp = self.get(probe, retry_on_403=False, retries=0)
         profile = {
             "status": resp.status_code,
             "length": len(resp.content),
@@ -298,13 +427,20 @@ class HttpClient:
             "title": self._extract_title(resp.text),
         }
         with self._soft404_lock:
-            self._soft404[httpx.URL(base_url).host or base_url] = profile
+            host = httpx.URL(base_url).host or base_url
+            self._soft404[host] = profile
+            self._soft404.move_to_end(host)
+            while len(self._soft404) > self._soft404_max_entries:
+                self._soft404.popitem(last=False)
         return profile
 
     def get_soft404_profile(self, url: str) -> Optional[dict[str, Any]]:
         host = httpx.URL(url).host or ""
         with self._soft404_lock:
-            return self._soft404.get(host)
+            profile = self._soft404.get(host)
+            if profile is not None:
+                self._soft404.move_to_end(host)
+            return profile
 
     @staticmethod
     def is_soft404(resp: HttpResponse, profile: dict[str, Any]) -> bool:
@@ -338,7 +474,11 @@ class HttpClient:
         return html[start + 1 : end].strip()[:200]
 
     def probe_live(self, url: str) -> HttpResponse:
-        return self.get(url)
+        # This is the initial liveness check across the whole target list —
+        # at scale most targets are dead/filtered, so retrying a timeout here
+        # doubles/triples the time wasted on hosts that will never respond.
+        # Real per-path module requests still use the configured retry count.
+        return self.get(url, retries=0)
 
     def test_methods(
         self,

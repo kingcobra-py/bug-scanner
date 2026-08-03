@@ -7,7 +7,7 @@ Fingerprints Next/React, checks exposed assets, and scores known vulnerable pack
 
 from __future__ import annotations
 
-from app.modules.base import body_extractions, finding_from_hit, save_evidence
+from app.modules.base import body_extractions, finding_from_hit, save_http_response
 from app.modules.vulnerability_intel import package_versions, react2shell_exposure
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
@@ -73,7 +73,7 @@ class ReactModule:
                 )
                 ctx.progress.add_hit(secrets=len(extracted.get("secrets", [])), module=self.name)
                 if extracted.get("secrets") or extracted.get("apis"):
-                    raw_ref = save_evidence(ctx, "next_home", home.text[: ctx.config.max_body_bytes])
+                    raw_ref = save_http_response(ctx, "next_home", home)
                     findings.append(
                         finding_from_hit(
                             module=self.name,
@@ -97,6 +97,7 @@ class ReactModule:
         ctx.progress.tick(success=True, module=self.name)
         if rsc_headers:
             tech.update({"nextjs", "react", "rsc"})
+            raw_ref = save_http_response(ctx, "next_rsc_headers", home)
             findings.append(
                 finding_from_hit(
                     module=self.name,
@@ -107,6 +108,7 @@ class ReactModule:
                     title="React Server Components surface headers present",
                     evidence=", ".join(rsc_headers),
                     confidence=0.8,
+                    raw_ref=raw_ref,
                     tags=["nextjs", "rsc", "react2shell", "detection-only"],
                 )
             )
@@ -127,7 +129,7 @@ class ReactModule:
                 versions = package_versions(body)
                 if versions:
                     tech.update({"nextjs", "react"})
-                    raw_ref = save_evidence(ctx, "next_package_json", body)
+                    raw_ref = save_http_response(ctx, "next_package_json", resp)
                     findings.append(
                         finding_from_hit(
                             module=self.name,
@@ -172,7 +174,7 @@ class ReactModule:
 
             if path.startswith("/.env") and ("=" in body or "KEY" in body.upper()):
                 extracted = body_extractions(ctx, resp.url or url, body)
-                raw_ref = save_evidence(ctx, f"next_env_{path}", body)
+                raw_ref = save_http_response(ctx, f"next_env_{path}", resp)
                 findings.append(
                     finding_from_hit(
                         module=self.name,
@@ -195,6 +197,7 @@ class ReactModule:
             if "/_next/" in path:
                 tech.update({"nextjs", "react"})
                 if "chunks/app/" in path:
+                    raw_ref = save_http_response(ctx, f"next_app_{path}", resp)
                     findings.append(
                         finding_from_hit(
                             module=self.name,
@@ -205,13 +208,14 @@ class ReactModule:
                             title="Next.js App Router asset exposed",
                             evidence=path,
                             confidence=0.75,
+                            raw_ref=raw_ref,
                             tags=["nextjs", "app-router", "detection-only"],
                         )
                     )
                     ctx.progress.add_hit(module=self.name)
                 extracted = body_extractions(ctx, resp.url or url, body)
                 if extracted.get("secrets") or extracted.get("apis") or extracted.get("smtp"):
-                    raw_ref = save_evidence(ctx, f"next_{path}", body)
+                    raw_ref = save_http_response(ctx, f"next_{path}", resp)
                     findings.append(
                         finding_from_hit(
                             module=self.name,

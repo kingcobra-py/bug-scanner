@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from app.core.crawler import crawl_target
 from app.core.wordlists import load_wordlist, WORDLIST_DIR
-from app.modules.base import body_extractions, finding_from_hit, save_evidence
+from app.modules.base import body_extractions, finding_from_hit, save_http_response
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
 
@@ -58,7 +58,7 @@ class JsSecretsModule:
             if not (secrets or apis or smtp):
                 # still record interesting source maps / large configs lightly as info if map
                 if url.endswith(".map") and ("sourcesContent" in body or "mappings" in body):
-                    raw_ref = save_evidence(ctx, f"jsmap_{url}", body[: ctx.config.max_body_bytes])
+                    raw_ref = save_http_response(ctx, f"jsmap_{url}", resp)
                     findings.append(
                         finding_from_hit(
                             module=self.name,
@@ -77,7 +77,7 @@ class JsSecretsModule:
                     ctx.progress.add_hit(module=self.name)
                 continue
 
-            raw_ref = save_evidence(ctx, f"js_{url}", body[: ctx.config.max_body_bytes])
+            raw_ref = save_http_response(ctx, f"js_{url}", resp)
             severity = "critical" if secrets or smtp else "medium"
             f = finding_from_hit(
                 module=self.name,

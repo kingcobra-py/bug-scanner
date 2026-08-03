@@ -3,139 +3,169 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>BB Scanner</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="stylesheet" href="/static/css/app.css" />
+  <title>BB Scanner Console</title>
+  <script src="https://cdn.tailwindcss.com" defer></script>
+  <link rel="stylesheet" href="/static/css/app.css?v=__ASSET_VERSION__" />
 </head>
 <body class="min-h-screen text-slate-100">
   <div class="bg-grid min-h-screen">
-    <header class="border-b border-cyan-900/40 backdrop-blur sticky top-0 z-20 bg-slate-950/70">
-      <div class="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
-        <div>
-          <div class="text-2xl font-semibold tracking-tight text-cyan-300">BB Scanner</div>
-          <div class="text-xs text-slate-400">Authorized recon · discovery · extraction</div>
+    <div class="ash-layer" aria-hidden="true">
+      <i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+      <i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+    </div>
+    <header class="topbar">
+      <div class="max-w-[1500px] mx-auto px-5 h-16 flex items-center justify-between">
+        <div class="flex items-center gap-3">
+          <div class="brand-mark">BB</div>
+          <div>
+            <div class="text-lg font-semibold tracking-tight">Scanner Console</div>
+            <div class="text-[11px] text-slate-500">Authorized attack-surface operations</div>
+          </div>
         </div>
-        <div class="text-xs text-slate-400" id="connState">ws: disconnected</div>
+        <div class="flex items-center gap-3 text-xs">
+          <span id="connDot" class="status-dot offline"></span>
+          <span id="connState" class="text-slate-400">Live channel offline</span>
+        </div>
       </div>
     </header>
 
-    <main class="max-w-7xl mx-auto px-4 py-6 grid lg:grid-cols-12 gap-6">
-      <section class="lg:col-span-4 space-y-4">
-        <div class="panel p-4">
-          <h2 class="section-title">Start scan</h2>
-          <label class="label">Targets</label>
-          <textarea id="targets" class="input h-36" placeholder="one host or URL per line"></textarea>
+    <nav class="tabbar">
+      <div class="max-w-[1500px] mx-auto px-5 flex gap-1">
+        <button class="nav-tab active" data-tab="uploads"><span>⇧</span> Uploads</button>
+        <button class="nav-tab" data-tab="jobs"><span>◫</span> Jobs <b id="runningBadge" class="nav-badge hidden">0</b></button>
+        <button class="nav-tab" data-tab="results"><span>⌁</span> Results</button>
+        <button class="nav-tab" data-tab="logs"><span>›_</span> Logs</button>
+      </div>
+    </nav>
 
-          <div class="grid grid-cols-2 gap-3 mt-3">
-            <div>
-              <label class="label">Threads</label>
-              <input id="threads" type="number" class="input" value="20" />
-            </div>
-            <div>
-              <label class="label">Timeout (s)</label>
-              <input id="timeout" type="number" class="input" value="8" />
-            </div>
-          </div>
-
-          <label class="label mt-3">Modules</label>
-          <div id="modules" class="grid grid-cols-2 gap-2 text-sm"></div>
-
-          <label class="label mt-3">Custom paths mode</label>
-          <select id="pathsMode" class="input">
-            <option value="merge">merge with built-in</option>
-            <option value="custom_only">custom only</option>
-            <option value="builtin_only">built-in only</option>
-          </select>
-
-          <label class="label mt-3">Upload path wordlist (.txt)</label>
-          <input id="wordlist" type="file" accept=".txt,text/plain" class="block w-full text-sm" />
-          <div id="wordlistInfo" class="text-xs text-slate-400 mt-1"></div>
-
-          <label class="label mt-3">Scope notes</label>
-          <textarea id="scope" class="input h-20" placeholder="authorization / program notes"></textarea>
-
-          <div class="flex gap-2 mt-4">
-            <button id="startBtn" class="btn-primary flex-1">Start scan</button>
-            <button id="stopBtn" class="btn-danger">Stop</button>
-          </div>
+    <main class="max-w-[1500px] mx-auto px-5 py-6">
+      <section id="tab-uploads" class="tab-view">
+        <div class="page-heading">
+          <div><h1>Upload library</h1><p>Store target lists and custom path dictionaries on this server.</p></div>
+          <button id="openJobFromUploads" class="btn-primary">Create job →</button>
         </div>
-
-        <div class="panel p-4">
-          <h2 class="section-title">History</h2>
-          <div id="history" class="space-y-2 max-h-80 overflow-auto text-sm"></div>
+        <div class="grid lg:grid-cols-12 gap-5">
+          <div class="panel lg:col-span-5 p-6">
+            <div class="eyebrow">NEW FILE</div>
+            <h2 class="text-xl font-semibold mt-1">Upload to server</h2>
+            <div class="grid grid-cols-2 gap-2 mt-5">
+              <button class="kind-option active" data-kind="targets"><b>Targets</b><small>Domains, IPs, URLs</small></button>
+              <button class="kind-option" data-kind="wordlist"><b>Path wordlist</b><small>Custom discovery paths</small></button>
+            </div>
+            <label id="dropZone" class="drop-zone mt-4">
+              <input id="uploadFile" type="file" accept=".txt,.lst,.csv,text/plain" hidden />
+              <div class="upload-glyph">⇧</div>
+              <b>Drop a text file here</b>
+              <span>or click to choose · up to 5 GB · parallel chunk upload</span>
+              <em id="chosenFile">No file selected</em>
+            </label>
+            <button id="uploadBtn" class="btn-primary w-full mt-4">Upload file</button>
+            <div id="uploadProgress" class="upload-progress hidden" aria-live="polite">
+              <div class="upload-progress-head"><span id="uploadProgressLabel">Preparing…</span><b id="uploadProgressPercent">0%</b></div>
+              <div class="progress-track"><div id="uploadProgressBar" class="progress-fill" style="width:0%"></div></div>
+              <div id="uploadProgressBytes" class="upload-progress-bytes">0 B / 0 B</div>
+            </div>
+            <div id="uploadMessage" class="text-xs text-slate-400 mt-3 min-h-5"></div>
+          </div>
+          <div class="panel lg:col-span-7 p-6">
+            <div class="flex items-center justify-between">
+              <div><div class="eyebrow">SERVER STORAGE</div><h2 class="text-xl font-semibold mt-1">Uploaded files</h2></div>
+              <button id="refreshUploads" class="icon-btn" title="Refresh">↻</button>
+            </div>
+            <div id="uploadList" class="mt-4 space-y-2"></div>
+          </div>
         </div>
       </section>
 
-      <section class="lg:col-span-8 space-y-4">
-        <div class="panel p-4">
-          <div class="flex items-center justify-between gap-3">
-            <h2 class="section-title">Live progress</h2>
-            <div class="text-xs text-slate-400" id="scanMeta">no active scan</div>
-          </div>
-          <div class="mt-3">
-            <div class="flex justify-between text-xs text-slate-400 mb-1">
-              <span id="pctLabel">0%</span>
-              <span id="etaLabel">ETA —</span>
-            </div>
-            <div class="h-3 rounded bg-slate-800 overflow-hidden">
-              <div id="bar" class="h-full bg-gradient-to-r from-cyan-600 to-emerald-400 transition-all duration-300" style="width:0%"></div>
-            </div>
-            <div class="grid grid-cols-2 md:grid-cols-5 gap-2 mt-3 text-xs">
-              <div class="stat">RPS <b id="rps">0</b></div>
-              <div class="stat">Queued <b id="queued">0</b></div>
-              <div class="stat">Done <b id="done">0</b></div>
-              <div class="stat">Failed <b id="failed">0</b></div>
-              <div class="stat">Hits <b id="hits">0</b></div>
-            </div>
-            <div class="text-xs text-slate-400 mt-2" id="currentLabel"></div>
-            <div id="moduleBars" class="mt-3 space-y-1 text-xs"></div>
+      <section id="tab-jobs" class="tab-view hidden">
+        <div class="page-heading">
+          <div><h1>Scan jobs</h1><p>Create, monitor, and inspect every scanner run.</p></div>
+          <button id="createJobBtn" class="btn-primary">＋ Create job</button>
+        </div>
+        <div id="jobsOverview" class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5"></div>
+        <div id="jobsGrid" class="grid xl:grid-cols-2 gap-4"></div>
+        <div id="jobsEmpty" class="empty-state hidden"><b>No jobs yet</b><span>Upload a targets file, then create your first scan job.</span></div>
+      </section>
+
+      <section id="tab-results" class="tab-view hidden">
+        <div class="page-heading">
+          <div><h1>Results</h1><p>Deduplicated findings, vulnerable hosts, APIs, and secrets.</p></div>
+          <div class="flex gap-2">
+            <select id="resultScanSelect" class="input min-w-[250px]"></select>
+            <button id="refreshResults" class="icon-btn" title="Refresh">↻</button>
+            <button id="purgeResults" class="btn-destructive">Delete job + results</button>
           </div>
         </div>
-
-        <div class="panel p-4">
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <h2 class="section-title">Findings</h2>
-            <div class="flex gap-2 items-center">
-              <input id="findQ" class="input !py-1 !w-40" placeholder="search" />
-              <select id="sevFilter" class="input !py-1 !w-32">
-                <option value="">all severity</option>
-                <option>critical</option><option>high</option><option>medium</option><option>low</option><option>info</option>
-              </select>
+        <div id="resultSummary" class="grid grid-cols-2 lg:grid-cols-4 gap-3"></div>
+        <div class="panel p-5 mt-5">
+          <div class="flex items-center justify-between gap-3 flex-wrap">
+            <div><div class="eyebrow">DEDUPLICATED API KEYS &amp; SECRETS</div><div class="text-sm text-slate-400 mt-1">Unique credential values with occurrence counts, filterable by provider</div></div>
+            <div class="flex gap-2">
               <button id="exportJson" class="btn-ghost">JSON</button>
               <button id="exportCsv" class="btn-ghost">CSV</button>
-              <button id="exportMd" class="btn-ghost">MD</button>
+              <button id="exportVulns" class="btn-ghost">Vulns CSV</button>
+              <button id="exportHosts" class="btn-ghost">Hosts</button>
             </div>
           </div>
-          <div class="overflow-auto max-h-96 mt-3">
-            <table class="w-full text-sm">
-              <thead class="text-slate-400 text-left sticky top-0 bg-slate-900/90">
-                <tr>
-                  <th class="py-2 pr-2">Sev</th>
-                  <th class="py-2 pr-2">Type</th>
-                  <th class="py-2 pr-2">Title</th>
-                  <th class="py-2 pr-2">URL</th>
-                  <th class="py-2">Conf</th>
-                </tr>
-              </thead>
-              <tbody id="findingsBody"></tbody>
-            </table>
-          </div>
-          <pre id="evidence" class="mt-3 text-xs bg-black/40 rounded p-3 overflow-auto max-h-40 text-emerald-200/90 hidden"></pre>
+          <div id="providerFilters" class="provider-filters mt-4"></div>
+          <div id="secretsBox" class="mt-4"></div>
         </div>
+      </section>
 
-        <div class="panel p-4">
-          <div class="flex items-center justify-between">
-            <h2 class="section-title">Logs</h2>
-            <select id="logLevel" class="input !py-1 !w-28">
-              <option value="">all</option>
-              <option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option>
-            </select>
+      <section id="tab-logs" class="tab-view hidden">
+        <div class="page-heading">
+          <div><h1>Job logs</h1><p>Live scanner output for the selected job.</p></div>
+          <div class="flex gap-2">
+            <select id="logScanSelect" class="input min-w-[250px]"></select>
+            <select id="logLevel" class="input w-32"><option value="">All levels</option><option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select>
           </div>
-          <div id="logs" class="mt-2 font-mono text-xs h-64 overflow-auto space-y-1"></div>
+        </div>
+        <div class="terminal panel">
+          <div class="terminal-top"><div><i></i><i></i><i></i></div><span id="terminalTitle">No job selected</span><button id="clearLogs" class="btn-ghost">Clear view</button></div>
+          <div id="logs" class="terminal-body"></div>
         </div>
       </section>
     </main>
   </div>
-  <script src="/static/js/app.js"></script>
+
+  <div id="jobModal" class="modal-backdrop" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div><div class="eyebrow">NEW SCAN</div><h2>Create job</h2><p>Select a server upload and configure execution.</p></div>
+        <button id="closeJobModal" class="modal-close">×</button>
+      </div>
+      <form id="jobForm" class="modal-body">
+        <label class="label">Job name</label>
+        <input id="jobName" class="input" placeholder="e.g. August authorized surface scan" />
+        <div class="grid md:grid-cols-2 gap-4">
+          <div><label class="label">Target file <b class="text-red-400">*</b></label><select id="jobTargetsUpload" class="input" required></select></div>
+          <div><label class="label">Custom path file</label><select id="jobWordlistUpload" class="input"><option value="">None — built-ins only</option></select></div>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <div><label class="label" title="I/O-bound worker threads PER process. Peak is around 300 per process; going higher in one process can reduce speed. With multiple worker processes, each one gets this many threads (300 threads × 3 processes ≈ 900 concurrent targets).">Threads</label><input id="threads" type="number" class="input" value="100" min="1" max="500" /></div>
+          <div><label class="label" title="Runs the scan across N separate OS processes. Each process gets its own Python GIL and its own full Threads budget. Example: Threads=300 and Worker processes=3 → 300 threads in each of 3 processes.">Worker processes</label><input id="workerProcesses" type="number" class="input" value="1" min="1" max="16" /></div>
+          <div><label class="label" title="Connection timeout is automatically set to min(this value, 5s), so unreachable/filtered hosts fail fast instead of always waiting 5s to connect.">Timeout</label><input id="timeout" type="number" class="input" value="8" min="1" max="60" /></div>
+          <div><label class="label" title="Safety ceiling for repeated requests to the same host; not a guaranteed global speed">Max req/sec / host</label><input id="rateLimit" type="number" class="input" value="50" min="1" max="500" title="Per-host safety ceiling, not global RPS" /></div>
+          <div><label class="label">Retries</label><input id="retries" type="number" class="input" value="1" min="0" max="5" /></div>
+        </div>
+        <div>
+          <label class="label">Methods / modules</label>
+          <div id="modules" class="module-picker"></div>
+        </div>
+        <div class="grid md:grid-cols-2 gap-4">
+          <div><label class="label">Path mode</label><select id="pathsMode" class="input"><option value="merge">Merge custom + built-in</option><option value="custom_only">Custom only</option><option value="builtin_only">Built-in only</option></select></div>
+          <div class="space-y-2">
+            <label class="check-option"><input id="methodTrace" type="checkbox" /> Include HTTP TRACE method test</label>
+          </div>
+        </div>
+        <label class="label">Authorization / scope notes</label>
+        <textarea id="scope" class="input h-20" placeholder="Program name, scope reference, operator notes"></textarea>
+        <div id="jobError" class="text-sm text-red-300 min-h-5"></div>
+      </form>
+      <div class="modal-actions"><button type="button" id="cancelJob" class="btn-ghost">Cancel</button><button type="button" id="startBtn" class="btn-primary">Start job</button></div>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js?v=__ASSET_VERSION__"></script>
 </body>
 </html>

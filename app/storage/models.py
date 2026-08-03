@@ -71,11 +71,15 @@ class TargetContext:
 
 @dataclass
 class ProgressSnapshot:
+    # ``total`` / ``done`` / ``failed`` / ``queued`` / ``percent`` are
+    # host-level: one unit = one domain/IP that finished its full pipeline
+    # (or failed hard). Per-request work stays in ``module_progress`` only.
     total: int = 0
     done: int = 0
     failed: int = 0
     queued: int = 0
     hits: int = 0
+    vulnerable_hosts: int = 0
     secrets: int = 0
     timeouts: int = 0
     requests: int = 0
@@ -90,22 +94,31 @@ class ProgressSnapshot:
 @dataclass
 class ScanConfig:
     targets: list[str]
+    targets_path: str = ""
+    target_count: int = 0
+    job_name: str = ""
+    targets_upload_id: str = ""
+    wordlist_upload_id: str = ""
     threads: int = 20
+    worker_processes: int = 1
     timeout: float = 8.0
     connect_timeout: float = 5.0
     retries: int = 2
+    rate_limit_per_host: float = 50.0
     modules: list[str] = field(default_factory=lambda: [
         "git", "js", "config", "path", "methods", "wordpress", "joomla", "react", "crawl"
     ])
     paths_mode: str = "merge"
     custom_paths: list[str] = field(default_factory=list)
+    wordlist_path: str = ""
+    custom_path_count: int = 0
     output_dir: str = "output/scans"
     formats: list[str] = field(default_factory=lambda: ["json", "md", "csv"])
     verify_tls: bool = False
     proxy: Optional[str] = None
     headers: dict[str, str] = field(default_factory=dict)
     scope_notes: str = ""
-    redact_secrets: bool = True
+    redact_secrets: bool = False
     method_test_trace: bool = False
     probe_both_schemes: bool = True
     max_body_bytes: int = 2_097_152

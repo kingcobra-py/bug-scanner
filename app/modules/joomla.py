@@ -8,7 +8,7 @@ Detection + priority secret packs only: AWS, GitHub, Stripe, SendGrid, Brevo.
 from __future__ import annotations
 
 from app.extractors.priority_secrets import priority_extractions
-from app.modules.base import finding_from_hit, save_evidence
+from app.modules.base import finding_from_hit, save_http_response
 from app.modules.vulnerability_intel import executable_upload_paths, jce_exposure, xml_version
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
@@ -58,11 +58,16 @@ def _emit_priority_secrets(
     path: str,
     body: str,
     extracted: dict,
+    resp=None,
 ) -> None:
     secrets = extracted.get("secrets") or []
     if not secrets:
         return
-    raw_ref = save_evidence(ctx, f"joomla_priority_secrets_{path.strip('/') or 'home'}", body)
+    if resp is not None:
+        raw_ref = save_http_response(ctx, f"joomla_priority_secrets_{path.strip('/') or 'home'}", resp)
+    else:
+        from app.modules.base import save_evidence
+        raw_ref = save_evidence(ctx, f"joomla_priority_secrets_{path.strip('/') or 'home'}", body)
     kinds = sorted({s.get("kind", "") for s in secrets if s.get("kind")})
     findings.append(
         finding_from_hit(
@@ -137,7 +142,7 @@ class JoomlaModule:
             if path.startswith("/configuration.php") and resp.status_code == 200 and (
                 "public $" in body or "JConfig" in body or "dbpassword" in body.lower() or "$password" in body
             ):
-                raw_ref = save_evidence(ctx, f"joomla_config_{path}", body)
+                raw_ref = save_http_response(ctx, f"joomla_config_{path}", resp)
                 findings.append(
                     finding_from_hit(
                         module=self.name,
@@ -159,7 +164,7 @@ class JoomlaModule:
             if path.endswith("jce.xml") and resp.status_code == 200 and len(body) > 20:
                 is_joomla = True
                 version = xml_version(body)
-                raw_ref = save_evidence(ctx, f"jce_xml_{path}", body)
+                raw_ref = save_http_response(ctx, f"jce_xml_{path}", resp)
                 findings.append(
                     finding_from_hit(
                         module=self.name,
@@ -209,6 +214,7 @@ class JoomlaModule:
                     title = "JCE cpanel.feed proxy endpoint reachable"
                     severity = "medium"
                     tags = ["joomla", "jce", "cve-2026-48907", "detection-only"]
+                raw_ref = save_http_response(ctx, f"joomla_jce_{path}", resp)
                 findings.append(
                     finding_from_hit(
                         module=self.name,
@@ -219,6 +225,7 @@ class JoomlaModule:
                         title=title,
                         evidence=body[:200],
                         confidence=0.7 if "feeds" in body else 0.65,
+                        raw_ref=raw_ref,
                         tags=tags,
                     )
                 )
@@ -228,6 +235,7 @@ class JoomlaModule:
                 version = xml_version(body) if path.endswith(".xml") else None
                 if version or ("joomla" in body.lower() and resp.status_code == 200):
                     is_joomla = True
+                    raw_ref = save_http_response(ctx, f"joomla_version_{path}", resp)
                     findings.append(
                         finding_from_hit(
                             module=self.name,
@@ -239,6 +247,7 @@ class JoomlaModule:
                             evidence=version or body[:200],
                             confidence=0.85 if version else 0.6,
                             extracted={"joomla_version": version} if version else {},
+                            raw_ref=raw_ref,
                             tags=["joomla", "version-check", "detection-only"],
                         )
                     )
@@ -263,6 +272,7 @@ class JoomlaModule:
 
             if path.startswith("/api/index.php") and resp.status_code in (200, 401, 403) and body:
                 is_joomla = True
+                raw_ref = save_http_response(ctx, f"joomla_api_{path}", resp)
                 findings.append(
                     finding_from_hit(
                         module=self.name,
@@ -273,6 +283,7 @@ class JoomlaModule:
                         title="Joomla Web Services API endpoint reachable",
                         evidence=body[:200],
                         confidence=0.85,
+                        raw_ref=raw_ref,
                         tags=["joomla", "api", "webservices", "detection-only"],
                     )
                 )
@@ -287,6 +298,7 @@ class JoomlaModule:
                     path=path,
                     body=body,
                     extracted=extracted,
+                    resp=resp,
                 )
 
         if is_joomla and not any("Joomla" in f.title for f in findings):

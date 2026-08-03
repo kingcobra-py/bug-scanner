@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,9 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    delete,
+    func,
+    or_,
     select,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -35,6 +39,7 @@ class ScanRow(Base):
     progress_json = Column(Text, default="{}")
     summary_json = Column(Text, default="{}")
     output_dir = Column(String(512), default="")
+    archived = Column(Integer, default=0)
 
 
 class FindingRow(Base):
@@ -66,14 +71,108 @@ class LogRow(Base):
     message = Column(Text)
 
 
+class UploadRow(Base):
+    __tablename__ = "uploads"
+    id = Column(String(32), primary_key=True)
+    kind = Column(String(16), index=True)
+    original_name = Column(String(255))
+    stored_path = Column(String(1024), unique=True)
+    item_count = Column(Integer, default=0)
+    size_bytes = Column(Integer, default=0)
+    sha256 = Column(String(64), default="")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class ScanStore:
     def __init__(self, db_path: Path | str = "output/scans/scanner.db") -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.engine = create_engine(f"sqlite:///{self.db_path}", future=True)
+        # check_same_thread=False: scan worker threads and the API share this engine.
+        # timeout + WAL keep progress writers from stalling create-job / list APIs.
+        self.engine = create_engine(
+            f"sqlite:///{self.db_path}",
+            future=True,
+            connect_args={"check_same_thread": False, "timeout": 30},
+        )
         Base.metadata.create_all(self.engine)
+        # create_all does not add columns to an existing SQLite table.
+        with self.engine.begin() as conn:
+            columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(scans)")}
+            if "archived" not in columns:
+                conn.exec_driver_sql("ALTER TABLE scans ADD COLUMN archived INTEGER DEFAULT 0")
+            conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+            conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         self._lock = threading.Lock()
+        # A scan can log thousands of lines/sec across hundreds of worker
+        # threads. Committing each one synchronously under a shared lock was
+        # the dominant bottleneck at high thread counts (every request stalls
+        # behind every other thread's disk commit). Logs are now buffered in
+        # memory and flushed in small batches by one background thread, so
+        # add_log() never blocks a scan worker on disk I/O.
+        self._log_queue: queue.Queue[tuple[str, dict[str, Any]] | None] = queue.Queue()
+        self._log_flush_interval = 0.25
+        self._log_flush_batch = 500
+        self._log_counter_lock = threading.Lock()
+        self._log_enqueued = 0
+        self._log_committed = 0
+        self._log_writer = threading.Thread(target=self._log_writer_loop, daemon=True)
+        self._log_writer.start()
+
+    def _log_writer_loop(self) -> None:
+        while True:
+            try:
+                item = self._log_queue.get(timeout=self._log_flush_interval)
+            except queue.Empty:
+                continue
+            if item is None:
+                return
+            batch = [item]
+            while len(batch) < self._log_flush_batch:
+                try:
+                    nxt = self._log_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    self._flush_log_batch(batch)
+                    return
+                batch.append(nxt)
+            self._flush_log_batch(batch)
+
+    def _flush_log_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
+        if not batch:
+            return
+        try:
+            with Session(self.engine) as s:
+                for scan_id, event in batch:
+                    s.add(
+                        LogRow(
+                            scan_id=scan_id,
+                            timestamp=event.get("timestamp", ""),
+                            level=event.get("level", "INFO"),
+                            module=event.get("module", "engine"),
+                            message=event.get("message", ""),
+                        )
+                    )
+                s.commit()
+        except Exception:
+            pass
+        finally:
+            with self._log_counter_lock:
+                self._log_committed += len(batch)
+
+    def flush_logs(self, timeout: float = 5.0) -> None:
+        """Block until every log queued so far has been committed. Used by tests/shutdown."""
+        import time
+
+        with self._log_counter_lock:
+            target = self._log_enqueued
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._log_counter_lock:
+                if self._log_committed >= target:
+                    return
+            time.sleep(0.01)
 
     def create_scan(self, scan_id: str, config: dict[str, Any], output_dir: str) -> None:
         with self._lock, Session(self.engine) as s:
@@ -136,27 +235,169 @@ class ScanStore:
             s.commit()
 
     def add_log(self, scan_id: str, event: dict[str, Any]) -> None:
+        # Non-blocking: the background writer batches these to avoid
+        # serializing every scan worker thread behind one SQLite commit.
+        with self._log_counter_lock:
+            self._log_enqueued += 1
+        self._log_queue.put((scan_id, event))
+
+    def add_upload(self, upload: dict[str, Any]) -> None:
         with self._lock, Session(self.engine) as s:
-            s.add(
-                LogRow(
-                    scan_id=scan_id,
-                    timestamp=event.get("timestamp", ""),
-                    level=event.get("level", "INFO"),
-                    module=event.get("module", "engine"),
-                    message=event.get("message", ""),
+            s.merge(
+                UploadRow(
+                    id=upload["id"],
+                    kind=upload["kind"],
+                    original_name=upload["original_name"],
+                    stored_path=upload["stored_path"],
+                    item_count=int(upload.get("item_count", 0)),
+                    size_bytes=int(upload.get("size_bytes", 0)),
+                    sha256=upload.get("sha256", ""),
                 )
             )
             s.commit()
 
-    def list_scans(self) -> list[dict[str, Any]]:
+    def list_uploads(self, kind: Optional[str] = None) -> list[dict[str, Any]]:
         with Session(self.engine) as s:
-            rows = s.scalars(select(ScanRow).order_by(ScanRow.created_at.desc())).all()
-            return [self._scan_dict(r) for r in rows]
+            stmt = select(UploadRow).order_by(UploadRow.created_at.desc())
+            if kind:
+                stmt = stmt.where(UploadRow.kind == kind)
+            return [self._upload_dict(row) for row in s.scalars(stmt).all()]
 
-    def get_scan(self, scan_id: str) -> Optional[dict[str, Any]]:
+    def get_upload(self, upload_id: str) -> Optional[dict[str, Any]]:
+        with Session(self.engine) as s:
+            row = s.get(UploadRow, upload_id)
+            return self._upload_dict(row) if row else None
+
+    def delete_upload(self, upload_id: str) -> Optional[dict[str, Any]]:
+        with self._lock, Session(self.engine) as s:
+            row = s.get(UploadRow, upload_id)
+            if not row:
+                return None
+            result = self._upload_dict(row)
+            s.delete(row)
+            s.commit()
+            return result
+
+    def list_scans(
+        self,
+        limit: int = 100,
+        compact: bool = False,
+        include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
+        with Session(self.engine) as s:
+            stmt = select(ScanRow).order_by(ScanRow.created_at.desc())
+            if not include_archived:
+                stmt = stmt.where(ScanRow.archived == 0)
+            rows = s.scalars(stmt.limit(max(1, min(limit, 1000)))).all()
+            return [self._scan_dict(r, compact=compact) for r in rows]
+
+    def get_scan(self, scan_id: str, compact: bool = False) -> Optional[dict[str, Any]]:
         with Session(self.engine) as s:
             row = s.get(ScanRow, scan_id)
-            return self._scan_dict(row) if row else None
+            return self._scan_dict(row, compact=compact) if row else None
+
+    def delete_scan(self, scan_id: str) -> bool:
+        # Log writes are queued asynchronously (see add_log); flush first so
+        # a write already in flight when this is called can't land after
+        # the delete and leave an orphaned row behind.
+        self.flush_logs(timeout=2.0)
+        with self._lock, Session(self.engine) as s:
+            row = s.get(ScanRow, scan_id)
+            if not row:
+                return False
+            s.execute(delete(FindingRow).where(FindingRow.scan_id == scan_id))
+            s.execute(delete(LogRow).where(LogRow.scan_id == scan_id))
+            s.delete(row)
+            s.commit()
+            return True
+
+    def archive_scan(self, scan_id: str) -> bool:
+        with self._lock, Session(self.engine) as s:
+            row = s.get(ScanRow, scan_id)
+            if not row:
+                return False
+            row.archived = 1
+            row.updated_at = datetime.now(timezone.utc)
+            s.commit()
+            return True
+
+    def slim_stored_summaries(self) -> int:
+        """Rewrite fat legacy summaries that embed full target arrays."""
+        changed = 0
+        with self._lock, Session(self.engine) as s:
+            rows = s.scalars(select(ScanRow)).all()
+            for row in rows:
+                summary = json.loads(row.summary_json or "{}")
+                if "targets" not in summary and "custom_paths" not in summary:
+                    # Still drop oversized progress blobs copied into summary.
+                    if "progress" not in summary and len(row.summary_json or "") < 4096:
+                        continue
+                slim = self._slim_summary(summary)
+                # Keep a compact progress snapshot if present.
+                progress = summary.get("progress")
+                if isinstance(progress, dict):
+                    slim["progress"] = {
+                        key: progress.get(key)
+                        for key in (
+                            "total", "done", "failed", "queued", "hits", "vulnerable_hosts",
+                            "secrets", "requests", "rps", "percent", "eta_seconds",
+                        )
+                        if key in progress
+                    }
+                new_json = json.dumps(slim)
+                if new_json != (row.summary_json or "{}"):
+                    row.summary_json = new_json
+                    changed += 1
+            if changed:
+                s.commit()
+        return changed
+
+    def query_findings(
+        self,
+        scan_id: str,
+        severity: Optional[str] = None,
+        ftype: Optional[str] = None,
+        module: Optional[str] = None,
+        q: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return ``(page_items, total_matching)`` with SQL filters + LIMIT.
+
+        Used by the Results dashboard so a scan with hundreds of thousands of
+        findings does not force the API (or browser) to materialize every row
+        just to show one page of 10/20/50/100.
+        """
+        filters = [FindingRow.scan_id == scan_id]
+        if severity:
+            filters.append(FindingRow.severity == severity)
+        if ftype:
+            filters.append(FindingRow.type == ftype)
+        if module:
+            filters.append(FindingRow.module == module)
+        if q:
+            like = f"%{q.strip()}%"
+            filters.append(
+                or_(
+                    FindingRow.title.like(like),
+                    FindingRow.url.like(like),
+                    FindingRow.target.like(like),
+                    FindingRow.evidence.like(like),
+                    FindingRow.module.like(like),
+                )
+            )
+        with Session(self.engine) as s:
+            total = int(s.scalar(select(func.count()).select_from(FindingRow).where(*filters)) or 0)
+            stmt = (
+                select(FindingRow)
+                .where(*filters)
+                .order_by(FindingRow.timestamp.desc(), FindingRow.id.desc())
+                .offset(max(0, int(offset or 0)))
+            )
+            if limit is not None:
+                stmt = stmt.limit(max(0, int(limit)))
+            rows = s.scalars(stmt).all()
+            return [self._finding_dict(r) for r in rows], total
 
     def get_findings(
         self,
@@ -165,26 +406,26 @@ class ScanStore:
         ftype: Optional[str] = None,
         module: Optional[str] = None,
         q: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
+        items, _total = self.query_findings(
+            scan_id,
+            severity=severity,
+            ftype=ftype,
+            module=module,
+            q=q,
+            limit=limit,
+            offset=offset,
+        )
+        return items
+
+    def get_finding(self, scan_id: str, finding_id: str) -> Optional[dict[str, Any]]:
         with Session(self.engine) as s:
-            rows = s.scalars(
-                select(FindingRow).where(FindingRow.scan_id == scan_id)
-            ).all()
-            out = []
-            for r in rows:
-                if severity and r.severity != severity:
-                    continue
-                if ftype and r.type != ftype:
-                    continue
-                if module and r.module != module:
-                    continue
-                item = self._finding_dict(r)
-                if q:
-                    blob = json.dumps(item).lower()
-                    if q.lower() not in blob:
-                        continue
-                out.append(item)
-            return out
+            row = s.get(FindingRow, finding_id)
+            if not row or row.scan_id != scan_id:
+                return None
+            return self._finding_dict(row)
 
     def get_logs(self, scan_id: str, level: Optional[str] = None, module: Optional[str] = None, limit: int = 500) -> list[dict[str, Any]]:
         with Session(self.engine) as s:
@@ -208,16 +449,46 @@ class ScanStore:
             return out
 
     @staticmethod
-    def _scan_dict(row: ScanRow) -> dict[str, Any]:
+    def _slim_summary(summary: dict[str, Any]) -> dict[str, Any]:
+        """Drop bulky fields (full target lists) from dashboard payloads."""
+        slim = {
+            "scan_id": summary.get("scan_id"),
+            "generated_at": summary.get("generated_at"),
+            "finding_count": summary.get("finding_count"),
+            "vuln_finding_count": summary.get("vuln_finding_count"),
+            "by_severity": summary.get("by_severity") or {},
+            "modules": summary.get("modules") or [],
+        }
+        if "target_count" in summary:
+            slim["target_count"] = summary.get("target_count")
+        elif isinstance(summary.get("targets"), list):
+            slim["target_count"] = len(summary.get("targets") or [])
+        return {key: value for key, value in slim.items() if value not in (None, [], {})}
+
+    @staticmethod
+    def _scan_dict(row: ScanRow, compact: bool = False) -> dict[str, Any]:
+        config = json.loads(row.config_json or "{}")
+        summary = json.loads(row.summary_json or "{}")
+        if compact:
+            targets = config.pop("targets", None)
+            custom_paths = config.pop("custom_paths", None)
+            if targets is not None or "target_count" not in config:
+                config["target_count"] = len(targets or [])
+            if custom_paths is not None or "custom_path_count" not in config:
+                config["custom_path_count"] = len(custom_paths or [])
+            # Older scans stored the full target list inside summary_json (~175KB).
+            # That alone made Jobs polling ~1MB and caused browser "Failed to fetch".
+            summary = ScanStore._slim_summary(summary)
         return {
             "id": row.id,
             "status": row.status,
             "created_at": row.created_at.isoformat() if row.created_at else "",
             "updated_at": row.updated_at.isoformat() if row.updated_at else "",
-            "config": json.loads(row.config_json or "{}"),
+            "config": config,
             "progress": json.loads(row.progress_json or "{}"),
-            "summary": json.loads(row.summary_json or "{}"),
+            "summary": summary,
             "output_dir": row.output_dir,
+            "archived": bool(row.archived),
         }
 
     @staticmethod
@@ -237,4 +508,17 @@ class ScanStore:
             "timestamp": row.timestamp,
             "validated": bool(row.validated),
             "tags": json.loads(row.tags_json or "[]"),
+        }
+
+    @staticmethod
+    def _upload_dict(row: UploadRow) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "kind": row.kind,
+            "original_name": row.original_name,
+            "stored_path": row.stored_path,
+            "item_count": row.item_count,
+            "size_bytes": row.size_bytes,
+            "sha256": row.sha256,
+            "created_at": row.created_at.isoformat() if row.created_at else "",
         }

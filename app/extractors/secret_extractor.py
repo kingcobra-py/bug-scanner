@@ -8,7 +8,15 @@ import re
 from typing import Any
 
 from app.extractors import patterns as P
-from app.extractors.validators import confidence_for, is_placeholder, looks_like_secret, redact
+from app.extractors.validators import (
+    GENERIC_ENV_KV_NAMES,
+    confidence_for,
+    is_placeholder,
+    is_useless_env_assignment,
+    looks_like_js_expression,
+    looks_like_secret,
+    redact,
+)
 from app.utils.dedupe import value_hash
 
 
@@ -44,15 +52,54 @@ def _parse_jsonish(text: str) -> dict[str, Any]:
     return {}
 
 
+# Common manifest/package/meta fields that read as long, high-entropy strings
+# but are public by design (site names, descriptions, PWA/app metadata, shader
+# code assignments picked up by the bare KEY=VALUE line parser).
+_NON_SECRET_KEYS = {
+    "name", "short_name", "description", "orientation", "start_url", "scope",
+    "display", "background_color", "theme_color", "lang", "dir", "id",
+    "categories", "icons", "screenshots", "related_applications",
+    "prefer_related_applications", "gcm_sender_id", "version", "author",
+    "homepage", "license", "keywords", "main", "module", "exports", "browser",
+    "style", "type", "sideeffects", "dependencies", "devdependencies",
+    "peerdependencies", "scripts", "engines", "repository", "title", "alt",
+    "label", "placeholder", "tooltip", "class", "classname", "role",
+}
+
+
+def _looks_like_sentence_or_code(value: str) -> bool:
+    """Reject natural-language text and JS/GLSL statements, not credentials."""
+    words = value.split()
+    if len(words) >= 3:
+        return True
+    return bool(re.search(r"[(){};]|=>|function\s*\(", value))
+
+
+_KV_MARKERS = (
+    "aws", "github", "gitlab", "stripe", "sendgrid", "brevo", "mailgun",
+    "postmark", "slack", "openai", "anthropic", "twilio", "azure", "tencent",
+    "aliyun", "smtp", "mail_", "mail-", "password", "passwd", "secret",
+    "private", "credential", "access_key", "secret_key",
+)
+
+
 def _interesting_kv(key: str, value: str) -> bool:
-    key_l = key.lower()
-    markers = (
-        "key", "token", "secret", "password", "passwd", "auth", "api",
-        "smtp", "mail", "aws", "private", "credential", "bearer",
-    )
-    if any(m in key_l for m in markers):
-        return looks_like_secret(value, min_len=6) or len(value) >= 8
-    return looks_like_secret(value)
+    key_l = key.strip().lower()
+    value = (value or "").strip().strip("'\"")
+    if key_l in _NON_SECRET_KEYS:
+        return False
+    if key_l in GENERIC_ENV_KV_NAMES or key_l.startswith("keyword"):
+        return False
+    if _looks_like_sentence_or_code(value) or looks_like_js_expression(value):
+        return False
+    if is_placeholder(value):
+        return False
+    # Require a provider/credential-shaped key name AND a value that actually
+    # looks like a secret. The old ``len >= 8`` escape hatch is what let
+    # ``wp_local_password`` and other low-entropy placeholders through.
+    if not any(m in key_l for m in _KV_MARKERS):
+        return False
+    return looks_like_secret(value, min_len=8)
 
 
 def extract_secrets(text: str, source_url: str = "", redact_values: bool = True) -> list[dict[str, Any]]:
@@ -64,7 +111,17 @@ def extract_secrets(text: str, source_url: str = "", redact_values: bool = True)
         value = (value or "").strip().strip("'\"")
         if not value or is_placeholder(value):
             return
-        if kind.startswith("generic") and not looks_like_secret(value):
+        kind_l = (kind or "").lower()
+        if kind_l in P.IGNORED_SECRET_KINDS or kind_l.startswith("generic"):
+            return
+        # Drop public Google API keys / JWTs even when they arrive via env/JSON KV.
+        if value.startswith("AIza") or (value.startswith("eyJ") and value.count(".") >= 2):
+            return
+        # env rows are stored as KEY=VALUE — validate the RHS / generic LHS too.
+        if kind_l == "env" and is_useless_env_assignment(value):
+            return
+        rhs = value.split("=", 1)[1] if kind_l == "env" and "=" in value else value
+        if looks_like_js_expression(rhs) or is_placeholder(rhs):
             return
         h = value_hash(f"{kind}:{value}:{source_url}")
         if h in seen:
@@ -132,16 +189,17 @@ def extract_secrets(text: str, source_url: str = "", redact_values: bool = True)
         except Exception:
             continue
 
-    # AWS access + nearby secret
+    # AWS access + nearby secret as one ``access:secret`` value.
     for am in P.AWS_ACCESS_KEY.finditer(text):
         ak = am.group(1)
         window = text[max(0, am.start() - 300) : am.end() + 300]
         secrets = P.AWS_SECRET_KEY.findall(window)
-        if secrets:
-            for sk in secrets:
-                if re.search(r"[A-Z]", sk) and re.search(r"[0-9]", sk):
-                    add("aws_cred", f"{ak}|{sk}", evidence=P.context_window(text, am.start(), am.end()), conf=0.92)
-        else:
+        paired = False
+        for sk in secrets:
+            if re.search(r"[A-Z]", sk) and re.search(r"[0-9]", sk):
+                add("aws_cred", f"{ak}:{sk}", evidence=P.context_window(text, am.start(), am.end()), conf=0.92)
+                paired = True
+        if not paired:
             add("aws_access_key", ak, evidence=P.context_window(text, am.start(), am.end()), conf=0.88)
 
     return findings

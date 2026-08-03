@@ -35,3 +35,18 @@ def test_priority_extractions_bundle_shape():
     assert out["smtp"] == []
     assert out["extractor"] == "priority_secrets"
     assert out["secrets"]
+
+
+def test_aws_access_and_secret_are_paired_with_colon():
+    secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    text = f'''
+    AWS_ACCESS_KEY_ID="{FAKE_AWS}"
+    AWS_SECRET_ACCESS_KEY="{secret}"
+    '''
+    secrets = extract_priority_secrets(text, source_url="https://t/.env", redact_values=False)
+    kinds = {s["kind"] for s in secrets}
+    assert "aws_cred" in kinds
+    assert "aws_access_key" not in kinds  # paired, not separate
+    paired = next(s for s in secrets if s["kind"] == "aws_cred")
+    assert paired["value"] == f"{FAKE_AWS}:{secret}"
+    assert "*" not in paired["value"]

@@ -111,6 +111,9 @@ JS_LINK = re.compile(
     re.I | re.VERBOSE,
 )
 
+# High-signal credential packs only. JWT / Google Maps-style keys / bare
+# "api_key=" generics and bearer tokens are intentionally omitted — they
+# flood Results with public or low-value noise.
 PATTERN_PACKS: dict[str, list[tuple[str, re.Pattern]]] = {
     "aws_access_key": [("aws_access_key", AWS_ACCESS_KEY)],
     "github_token": [("github_token", GITHUB_TOKEN)],
@@ -121,15 +124,19 @@ PATTERN_PACKS: dict[str, list[tuple[str, re.Pattern]]] = {
     "mailgun": [("mailgun", MAILGUN_KEY)],
     "stripe": [("stripe_live", STRIPE_LIVE), ("stripe_test", STRIPE_TEST)],
     "slack": [("slack", SLACK_TOKEN)],
-    "jwt": [("jwt", JWT)],
     "openai": [("openai", OPENAI_KEY)],
     "anthropic": [("anthropic", ANTHROPIC_KEY)],
-    "google_api": [("google_api", GOOGLE_API_KEY)],
     "tencent": [("tencent", TENCENT_AK)],
     "aliyun": [("aliyun", ALIYUN_AK)],
-    "generic_api_key": [("generic_api_key", GENERIC_API_KEY)],
-    "bearer": [("bearer", BEARER)],
 }
+
+# Kinds we never want in Results (also used to hide legacy rows already stored).
+IGNORED_SECRET_KINDS = frozenset({
+    "jwt",
+    "google_api",
+    "generic_api_key",
+    "bearer",
+})
 
 
 def context_window(text: str, start: int, end: int, radius: int = 80) -> str:
