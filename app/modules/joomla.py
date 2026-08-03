@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from app.exploits.joomla_rce.detector import JoomlaJceDetector
 from app.exploits.joomla_rce.exploit import JoomlaJceExploit
-from app.modules.base import emit_credential_findings, finding_from_hit, joomla_body_extractions, save_http_response
+from app.modules.base import append_exploit_secret_finding, emit_credential_findings, finding_from_hit, joomla_body_extractions, save_http_response
 from app.modules.vulnerability_intel import executable_upload_paths, jce_exposure, xml_version
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
@@ -344,21 +344,15 @@ class JoomlaModule:
                 ctx.progress.add_hit(module=self.name)
                 secrets = exploit.extract_secrets(ctx)
                 for category, lines in secrets.items():
-                    if lines:
-                        findings.append(
-                            finding_from_hit(
-                                module=self.name,
-                                ftype="secrets",
-                                severity="high",
-                                target=target,
-                                url=target.url,
-                                title=f"Secret extraction: {category} (Joomla RCE)",
-                                evidence="\n".join(lines[:20]),
-                                confidence=0.95,
-                                tags=["joomla", "secrets", category, "active-exploit"],
-                                validated=True,
-                            )
-                        )
-                        ctx.progress.add_hit(secrets=len(lines), module=self.name)
+                    append_exploit_secret_finding(
+                        findings=findings,
+                        ctx=ctx,
+                        module=self.name,
+                        target=target,
+                        category=category,
+                        lines=lines,
+                        exploit_label="Joomla RCE",
+                        tags=["joomla"],
+                    )
 
         return findings

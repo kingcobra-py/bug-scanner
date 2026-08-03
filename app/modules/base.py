@@ -6,7 +6,7 @@ import json
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Protocol, runtime_checkable
 
 from app.extractors import extract_all
 from app.extractors.cms_extractions import cms_body_extractions
@@ -176,6 +176,84 @@ def save_method_responses(
 
 def body_extractions(ctx: ScanContext, url: str, body: str) -> dict:
     return extract_all(body, source_url=url, redact_values=ctx.config.redact_secrets)
+
+
+def exploit_lines_to_extracted(
+    category: str,
+    lines: list[Any],
+    *,
+    source_url: str = "",
+) -> dict[str, Any]:
+    """Normalize exploit file dumps into Results-compatible extracted payloads."""
+    secrets: list[dict[str, Any]] = []
+    smtp: list[dict[str, Any]] = []
+    kind_hint = category.replace("_secrets", "").replace("_apis", "api") or "env"
+    for item in lines or []:
+        if isinstance(item, dict):
+            kind = str(item.get("kind") or kind_hint)
+            payload = {
+                **item,
+                "source_url": item.get("source_url") or source_url,
+            }
+            if kind == "smtp":
+                smtp.append(payload)
+            else:
+                secrets.append(payload)
+            continue
+        if isinstance(item, str) and item.strip():
+            secrets.append(
+                {
+                    "kind": kind_hint,
+                    "value": item.strip(),
+                    "source_url": source_url,
+                }
+            )
+    extracted: dict[str, Any] = {}
+    if secrets:
+        extracted["secrets"] = secrets
+    if smtp:
+        extracted["smtp"] = smtp
+    return extracted
+
+
+def append_exploit_secret_finding(
+    *,
+    findings: list[Finding],
+    ctx: ScanContext,
+    module: str,
+    target: TargetContext,
+    category: str,
+    lines: list[Any],
+    exploit_label: str,
+    tags: list[str],
+) -> None:
+    extracted = exploit_lines_to_extracted(category, lines, source_url=target.url)
+    secret_count = len(extracted.get("secrets") or []) + len(extracted.get("smtp") or [])
+    if not secret_count:
+        return
+    preview: list[str] = []
+    for item in (extracted.get("secrets") or []) + (extracted.get("smtp") or []):
+        value = item.get("value")
+        if isinstance(value, dict):
+            preview.append(json.dumps(value, sort_keys=True))
+        else:
+            preview.append(str(value))
+    findings.append(
+        finding_from_hit(
+            module=module,
+            ftype="secrets",
+            severity="high",
+            target=target,
+            url=target.url,
+            title=f"Secret extraction: {category} ({exploit_label})",
+            evidence="\n".join(preview[:20]),
+            confidence=0.95,
+            extracted=extracted,
+            tags=[*tags, "secrets", category, "active-exploit"],
+            validated=True,
+        )
+    )
+    ctx.progress.add_hit(secrets=secret_count, module=module)
 
 
 def merge_extractions(*parts: dict) -> dict:

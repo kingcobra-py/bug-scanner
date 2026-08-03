@@ -104,7 +104,10 @@ class ConfigEnvModule:
                 validated=bool(extracted.get("secrets") or extracted.get("smtp")),
             )
             findings.append(f)
-            ctx.progress.add_hit(secrets=len(extracted.get("secrets", [])), module=self.name)
+            ctx.progress.add_hit(
+                secrets=len(extracted.get("secrets", [])) + len(extracted.get("smtp", [])),
+                module=self.name,
+            )
             if log:
                 log.hit(resp.url or url, f.confidence)
             ctx.bodies.append((resp.url or url, resp.text))

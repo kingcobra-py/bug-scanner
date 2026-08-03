@@ -76,6 +76,71 @@ def _is_useless_secret(kind: str, value: str) -> bool:
     return False
 
 
+def _format_credential_value(kind: str, value: Any) -> str:
+    if value is None:
+        return ""
+    if kind == "smtp" and isinstance(value, dict):
+        host = str(value.get("host") or "").strip()
+        port = str(value.get("port") or "").strip()
+        user = str(value.get("user") or "").strip()
+        password = str(value.get("pass") or value.get("password") or "").strip()
+        host_part = f"{host}:{port}" if host and port else host
+        parts = [part for part in (host_part, user, password) if part]
+        return " | ".join(parts)
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return str(value).strip()
+
+
+def _credential_provider(kind: str, value: Any) -> str:
+    provider_id = provider_for_kind(kind)
+    if provider_id != "other":
+        return provider_id
+    if kind == "smtp" and isinstance(value, dict):
+        host = str(value.get("host") or "").lower()
+        if host:
+            return provider_for_kind(host)
+    return provider_id
+
+
+def _index_credential(
+    secret_index: dict[str, dict[str, Any]],
+    provider_counts: dict[str, int],
+    *,
+    kind: str,
+    value: Any,
+    source_url: str,
+    module: str,
+    title: str,
+    finding_id: str,
+) -> None:
+    display = _format_credential_value(kind, value)
+    if not display:
+        return
+    if _is_useless_secret(kind, display):
+        return
+    provider_id = _credential_provider(kind, value)
+    key = f"{provider_id}:{kind}:{value_hash(display)}"
+    if key not in secret_index:
+        secret_index[key] = {
+            "kind": kind,
+            "provider": provider_id,
+            "value": display,
+            "source_url": source_url,
+            "sources": [source_url] if source_url else [],
+            "occurrences": 1,
+            "module": module,
+            "title": title,
+            "finding_id": finding_id,
+        }
+        provider_counts[provider_id] = provider_counts.get(provider_id, 0) + 1
+        return
+    item = secret_index[key]
+    item["occurrences"] += 1
+    if source_url and source_url not in item["sources"]:
+        item["sources"].append(source_url)
+
+
 def normalize_result_secrets(secrets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Prefer ``AKIA...:secret`` pairs and drop duplicate standalone access keys.
 
@@ -656,29 +721,47 @@ def create_app() -> FastAPI:
             by_severity[sev] = by_severity.get(sev, 0) + 1
             by_module[mod] = by_module.get(mod, 0) + 1
             extracted = f.get("extracted") or {}
+            source_url = f.get("url") or ""
             for secret in extracted.get("secrets") or []:
                 kind = secret.get("kind") or "secret"
-                provider_id = provider_for_kind(kind)
-                source_url = secret.get("source_url") or f.get("url")
-                key = f"{provider_id}:{kind}:{value_hash(str(secret.get('value') or ''))}"
-                if key not in secret_index:
-                    secret_index[key] = {
-                        "kind": kind,
-                        "provider": provider_id,
-                        "value": secret.get("value"),
-                        "source_url": source_url,
-                        "sources": [source_url] if source_url else [],
-                        "occurrences": 1,
-                        "module": mod,
-                        "title": f.get("title"),
-                        "finding_id": f.get("id"),
-                    }
-                    provider_counts[provider_id] = provider_counts.get(provider_id, 0) + 1
-                else:
-                    item = secret_index[key]
-                    item["occurrences"] += 1
-                    if source_url and source_url not in item["sources"]:
-                        item["sources"].append(source_url)
+                _index_credential(
+                    secret_index,
+                    provider_counts,
+                    kind=kind,
+                    value=secret.get("value"),
+                    source_url=secret.get("source_url") or source_url,
+                    module=mod,
+                    title=f.get("title") or "",
+                    finding_id=f.get("id") or "",
+                )
+            for smtp_item in extracted.get("smtp") or []:
+                kind = smtp_item.get("kind") or "smtp"
+                _index_credential(
+                    secret_index,
+                    provider_counts,
+                    kind=kind,
+                    value=smtp_item.get("value"),
+                    source_url=smtp_item.get("source_url") or source_url,
+                    module=mod,
+                    title=f.get("title") or "",
+                    finding_id=f.get("id") or "",
+                )
+            if not (extracted.get("secrets") or extracted.get("smtp")):
+                ftype = str(f.get("type") or "")
+                if ftype == "secrets" and f.get("evidence"):
+                    for line in str(f.get("evidence") or "").splitlines():
+                        if not line.strip():
+                            continue
+                        _index_credential(
+                            secret_index,
+                            provider_counts,
+                            kind="exploit",
+                            value=line.strip(),
+                            source_url=source_url,
+                            module=mod,
+                            title=f.get("title") or "",
+                            finding_id=f.get("id") or "",
+                        )
             if not is_vuln_worthy(f):
                 continue
             cats = classify_finding(f)
