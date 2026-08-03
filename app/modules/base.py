@@ -198,6 +198,9 @@ def _looks_like_credential_line(value: str) -> bool:
     if text.startswith("#") and text[1:].strip().isdigit():
         return False
     lowered = text.lower()
+    # JS / source noise from next_config dumps.
+    if any(token in lowered for token in ("process.env", "===", "=>", "const ", "let ", "function ")):
+        return False
     markers = (
         "password", "passwd", "secret", "token", "api_key", "apikey", "access_key",
         "private_key", "aws_", "akia", "ghp_", "sk_live", "xox", "smtp", "mail_",
@@ -214,6 +217,9 @@ def _looks_like_credential_line(value: str) -> bool:
     if key.isidentifier() and not any(
         part in key for part in ("pass", "secret", "token", "key", "auth", "cred", "smtp", "mail")
     ):
+        return False
+    # Require a simple KEY=VALUE left-hand side for dump lines.
+    if not key.replace("_", "").isalnum():
         return False
     return True
 
