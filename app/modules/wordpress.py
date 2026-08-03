@@ -1,8 +1,5 @@
 """
 WordPress detection module with optional wp2shell RCE exploitation.
-
-SAFE by default: fingerprints, extracts secrets, scores vulnerabilities.
-When --exploit is enabled, attempts active RCE via wp2shell chain.
 """
 
 from __future__ import annotations
@@ -413,7 +410,7 @@ class WordPressModule:
                 )
             )
 
-        # ========== ACTIVE EXPLOITATION (opt-in) ==========
+        # ===== ACTIVE EXPLOITATION =====
         if ctx.exploit_enabled and is_wp:
             exploit = Wp2ShellExploit(http, target.url)
             success, output = exploit.run(ctx.exploit_command or "id")
@@ -426,16 +423,14 @@ class WordPressModule:
                         target=target,
                         url=target.url,
                         title="WordPress RCE via wp2shell (active)",
-                        description=f"Command executed: {ctx.exploit_command}\nOutput: {output[:500]}",
-                        evidence=output[:1000],
+                        evidence=f"Command output:\n{output[:500]}",
                         confidence=1.0,
                         tags=["wordpress", "rce", "wp2shell", "active-exploit"],
                         validated=True,
                     )
                 )
                 ctx.progress.add_hit(module=self.name)
-                # Extract secrets
-                secrets = exploit.extract_secrets()
+                secrets = exploit.extract_secrets(ctx)
                 for category, lines in secrets.items():
                     if lines:
                         findings.append(
@@ -446,7 +441,6 @@ class WordPressModule:
                                 target=target,
                                 url=target.url,
                                 title=f"Secret extraction: {category} (wp2shell)",
-                                description=f"Found {len(lines)} entries",
                                 evidence="\n".join(lines[:20]),
                                 confidence=0.95,
                                 tags=["wordpress", "secrets", category, "active-exploit"],
