@@ -79,6 +79,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
         proxy=args.proxy or yml.get("proxy"),
         verbose=bool(args.verbose),
         method_test_trace=bool(args.trace_method),
+        # ===== NEW: exploit flags =====
+        exploit_enabled=bool(args.exploit),
+        exploit_command=args.exploit_cmd or "id",
+        exploit_all=bool(args.exploit_all),
     )
 
     store = ScanStore(Path(cfg.output_dir) / "scanner.db")
@@ -138,6 +142,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--proxy", default=None)
     s.add_argument("--trace-method", action="store_true")
     s.add_argument("--verbose", action="store_true")
+    # ===== NEW: exploit arguments =====
+    s.add_argument("--exploit", action="store_true", help="Enable active RCE exploitation (disabled by default)")
+    s.add_argument("--exploit-cmd", default="id", help="Command to execute on successful RCE (default: id)")
+    s.add_argument("--exploit-all", action="store_true", help="Try all exploits regardless of fingerprint (force)")
     s.set_defaults(func=cmd_scan)
 
     srv = sub.add_parser("serve", help="Start dashboard API/UI")
