@@ -97,8 +97,9 @@
           <div class="panel lg:col-span-4 p-6">
             <div class="eyebrow">NEW SERVER</div>
             <h2 class="text-xl font-semibold mt-1">Add SSH host</h2>
+            <p class="text-xs text-slate-400 mt-2 leading-relaxed">Prefer the EC2 <b>private IP</b> (same VPC). On that instance’s security group, allow inbound <b>TCP 22</b> from this controller. Install Deps only works after the card shows Online.</p>
             <form id="serverForm" class="mt-4 space-y-3">
-              <div><label class="label">Host / IP</label><input id="sshHost" class="input" placeholder="ec2-xx-xx-xx-xx.compute-1.amazonaws.com" required /></div>
+              <div><label class="label">Host / IP</label><input id="sshHost" class="input" placeholder="172.31.x.x (private IP preferred)" required /></div>
               <div class="grid grid-cols-2 gap-3">
                 <div><label class="label">Port</label><input id="sshPort" type="number" class="input" value="22" min="1" max="65535" /></div>
                 <div><label class="label">Username</label><input id="sshUser" class="input" value="ubuntu" /></div>

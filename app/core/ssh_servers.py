@@ -55,8 +55,9 @@ def friendly_ssh_error(message: str) -> str:
         )
     if "connection timed out" in low or text == "ssh timeout" or "timed out" in low:
         return (
-            "SSH timed out — host may be stopped, security group may block port 22 "
-            "from this controller, or the network path is too slow."
+            "SSH timed out — the second server is not reachable on port 22 from this "
+            "controller. Check: instance is Running; use private IP; security group "
+            "allows inbound TCP 22 from this controller (or its security group)."
         )
     if "permission denied" in low:
         return "SSH auth failed — check username / key / password."
