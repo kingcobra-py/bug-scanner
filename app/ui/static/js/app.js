@@ -956,19 +956,13 @@ async function copyProviderSecrets(providerId, button) {
 function renderProviderFilters(providers) {
   const allCount = providers.reduce((sum, item) => sum + Number(item.count || 0), 0);
   $("providerFilters").innerHTML = [`
-    <div class="provider-chip-wrap">
-      <button class="provider-chip ${state.provider ? "" : "active"}" data-provider="">
-        <span class="provider-mark">ALL</span><span>All APIs</span><b>${allCount}</b>
-      </button>
-      <button type="button" class="btn-ghost copy-provider" data-provider="" title="Copy all API secrets">Copy all</button>
-    </div>`, ...providers.map((item) => `
-    <div class="provider-chip-wrap">
-      <button class="provider-chip ${state.provider === item.id ? "active" : ""}" data-provider="${esc(item.id)}">
-        ${item.logo ? `<img src="${esc(item.logo)}" alt="" loading="lazy" />` : `<span class="provider-mark">${esc(item.label.slice(0, 2).toUpperCase())}</span>`}
-        <span>${esc(item.label)}</span><b>${formatNumber(item.count)}</b>
-      </button>
-      <button type="button" class="btn-ghost copy-provider" data-provider="${esc(item.id)}" title="Copy all ${esc(item.label)} secrets">Copy all</button>
-    </div>`)].join("");
+    <button class="provider-chip ${state.provider ? "" : "active"}" data-provider="">
+      <span class="provider-mark">ALL</span><span>All APIs</span><b>${allCount}</b>
+    </button>`, ...providers.map((item) => `
+    <button class="provider-chip ${state.provider === item.id ? "active" : ""}" data-provider="${esc(item.id)}">
+      ${item.logo ? `<img src="${esc(item.logo)}" alt="" loading="lazy" />` : `<span class="provider-mark">${esc(item.label.slice(0, 2).toUpperCase())}</span>`}
+      <span>${esc(item.label)}</span><b>${formatNumber(item.count)}</b>
+    </button>`)].join("");
   $("providerFilters").querySelectorAll(".provider-chip").forEach((button) => {
     button.onclick = () => {
       // Cached secrets already hold every provider; re-render instantly
@@ -978,13 +972,6 @@ function renderProviderFilters(providers) {
       renderSecrets(secretsForProvider(state.provider));
     };
   });
-  $("providerFilters").querySelectorAll(".copy-provider").forEach((button) => {
-    button.onclick = async (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      await copyProviderSecrets(button.dataset.provider || "", button);
-    };
-  });
 }
 
 function renderSecrets(secrets) {
@@ -992,22 +979,28 @@ function renderSecrets(secrets) {
   state._secrets = secrets;
   const copyBtn = $("copyAllSecrets");
   if (copyBtn) {
-    const label = state.provider
-      ? `Copy all (${secrets.length})`
-      : `Copy all (${secrets.length})`;
-    copyBtn.textContent = label;
-    copyBtn.disabled = !secrets.length;
+    // Copy all only appears after opening a specific API provider.
+    const providerOpen = Boolean(state.provider);
+    copyBtn.classList.toggle("hidden", !providerOpen);
+    if (providerOpen) {
+      const label = providers.get(state.provider)?.label || state.provider;
+      copyBtn.textContent = `Copy all ${label} (${secrets.length})`;
+      copyBtn.disabled = !secrets.length;
+    }
   }
   $("secretsBox").innerHTML = secrets.length ? secrets.map((secret, index) => {
     const provider = providers.get(secret.provider) || {};
     return `
-    <div class="secret-card">
-      <span class="secret-kind">${provider.logo ? `<img src="${esc(provider.logo)}" alt="" />` : ""}<span>${esc(secretKindLabel(secret.kind))}</span></span>
+    <article class="secret-card" data-index="${index}">
+      <div class="secret-kind">${provider.logo ? `<img src="${esc(provider.logo)}" alt="" />` : `<span class="provider-mark">${esc((provider.label || secret.kind || "?").slice(0, 2).toUpperCase())}</span>`}<span>${esc(secretKindLabel(secret.kind))}</span></div>
       <code class="secret-value">${esc(secret.value)}</code>
-      <span class="text-slate-500 break-all" title="${esc((secret.sources || []).join("\n"))}">${esc(secret.source_url || "")}</span>
-      <span class="secret-actions"><span class="pill">${formatNumber(secret.occurrences)} occurrence${secret.occurrences === 1 ? "" : "s"}</span><button class="btn-ghost copy-secret" data-index="${index}">Copy full value</button></span>
-    </div>`;
-  }).join("") : '<div class="py-8 text-center text-sm text-slate-500">No extracted secrets for this filter.</div>';
+      <div class="secret-source" title="${esc((secret.sources || []).join("\n"))}">${esc(secret.source_url || "")}</div>
+      <div class="secret-actions">
+        <span class="pill">${formatNumber(secret.occurrences)} occurrence${secret.occurrences === 1 ? "" : "s"}</span>
+        <button class="btn-ghost copy-secret" data-index="${index}">Copy full value</button>
+      </div>
+    </article>`;
+  }).join("") : `<div class="secrets-empty">${state.provider ? "No extracted secrets for this API." : "Select an API above to inspect secrets, or browse All APIs."}</div>`;
 }
 
 async function copyText(value) {
