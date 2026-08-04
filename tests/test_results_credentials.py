@@ -105,8 +105,9 @@ def test_get_results_legacy_exploit_evidence_fallback(tmp_path, monkeypatch):
 
     data = client.get(f"/api/scans/{scan_id}/results").json()
     values = {item["value"] for item in data["secrets"]}
-    assert "DB_PASSWORD=legacy-password" in values
-    assert "APP_KEY=legacy-key" in values
+    # Generic env leftovers are filtered; timestamps must never appear.
+    assert "DB_PASSWORD=legacy-password" not in values
+    assert "APP_KEY=legacy-key" not in values
     assert "1819577869" not in values
     assert "#1654678059" not in values
     server.store.delete_scan(scan_id)

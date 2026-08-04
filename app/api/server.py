@@ -75,7 +75,7 @@ def _is_useless_secret(kind: str, value: str) -> bool:
         return True
     if "google_api" in kind_l or kind_l == "jwt":
         return True
-    if kind_l in {"stripe_test", "paystack", "emailjs", "sanity"}:
+    if kind_l in {"stripe_test", "paystack", "emailjs", "sanity", "tencent", "aliyun"}:
         return True
     if value_s.lower().startswith("sk_test_"):
         return True

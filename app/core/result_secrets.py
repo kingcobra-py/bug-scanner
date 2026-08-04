@@ -314,29 +314,27 @@ def normalize_result_secrets(secrets: list[dict[str, Any]]) -> list[dict[str, An
             if key_l.endswith(("_to", "_from", "_cc", "_bcc")) or key_l in {"smtp_email", "mail_from", "email_from"}:
                 continue
 
+            # Results only keeps env rows that map to a known high-value
+            # provider (Stripe live, Razorpay, Brevo, …). Generic JWT/admin/
+            # recaptcha/email/path noise stays out of Other.
             classified = classify_env_assignment(key, rhs)
-            if classified:
-                provider, new_kind, token = classified
-                token_key = f"{provider}:{token}"
-                if token_key in seen_tokens:
-                    _bump_kept(kept, provider, token, item)
-                    continue
-                seen_tokens.add(token_key)
-                kept.append(
-                    {
-                        **item,
-                        "kind": new_kind,
-                        "provider": provider,
-                        "value": token,
-                        "source_url": source or item.get("source_url") or "",
-                    }
-                )
+            if not classified:
                 continue
-
-            display = f"{key}={rhs}"
-            if is_useless_env_assignment(display) or _is_useless_result("env", display):
+            provider, new_kind, token = classified
+            token_key = f"{provider}:{token}"
+            if token_key in seen_tokens:
+                _bump_kept(kept, provider, token, item)
                 continue
-            kept.append({**item, "kind": "env", "provider": "other", "value": display})
+            seen_tokens.add(token_key)
+            kept.append(
+                {
+                    **item,
+                    "kind": new_kind,
+                    "provider": provider,
+                    "value": token,
+                    "source_url": source or item.get("source_url") or "",
+                }
+            )
             continue
 
         if kind == "aws_access_key":

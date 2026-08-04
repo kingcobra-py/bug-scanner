@@ -119,9 +119,9 @@ def _looks_like_sentence_or_code(value: str) -> bool:
 
 
 _KV_MARKERS = (
-    "aws", "github", "gitlab", "stripe", "sendgrid", "brevo",
+    "aws", "github", "gitlab", "stripe", "razorpay", "sendgrid", "brevo",
     "mailgun", "postmark", "slack", "openai", "anthropic", "twilio", "azure",
-    "tencent", "aliyun", "smtp", "mail_", "mail-",
+    "smtp", "mail_", "mail-",
     "password", "passwd", "secret", "private", "credential", "access_key",
     "secret_key",
 )
@@ -129,6 +129,7 @@ _KV_MARKERS = (
 
 _IGNORED_ENV_KEY_MARKERS = (
     "nextauth", "emailjs", "sanity", "paystack", "msi_secret",
+    "tencent", "aliyun", "alibaba", "cloudbase", "yuanbao",
 )
 
 

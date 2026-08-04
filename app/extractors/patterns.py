@@ -142,8 +142,6 @@ PATTERN_PACKS: dict[str, list[tuple[str, re.Pattern]]] = {
     "slack": [("slack", SLACK_TOKEN)],
     "openai": [("openai", OPENAI_KEY)],
     "anthropic": [("anthropic", ANTHROPIC_KEY)],
-    "tencent": [("tencent", TENCENT_AK)],
-    "aliyun": [("aliyun", ALIYUN_AK)],
 }
 
 # Kinds we never want in Results (also used to hide legacy rows already stored).
@@ -156,6 +154,8 @@ IGNORED_SECRET_KINDS = frozenset({
     "paystack",
     "emailjs",
     "sanity",
+    "tencent",
+    "aliyun",
 })
 
 

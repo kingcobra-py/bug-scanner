@@ -63,7 +63,8 @@ def test_normalize_drops_js_env_noise_and_local_placeholders():
     ]
     out = normalize_result_secrets(secrets)
     values = [s["value"] for s in out]
-    assert "DB_PASSWORD=N7!vKp9xmQ2xR4sL" in values
+    # Generic env passwords are no longer kept in Results / Other.
+    assert "DB_PASSWORD=N7!vKp9xmQ2xR4sL" not in values
     assert any(s["kind"] == "github_token" for s in out)
     assert not any("_ref.token" in v for v in values)
     assert not any("product.post_title" in v for v in values)
