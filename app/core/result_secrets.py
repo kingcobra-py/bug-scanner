@@ -202,18 +202,46 @@ def _canonical_token_kind(kind: str, value: str) -> tuple[str, str, str]:
     return provider, kind_l, value_s
 
 
+def _earlier_timestamp(left: Any, right: Any) -> str:
+    a = str(left or "").strip()
+    b = str(right or "").strip()
+    if not a:
+        return b
+    if not b:
+        return a
+    return a if a <= b else b
+
+
+def _merge_secret_meta(existing: dict[str, Any], item: dict[str, Any]) -> None:
+    """Merge occurrence/source/module/time metadata into a kept secret row."""
+    existing["occurrences"] = max(
+        int(existing.get("occurrences") or 1),
+        int(item.get("occurrences") or 1),
+    )
+    src = item.get("source_url") or ""
+    sources = existing.setdefault("sources", [])
+    if src and src not in sources:
+        sources.append(src)
+    modules = existing.setdefault("modules", [])
+    if not isinstance(modules, list):
+        modules = [modules] if modules else []
+        existing["modules"] = modules
+    for mod in item.get("modules") or ([item.get("module")] if item.get("module") else []):
+        mod_s = str(mod or "").strip()
+        if mod_s and mod_s not in modules:
+            modules.append(mod_s)
+    if modules and not existing.get("module"):
+        existing["module"] = modules[0]
+    elif not existing.get("module") and item.get("module"):
+        existing["module"] = item.get("module")
+    existing["timestamp"] = _earlier_timestamp(existing.get("timestamp"), item.get("timestamp"))
+
+
 def _bump_kept(kept: list[dict[str, Any]], provider: str, token: str, item: dict[str, Any]) -> None:
     """Merge occurrence/source metadata into an already-kept provider token."""
     for existing in kept:
         if existing.get("provider") == provider and existing.get("value") == token:
-            existing["occurrences"] = max(
-                int(existing.get("occurrences") or 1),
-                int(item.get("occurrences") or 1),
-            )
-            src = item.get("source_url") or ""
-            sources = existing.setdefault("sources", [])
-            if src and src not in sources:
-                sources.append(src)
+            _merge_secret_meta(existing, item)
             return
 
 
@@ -444,17 +472,18 @@ def normalize_result_secrets(secrets: list[dict[str, Any]]) -> list[dict[str, An
                 else:
                     existing_key = f"{existing_provider}:{existing.get('kind')}:{existing.get('value')}"
                 if existing_key == dedupe:
-                    existing["occurrences"] = max(
-                        int(existing.get("occurrences") or 1),
-                        int(item.get("occurrences") or 1),
-                    )
-                    src = item.get("source_url") or ""
-                    sources = existing.setdefault("sources", [])
-                    if src and src not in sources:
-                        sources.append(src)
+                    _merge_secret_meta(existing, item)
                     break
             continue
         seen.add(dedupe)
         item["provider"] = provider
+        mods = item.get("modules")
+        if not isinstance(mods, list):
+            mods = [item["module"]] if item.get("module") else []
+            item["modules"] = [m for m in mods if m]
+        elif item.get("module") and item["module"] not in mods:
+            mods.append(item["module"])
+        if mods and not item.get("module"):
+            item["module"] = mods[0]
         out.append(item)
     return out

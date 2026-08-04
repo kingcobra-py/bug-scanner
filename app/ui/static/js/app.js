@@ -868,7 +868,6 @@ function applyResultsPayload(results) {
 async function reloadResults(force = false) {
   if (!state.scanId) {
     $("resultSummary").innerHTML = '<div class="text-slate-500 text-sm">Select a job first.</div>';
-    renderResultModules({});
     return;
   }
   const scanId = state.scanId;
@@ -917,27 +916,11 @@ async function reloadResults(force = false) {
   }
 }
 
-function renderResultModules(byModule) {
-  const box = $("resultModules");
-  if (!box) return;
-  const entries = Object.entries(byModule || {})
-    .filter(([, count]) => Number(count) > 0)
-    .sort((a, b) => Number(b[1]) - Number(a[1]));
-  if (!entries.length) {
-    box.hidden = true;
-    box.innerHTML = "";
-    return;
-  }
-  box.hidden = false;
-  box.innerHTML = `
-    <div class="result-modules-label">Hits by module</div>
-    <div class="result-module-hits">
-      ${entries.map(([name, count]) => `
-        <span class="result-module-chip" title="${esc(name)}: ${formatNumber(count)} hits">
-          <span class="result-module-name">${esc(name)}</span>
-          <b>${formatNumber(count)}</b>
-        </span>`).join("")}
-    </div>`;
+function secretModulesLabel(secret) {
+  const mods = Array.isArray(secret?.modules) && secret.modules.length
+    ? secret.modules
+    : (secret?.module ? [secret.module] : []);
+  return [...new Set(mods.map((item) => String(item || "").trim()).filter(Boolean))];
 }
 
 function renderResults() {
@@ -948,7 +931,6 @@ function renderResults() {
     <div class="stat-card"><span>Critical</span><b class="sev-critical">${formatNumber(severity.critical)}</b></div>
     <div class="stat-card"><span>High</span><b class="sev-high">${formatNumber(severity.high)}</b></div>
     <div class="stat-card"><span>Unique secrets</span><b>${formatNumber((data.secrets || []).length)}</b></div>`;
-  renderResultModules(data.by_module || {});
   renderProviderFilters(data.providers || []);
   const filteredSecrets = (data.secrets || []).filter((s) => !state.provider || s.provider === state.provider);
   renderSecrets(filteredSecrets);
@@ -1015,11 +997,19 @@ function renderSecrets(secrets) {
   }
   $("secretsBox").innerHTML = secrets.length ? secrets.map((secret, index) => {
     const provider = providers.get(secret.provider) || {};
+    const modules = secretModulesLabel(secret);
+    const foundAt = formatHitTime(secret.timestamp);
     return `
     <article class="secret-card" data-index="${index}">
       <div class="secret-kind">${provider.logo ? `<img src="${esc(provider.logo)}" alt="" />` : `<span class="provider-mark">${esc((provider.label || secret.kind || "?").slice(0, 2).toUpperCase())}</span>`}<span>${esc(secretKindLabel(secret.kind))}</span></div>
       <code class="secret-value">${esc(secret.value)}</code>
-      <div class="secret-source" title="${esc((secret.sources || []).join("\n"))}">${esc(secret.source_url || "")}</div>
+      <div class="secret-meta">
+        <div class="secret-source" title="${esc((secret.sources || []).join("\n"))}">${esc(secret.source_url || "")}</div>
+        <div class="secret-found">
+          <span class="secret-module" title="Scan module(s) that found this API">${modules.length ? modules.map((name) => esc(name)).join(", ") : "—"}</span>
+          <span class="secret-time" title="When this API was first found">${esc(foundAt)}</span>
+        </div>
+      </div>
       <div class="secret-actions">
         <span class="pill">${formatNumber(secret.occurrences)} occurrence${secret.occurrences === 1 ? "" : "s"}</span>
         <button class="btn-ghost copy-secret" data-index="${index}">Copy full value</button>

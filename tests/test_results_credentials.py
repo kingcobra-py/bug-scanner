@@ -20,6 +20,7 @@ def test_get_results_includes_smtp_credentials(tmp_path, monkeypatch):
             "url": "https://a.example/.env",
             "title": "SMTP credentials extracted",
             "module": "config",
+            "timestamp": "2026-08-04T12:34:56+00:00",
             "extracted": {
                 "smtp": [
                     {
@@ -38,7 +39,10 @@ def test_get_results_includes_smtp_credentials(tmp_path, monkeypatch):
 
     data = client.get(f"/api/scans/{scan_id}/results").json()
     assert data["secrets"]
-    assert any("sendgrid" in item["value"].lower() for item in data["secrets"])
+    match = next(item for item in data["secrets"] if "sendgrid" in item["value"].lower())
+    assert match["module"] == "config"
+    assert "config" in (match.get("modules") or [])
+    assert match["timestamp"].startswith("2026-08-04T12:34:56")
     server.store.delete_scan(scan_id)
 
 

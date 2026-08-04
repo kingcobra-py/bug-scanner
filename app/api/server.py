@@ -938,6 +938,14 @@ def create_app() -> FastAPI:
         extracted = f.get("extracted") or {}
         source_url = f.get("url") or ""
         mod = f.get("module") or "unknown"
+        found_at = str(f.get("timestamp") or "")
+        base_meta = {
+            "module": mod,
+            "modules": [mod] if mod else [],
+            "timestamp": found_at,
+            "title": f.get("title") or "",
+            "finding_id": f.get("id") or "",
+        }
         for secret in extracted.get("secrets") or []:
             raw_secrets.append(
                 {
@@ -946,9 +954,7 @@ def create_app() -> FastAPI:
                     "source_url": secret.get("source_url") or source_url,
                     "sources": [secret.get("source_url") or source_url],
                     "occurrences": 1,
-                    "module": mod,
-                    "title": f.get("title") or "",
-                    "finding_id": f.get("id") or "",
+                    **base_meta,
                 }
             )
         for smtp_item in extracted.get("smtp") or []:
@@ -959,9 +965,7 @@ def create_app() -> FastAPI:
                     "source_url": smtp_item.get("source_url") or source_url,
                     "sources": [smtp_item.get("source_url") or source_url],
                     "occurrences": 1,
-                    "module": mod,
-                    "title": f.get("title") or "",
-                    "finding_id": f.get("id") or "",
+                    **base_meta,
                 }
             )
         if not (extracted.get("secrets") or extracted.get("smtp")):
@@ -981,9 +985,7 @@ def create_app() -> FastAPI:
                             "source_url": source_url,
                             "sources": [source_url] if source_url else [],
                             "occurrences": 1,
-                            "module": mod,
-                            "title": f.get("title") or "",
-                            "finding_id": f.get("id") or "",
+                            **base_meta,
                         }
                     )
         return raw_secrets
