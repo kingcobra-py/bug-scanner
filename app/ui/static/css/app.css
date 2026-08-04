@@ -902,6 +902,23 @@ td { padding: .65rem .55rem; border-top: 1px solid rgba(125,211,252,.08); color:
 .ssh-actions .btn-danger { background: #b91c1c; color: #fff; border: 1px solid rgba(254,202,202,.2); }
 .ssh-actions .btn-danger:hover { filter: brightness(1.08); }
 .ssh-error { color: #fca5a5; font-size: .68rem; min-height: .9rem; }
+.ssh-install {
+  font-size: .68rem;
+  line-height: 1.35;
+  padding: .35rem .5rem;
+  border-radius: 8px;
+  margin: .15rem 0 .35rem;
+}
+.ssh-install.ok {
+  color: #a7f3d0;
+  background: rgba(16, 185, 129, .12);
+  border: 1px solid rgba(52, 211, 153, .28);
+}
+.ssh-install.fail {
+  color: #fecaca;
+  background: rgba(185, 28, 28, .18);
+  border: 1px solid rgba(248, 113, 113, .28);
+}
 
 @media (max-width: 768px) {
   .page-heading { align-items: flex-start; flex-direction: column; }

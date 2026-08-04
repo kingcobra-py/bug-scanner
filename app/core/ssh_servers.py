@@ -7,7 +7,7 @@ import os
 import subprocess
 import tempfile
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -25,6 +25,7 @@ class SshServer:
     label: str = ""
     status: str = "unknown"  # online | offline | unknown
     last_error: str = ""
+    last_install: dict[str, Any] = field(default_factory=dict)
     metrics: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
@@ -34,6 +35,34 @@ class SshServer:
 
     def endpoint(self) -> str:
         return f"{self.host}:{self.port}"
+
+
+_SSH_SERVER_FIELDS = {f.name for f in fields(SshServer)}
+
+
+def _server_from_row(row: dict[str, Any]) -> SshServer:
+    return SshServer(**{key: value for key, value in row.items() if key in _SSH_SERVER_FIELDS})
+
+
+def friendly_ssh_error(message: str) -> str:
+    """Rewrite common OpenSSH failures into operator-facing text."""
+    text = (message or "").strip()
+    low = text.lower()
+    if "could not resolve hostname" in low or "name or service not known" in low or "temporary failure in name resolution" in low:
+        return (
+            "Could not resolve hostname — check the host spelling, or use the "
+            "server's private/public IP. Controller DNS may also be temporarily overloaded."
+        )
+    if "connection timed out" in low or text == "ssh timeout" or "timed out" in low:
+        return (
+            "SSH timed out — host may be stopped, security group may block port 22 "
+            "from this controller, or the network path is too slow."
+        )
+    if "permission denied" in low:
+        return "SSH auth failed — check username / key / password."
+    if "connection refused" in low:
+        return "SSH connection refused — is sshd running on port 22?"
+    return text
 
 
 class SshServerStore:
@@ -54,12 +83,12 @@ class SshServerStore:
         self.path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
 
     def list(self) -> list[SshServer]:
-        return [SshServer(**row) for row in self._read()]
+        return [_server_from_row(row) for row in self._read()]
 
     def get(self, server_id: str) -> Optional[SshServer]:
         for row in self._read():
             if row.get("id") == server_id:
-                return SshServer(**row)
+                return _server_from_row(row)
         return None
 
     def upsert(self, server: SshServer) -> SshServer:
@@ -129,8 +158,9 @@ def ssh_run(
         cmd = [
             "ssh",
             "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=8",
+            "-o", "ConnectTimeout=12",
             "-o", "ServerAliveInterval=5",
+            "-o", "ConnectionAttempts=2",
             "-p", str(int(server.port or 22)),
         ]
         env = os.environ.copy()
@@ -170,11 +200,12 @@ def ssh_run(
             env=env,
             start_new_session=True,
         )
-        return proc.returncode, proc.stdout or "", proc.stderr or ""
+        stderr = friendly_ssh_error(proc.stderr or "") if proc.returncode else (proc.stderr or "")
+        return proc.returncode, proc.stdout or "", stderr
     except subprocess.TimeoutExpired as exc:
-        return 124, exc.stdout or "", exc.stderr or "ssh timeout"
+        return 124, exc.stdout or "", friendly_ssh_error(exc.stderr or "ssh timeout")
     except Exception as exc:
-        return 1, "", str(exc)
+        return 1, "", friendly_ssh_error(str(exc))
     finally:
         for path in (keyfile, askpass):
             if path:
@@ -268,7 +299,7 @@ def collect_metrics(server: SshServer) -> dict[str, Any]:
     if rc != 0:
         return {
             "online": False,
-            "error": (err or out or f"ssh exit {rc}").strip()[:300],
+            "error": friendly_ssh_error(err or out or f"ssh exit {rc}")[:300],
             "cpu_percent": 0,
             "memory_percent": 0,
             "disk_percent": 0,
@@ -324,13 +355,19 @@ echo OK
 
 def install_deps(server: SshServer) -> dict[str, Any]:
     rc, out, err = ssh_run(server, script=_INSTALL_SCRIPT, timeout=300)
-    ok = rc == 0 and "OK" in out
+    ok = rc == 0 and "OK" in (out or "")
+    message = (
+        "Dependencies installed on remote host (/opt/bb-scanner venv + packages)."
+        if ok
+        else friendly_ssh_error(err or out or "install failed")[:400]
+    )
     return {
         "ok": ok,
         "exit_code": rc,
-        "stdout": out[-4000:],
-        "stderr": err[-2000:],
-        "message": "Dependencies installed" if ok else (err or out or "install failed")[:400],
+        "stdout": (out or "")[-4000:],
+        "stderr": (err or "")[-2000:],
+        "message": message,
+        "at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -347,7 +384,7 @@ def preflight_server(server: SshServer) -> dict[str, Any]:
     ok = online and echo_ok
     error = ""
     if not ok:
-        error = (err or metrics.get("error") or out or "ssh preflight failed").strip()[:300]
+        error = friendly_ssh_error(err or metrics.get("error") or out or "ssh preflight failed")[:300]
     return {
         "id": server.id,
         "host": server.host,
