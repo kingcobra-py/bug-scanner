@@ -319,6 +319,72 @@ def install_deps(server: SshServer) -> dict[str, Any]:
     }
 
 
+def preflight_server(server: SshServer) -> dict[str, Any]:
+    """Probe one host for job use: SSH login + echo + light metrics."""
+    metrics = collect_metrics(server)
+    online = bool(metrics.get("online"))
+    rc, out, err = ssh_run(server, "echo BB_SSH_OK && hostname", timeout=20)
+    echo_ok = rc == 0 and "BB_SSH_OK" in (out or "")
+    hostname = ""
+    if echo_ok:
+        lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+        hostname = next((ln for ln in lines if ln != "BB_SSH_OK"), "")
+    ok = online and echo_ok
+    error = ""
+    if not ok:
+        error = (err or metrics.get("error") or out or "ssh preflight failed").strip()[:300]
+    return {
+        "id": server.id,
+        "host": server.host,
+        "endpoint": server.endpoint(),
+        "label": server.label or server.host,
+        "username": server.username,
+        "auth_type": server.auth_type,
+        "ok": ok,
+        "online": online,
+        "echo_ok": echo_ok,
+        "hostname": hostname,
+        "error": error,
+        "metrics": {
+            "cpu_percent": metrics.get("cpu_percent", 0),
+            "memory_percent": metrics.get("memory_percent", 0),
+            "disk_percent": metrics.get("disk_percent", 0),
+            "cores": metrics.get("cores", "-"),
+            "load": metrics.get("load", "-"),
+        },
+    }
+
+
+def preflight_servers(store: SshServerStore, server_ids: list[str]) -> list[dict[str, Any]]:
+    """Validate selected SSH servers before attaching them to a job."""
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for sid in server_ids:
+        sid = (sid or "").strip()
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        server = store.get(sid)
+        if not server:
+            results.append({
+                "id": sid,
+                "host": "",
+                "endpoint": "",
+                "label": sid,
+                "username": "",
+                "auth_type": "",
+                "ok": False,
+                "online": False,
+                "echo_ok": False,
+                "hostname": "",
+                "error": "server not found",
+                "metrics": {},
+            })
+            continue
+        results.append(preflight_server(server))
+    return results
+
+
 def public_server_dict(server: SshServer) -> dict[str, Any]:
     data = asdict(server)
     # Never send private key / password material back to the browser after create.

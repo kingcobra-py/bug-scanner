@@ -15,6 +15,7 @@ const state = {
   pingTimer: null,
   jobsRefreshPending: false,
   serversRefreshPending: false,
+  serversRefreshPromise: null,
   resultsRefreshPending: false,
   resultsRequestScan: null,
   resultsController: null,
@@ -420,7 +421,7 @@ async function startJob(event) {
   }
   const button = $("startBtn");
   button.disabled = true;
-  button.textContent = "Starting…";
+  button.textContent = body.ssh_server_ids.length ? "Testing SSH…" : "Starting…";
   $("jobError").textContent = "";
   try {
     const response = await api("/api/scans", {
@@ -547,11 +548,13 @@ function jobCard(job) {
   const canResume = ["stopped", "failed"].includes(job.status) && (!total || finished < total);
   const isStoppedEarly = job.status === "stopped" && pct > 0 && pct < 100;
   const statusLabel = isStoppedEarly ? `stopped @ ${pct.toFixed(1)}%` : job.status;
-  const serverCount = Array.isArray(config.ssh_server_ids) ? config.ssh_server_ids.length : 0;
+  const sshServers = Array.isArray(config.ssh_servers) ? config.ssh_servers : [];
+  const serverCount = sshServers.length || (Array.isArray(config.ssh_server_ids) ? config.ssh_server_ids.length : 0);
+  const sshLabels = sshServers.map((item) => item.label || item.host || item.id).filter(Boolean);
   return `
     <article class="job-card ${esc(job.status)}">
       <div class="job-card-head">
-        <div class="min-w-0"><div class="job-title truncate">${esc(name)}</div><div class="job-id">${esc(job.id)} · ${formatNumber(config.target_count ?? (config.targets || []).length)} targets${Number(config.worker_processes) > 1 ? ` · ${config.worker_processes} processes` : ""}${serverCount ? ` · ${serverCount} SSH` : ""} · ${esc(formatHitTime(job.updated_at || job.created_at))}</div></div>
+        <div class="min-w-0"><div class="job-title truncate">${esc(name)}</div><div class="job-id">${esc(job.id)} · ${formatNumber(config.target_count ?? (config.targets || []).length)} targets${Number(config.worker_processes) > 1 ? ` · ${config.worker_processes} processes` : ""}${serverCount ? ` · ${serverCount} SSH` : ""} · ${esc(formatHitTime(job.updated_at || job.created_at))}</div>${sshLabels.length ? `<div class="job-ssh-line" title="${esc(sshLabels.join(", "))}">SSH: ${esc(sshLabels.join(" · "))}</div>` : ""}</div>
         <span class="status-badge ${esc(job.status)}" title="${esc(job.status)}">${esc(statusLabel)}</span>
       </div>
       <div class="flex justify-between text-[11px] text-slate-500 mt-4 mb-1.5"><span>${pct.toFixed(1)}%</span><span>ETA ${formatEta(progress.eta_seconds)}</span></div>
@@ -583,32 +586,52 @@ function selectedServerIds() {
 function renderJobServerPicker() {
   const box = $("jobServers");
   if (!box) return;
+  const selected = new Set(selectedServerIds());
   if (!state.servers.length) {
-    box.innerHTML = "";
+    box.innerHTML = `
+      <div class="server-picker-empty">
+        <b>No SSH servers added</b>
+        <span>Open the SSH Servers tab, add a host (key or password), then come back to select it here.</span>
+      </div>`;
     return;
   }
-  box.innerHTML = state.servers.map((server) => `
-    <label>
-      <input type="checkbox" value="${esc(server.id)}" />
-      <span>${esc(server.label || server.host)} <small class="text-slate-500">${esc(server.endpoint || `${server.host}:${server.port}`)}</small></span>
-    </label>`).join("");
+  box.innerHTML = state.servers.map((server) => {
+    const online = server.status === "online" || server.metrics?.online === true;
+    const checked = selected.has(server.id) ? "checked" : "";
+    return `
+    <label class="server-pick ${online ? "is-online" : "is-offline"}">
+      <input type="checkbox" value="${esc(server.id)}" ${checked} />
+      <span class="server-pick-body">
+        <span class="server-pick-title">${esc(server.label || server.host)}</span>
+        <span class="server-pick-meta">${esc(server.endpoint || `${server.host}:${server.port}`)} · ${esc(server.username || "ubuntu")} · ${esc(server.auth_type === "password" ? "Password" : "Key")}</span>
+      </span>
+      <span class="status-badge ${online ? "online" : "offline"}">${online ? "Online" : "Offline"}</span>
+    </label>`;
+  }).join("");
 }
 
 async function refreshServers(forceMetrics = false) {
-  if (state.serversRefreshPending) return;
-  state.serversRefreshPending = true;
-  try {
-    state.servers = forceMetrics
-      ? await api("/api/servers/refresh", { method: "POST" })
-      : await api("/api/servers");
-    renderServers();
-    renderJobServerPicker();
-  } catch (error) {
-    const grid = $("serversGrid");
-    if (grid) grid.innerHTML = `<div class="text-red-300">${esc(error.message)}</div>`;
-  } finally {
-    state.serversRefreshPending = false;
+  if (state.serversRefreshPromise) {
+    await state.serversRefreshPromise;
+    if (!forceMetrics) return;
   }
+  state.serversRefreshPending = true;
+  state.serversRefreshPromise = (async () => {
+    try {
+      state.servers = forceMetrics
+        ? await api("/api/servers/refresh", { method: "POST" })
+        : await api("/api/servers");
+      renderServers();
+      renderJobServerPicker();
+    } catch (error) {
+      const grid = $("serversGrid");
+      if (grid) grid.innerHTML = `<div class="text-red-300">${esc(error.message)}</div>`;
+    } finally {
+      state.serversRefreshPending = false;
+      state.serversRefreshPromise = null;
+    }
+  })();
+  await state.serversRefreshPromise;
 }
 
 function metricPct(metrics, key) {
@@ -906,23 +929,60 @@ function renderResults() {
   renderSecrets(filteredSecrets);
 }
 
+function secretsForProvider(providerId) {
+  const secrets = state.results?.secrets || [];
+  if (!providerId) return secrets;
+  return secrets.filter((item) => item.provider === providerId);
+}
+
+function formatSecretsForCopy(secrets) {
+  return secrets.map((item) => String(item.value || "").trim()).filter(Boolean).join("\n");
+}
+
+async function copyProviderSecrets(providerId, button) {
+  const secrets = secretsForProvider(providerId);
+  if (!secrets.length) {
+    alert("No secrets to copy for this API.");
+    return;
+  }
+  await copyText(formatSecretsForCopy(secrets));
+  if (button) {
+    const previous = button.textContent;
+    button.textContent = "Copied";
+    setTimeout(() => { button.textContent = previous; }, 1200);
+  }
+}
+
 function renderProviderFilters(providers) {
   const allCount = providers.reduce((sum, item) => sum + Number(item.count || 0), 0);
   $("providerFilters").innerHTML = [`
-    <button class="provider-chip ${state.provider ? "" : "active"}" data-provider="">
-      <span class="provider-mark">ALL</span><span>All APIs</span><b>${allCount}</b>
-    </button>`, ...providers.map((item) => `
-    <button class="provider-chip ${state.provider === item.id ? "active" : ""}" data-provider="${esc(item.id)}">
-      ${item.logo ? `<img src="${esc(item.logo)}" alt="" loading="lazy" />` : `<span class="provider-mark">${esc(item.label.slice(0, 2).toUpperCase())}</span>`}
-      <span>${esc(item.label)}</span><b>${formatNumber(item.count)}</b>
-    </button>`)].join("");
+    <div class="provider-chip-wrap">
+      <button class="provider-chip ${state.provider ? "" : "active"}" data-provider="">
+        <span class="provider-mark">ALL</span><span>All APIs</span><b>${allCount}</b>
+      </button>
+      <button type="button" class="btn-ghost copy-provider" data-provider="" title="Copy all API secrets">Copy all</button>
+    </div>`, ...providers.map((item) => `
+    <div class="provider-chip-wrap">
+      <button class="provider-chip ${state.provider === item.id ? "active" : ""}" data-provider="${esc(item.id)}">
+        ${item.logo ? `<img src="${esc(item.logo)}" alt="" loading="lazy" />` : `<span class="provider-mark">${esc(item.label.slice(0, 2).toUpperCase())}</span>`}
+        <span>${esc(item.label)}</span><b>${formatNumber(item.count)}</b>
+      </button>
+      <button type="button" class="btn-ghost copy-provider" data-provider="${esc(item.id)}" title="Copy all ${esc(item.label)} secrets">Copy all</button>
+    </div>`)].join("");
   $("providerFilters").querySelectorAll(".provider-chip").forEach((button) => {
     button.onclick = () => {
       // Cached secrets already hold every provider; re-render instantly
       // instead of asking the server to recompute and rewrite results.
       state.provider = button.dataset.provider;
       renderProviderFilters(providers);
-      renderSecrets((state.results?.secrets || []).filter((s) => !state.provider || s.provider === state.provider));
+      renderSecrets(secretsForProvider(state.provider));
+    };
+  });
+  $("providerFilters").querySelectorAll(".copy-provider").forEach((button) => {
+    button.onclick = async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      await copyProviderSecrets(button.dataset.provider || "", button);
     };
   });
 }
@@ -930,6 +990,14 @@ function renderProviderFilters(providers) {
 function renderSecrets(secrets) {
   const providers = new Map((state.results?.providers || []).map((item) => [item.id, item]));
   state._secrets = secrets;
+  const copyBtn = $("copyAllSecrets");
+  if (copyBtn) {
+    const label = state.provider
+      ? `Copy all (${secrets.length})`
+      : `Copy all (${secrets.length})`;
+    copyBtn.textContent = label;
+    copyBtn.disabled = !secrets.length;
+  }
   $("secretsBox").innerHTML = secrets.length ? secrets.map((secret, index) => {
     const provider = providers.get(secret.provider) || {};
     return `
@@ -1062,6 +1130,20 @@ function bindEvents() {
   on("refreshServers", "onclick", () => refreshServers(true));
   on("serverForm", "onsubmit", addServer);
   on("addServerBtn", "onclick", addServer);
+  on("jobServersSelectAll", "onclick", () => {
+    document.querySelectorAll("#jobServers input[type=checkbox]").forEach((el) => { el.checked = true; });
+  });
+  on("jobServersClear", "onclick", () => {
+    document.querySelectorAll("#jobServers input[type=checkbox]").forEach((el) => { el.checked = false; });
+  });
+  on("jobServersGoTab", "onclick", () => {
+    closeJobModal();
+    showTab("servers");
+  });
+  on("copyAllSecrets", "onclick", async () => {
+    const button = $("copyAllSecrets");
+    await copyProviderSecrets(state.provider || "", button);
+  });
   document.querySelectorAll("[data-ssh-auth]").forEach((button) => {
     button.onclick = () => setSshAuthType(button.dataset.sshAuth);
   });

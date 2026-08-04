@@ -232,6 +232,7 @@ tr.find-row { transition: background .12s var(--ease); }
 .module-pills span { background: rgba(30,41,59,.7); border: 1px solid var(--line); color: #94a3b8; border-radius: 5px; padding: .16rem .38rem; font-size: .61rem; }
 
 .provider-filters { display: flex; flex-wrap: wrap; gap: .55rem; }
+.provider-chip-wrap { display: flex; align-items: stretch; gap: .35rem; }
 .provider-chip { display: flex; align-items: center; gap: .45rem; border: 1px solid var(--line); background: rgba(2,6,23,.6); border-radius: 10px; padding: .48rem .7rem; color: #94a3b8; font-size: .75rem; transition: border-color .15s var(--ease), background .15s var(--ease), color .15s var(--ease), transform .1s var(--ease); }
 .provider-chip:hover { border-color: rgba(34,211,238,.4); }
 .provider-chip:active { transform: scale(.97); }
@@ -240,6 +241,7 @@ tr.find-row { transition: background .12s var(--ease); }
 .provider-mark { display: grid; place-items: center; border-radius: 5px; background: rgba(148,163,184,.12); font-size: .58rem; }
 .provider-chip.active { border-color: rgba(34,211,238,.65); background: rgba(34,211,238,.08); color: #cffafe; }
 .provider-chip b { color: #e2e8f0; font-size: .65rem; background: rgba(100,116,139,.15); padding: .08rem .35rem; border-radius: 999px; }
+.provider-chip-wrap .copy-provider { align-self: center; white-space: nowrap; }
 .secret-card { display: grid; grid-template-columns: 170px minmax(220px,1.4fr) minmax(180px,1fr) auto; gap: .75rem; align-items: center; border-top: 1px solid var(--line); padding: .75rem .3rem; font-size: .76rem; transition: background .15s var(--ease); }
 .secret-card:hover { background: rgba(34,211,238,.04); }
 .secret-kind { display: flex; align-items: center; gap: .55rem; color: #fcd34d; min-width: 0; }
@@ -362,9 +364,29 @@ td { padding: .65rem .55rem; border-top: 1px solid rgba(51,65,85,.5); color: #cb
 .terminal-top i { width: 9px; height: 9px; border-radius: 50%; background: #ef4444; }.terminal-top i:nth-child(2){background:#f59e0b}.terminal-top i:nth-child(3){background:#22c55e}
 .terminal-body { height: calc(100vh - 230px); min-height: 420px; overflow: auto; padding: 1rem; font: .72rem/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; background: rgba(0,0,0,.28); }
 
-.server-picker { display: grid; gap: .4rem; max-height: 140px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; padding: .55rem; background: rgba(2,6,23,.45); }
-.server-picker label { display: flex; align-items: center; gap: .55rem; color: #94a3b8; font-size: .78rem; }
-.server-picker:empty::before { content: "No SSH servers added yet"; color: #64748b; font-size: .72rem; }
+.job-ssh-panel { border: 1px solid var(--line); border-radius: 12px; padding: .85rem; background: rgba(2,6,23,.35); }
+.job-ssh-panel .label { margin-bottom: .55rem; }
+.server-picker { display: grid; gap: .45rem; max-height: 190px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; padding: .55rem; background: rgba(2,6,23,.45); margin-top: .55rem; }
+.server-picker-empty { display: grid; gap: .2rem; padding: .7rem .55rem; color: #64748b; font-size: .74rem; }
+.server-picker-empty b { color: #cbd5e1; font-size: .8rem; }
+.server-pick {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: .65rem;
+  align-items: center;
+  border: 1px solid rgba(51,65,85,.85);
+  border-radius: 10px;
+  padding: .55rem .65rem;
+  background: rgba(15,23,42,.72);
+  cursor: pointer;
+  transition: border-color .15s var(--ease), background .15s var(--ease);
+}
+.server-pick:hover { border-color: rgba(34,211,238,.4); }
+.server-pick:has(input:checked) { border-color: rgba(34,211,238,.65); background: rgba(8,145,178,.1); }
+.server-pick-body { display: grid; gap: .12rem; min-width: 0; }
+.server-pick-title { color: #e2e8f0; font-size: .8rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.server-pick-meta { color: #64748b; font-size: .68rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-ssh-line { color: #67e8f9; font-size: .68rem; margin-top: .25rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .ssh-card {
   border: 1px solid rgba(51,65,85,.9);

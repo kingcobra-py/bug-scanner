@@ -143,7 +143,8 @@
         <div class="panel p-5 mt-5">
           <div class="flex items-center justify-between gap-3 flex-wrap">
             <div><div class="eyebrow">DEDUPLICATED API KEYS &amp; SECRETS</div><div class="text-sm text-slate-400 mt-1">Unique credential values with occurrence counts, filterable by provider</div></div>
-            <div class="flex gap-2">
+            <div class="flex gap-2 flex-wrap">
+              <button id="copyAllSecrets" class="btn-ghost" title="Copy all secret values for the active API filter">Copy all</button>
               <button id="exportJson" class="btn-ghost">JSON</button>
               <button id="exportCsv" class="btn-ghost">CSV</button>
               <button id="exportVulns" class="btn-ghost">Vulns CSV</button>
@@ -216,10 +217,17 @@
             <label class="check-option mt-2"><input id="exploitAll" type="checkbox" checked /> Run exploits even when fingerprint is uncertain</label>
           </div>
         </div>
-        <div>
-          <label class="label">SSH servers (optional)</label>
-          <div id="jobServers" class="server-picker"></div>
-          <p class="text-[11px] text-slate-500 mt-1">Associate fleet hosts with this job. Manage hosts under SSH Servers.</p>
+        <div class="job-ssh-panel">
+          <div class="flex items-center justify-between gap-2 flex-wrap">
+            <label class="label mb-0">SSH servers</label>
+            <div class="flex gap-2">
+              <button type="button" id="jobServersSelectAll" class="btn-ghost">Select all</button>
+              <button type="button" id="jobServersClear" class="btn-ghost">Clear</button>
+              <button type="button" id="jobServersGoTab" class="btn-ghost">Manage →</button>
+            </div>
+          </div>
+          <div id="jobServers" class="server-picker" role="group" aria-label="Select SSH servers for this job"></div>
+          <p class="text-[11px] text-slate-500 mt-1">Pick added hosts for this job. Selected servers are SSH-tested before the scan starts.</p>
         </div>
         <label class="label">Authorization / scope notes</label>
         <textarea id="scope" class="input h-20" placeholder="Program name, scope reference, operator notes"></textarea>

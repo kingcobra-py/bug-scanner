@@ -29,6 +29,7 @@ from app.core.ssh_servers import (
     collect_metrics,
     install_deps,
     new_server_id,
+    preflight_servers,
     public_server_dict,
 )
 from app.extractors.patterns import IGNORED_SECRET_KINDS
@@ -486,6 +487,19 @@ def create_app() -> FastAPI:
             output_dir=str(ROOT / "output" / "scans"),
         )
         ssh_server_ids = [sid for sid in (body.ssh_server_ids or []) if isinstance(sid, str) and sid.strip()]
+        ssh_preflight: list[dict[str, Any]] = []
+        if ssh_server_ids:
+            ssh_preflight = await asyncio.to_thread(preflight_servers, ssh_store, ssh_server_ids)
+            failed = [row for row in ssh_preflight if not row.get("ok")]
+            if failed:
+                names = ", ".join(
+                    (row.get("label") or row.get("host") or row.get("id") or "?") for row in failed
+                )
+                detail = failed[0].get("error") or "SSH preflight failed"
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Selected SSH server(s) not ready: {names}. {detail}",
+                )
         out_dir = Path(cfg.output_dir) / cfg.scan_id
         out_dir.mkdir(parents=True, exist_ok=True)
         # Hard-link large uploads into the scan directory in O(1). The job no
@@ -536,12 +550,29 @@ def create_app() -> FastAPI:
                 "target_count": cfg.target_count,
                 "custom_path_count": cfg.custom_path_count,
                 "ssh_server_ids": ssh_server_ids,
+                "ssh_servers": [
+                    {
+                        "id": row.get("id"),
+                        "host": row.get("host"),
+                        "endpoint": row.get("endpoint"),
+                        "label": row.get("label"),
+                        "auth_type": row.get("auth_type"),
+                        "hostname": row.get("hostname"),
+                        "ok": row.get("ok"),
+                    }
+                    for row in ssh_preflight
+                ],
             },
             str(out_dir),
         )
         store.update_status(cfg.scan_id, "pending")
         engine.start_async(cfg)
-        return {"id": cfg.scan_id, "status": "running"}
+        return {
+            "id": cfg.scan_id,
+            "status": "running",
+            "ssh_server_ids": ssh_server_ids,
+            "ssh_preflight": ssh_preflight,
+        }
 
     @app.get("/api/scans")
     async def list_scans(

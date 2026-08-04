@@ -43,6 +43,96 @@ def test_public_server_dict_redacts_secrets():
     assert public["endpoint"] == "h.example:22"
 
 
+def test_create_job_requires_ready_ssh_servers(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
+    ssh_store = SshServerStore(tmp_path / "ssh.json")
+    monkeypatch.setattr(server, "ssh_store", ssh_store)
+
+    from app.core.ssh_servers import SshServer, new_server_id
+
+    sid = new_server_id()
+    ssh_store.upsert(SshServer(id=sid, host="node.example", private_key="KEY", label="node-a"))
+
+    started = []
+    monkeypatch.setattr(server.engine, "start_async", lambda config: started.append(config))
+    monkeypatch.setattr(
+        server,
+        "preflight_servers",
+        lambda _store, ids: [{
+            "id": sid,
+            "host": "node.example",
+            "endpoint": "node.example:22",
+            "label": "node-a",
+            "auth_type": "key",
+            "ok": False,
+            "online": False,
+            "echo_ok": False,
+            "hostname": "",
+            "error": "connection refused",
+            "metrics": {},
+        }],
+    )
+
+    client = TestClient(create_app())
+    uploaded = client.post(
+        "/api/uploads",
+        data={"kind": "targets"},
+        files={"file": ("scope.txt", b"a.example\n", "text/plain")},
+    )
+    assert uploaded.status_code == 200
+    upload_id = uploaded.json()["id"]
+
+    bad = client.post(
+        "/api/scans",
+        json={
+            "job_name": "ssh fail",
+            "targets_upload_id": upload_id,
+            "modules": ["git"],
+            "ssh_server_ids": [sid],
+            "threads": 2,
+        },
+    )
+    assert bad.status_code == 400
+    assert "not ready" in bad.json()["detail"].lower()
+    assert started == []
+
+    monkeypatch.setattr(
+        server,
+        "preflight_servers",
+        lambda _store, ids: [{
+            "id": sid,
+            "host": "node.example",
+            "endpoint": "node.example:22",
+            "label": "node-a",
+            "auth_type": "key",
+            "ok": True,
+            "online": True,
+            "echo_ok": True,
+            "hostname": "node-a",
+            "error": "",
+            "metrics": {"cpu_percent": 1},
+        }],
+    )
+    ok = client.post(
+        "/api/scans",
+        json={
+            "job_name": "ssh ok",
+            "targets_upload_id": upload_id,
+            "modules": ["git"],
+            "ssh_server_ids": [sid],
+            "threads": 2,
+        },
+    )
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["ssh_server_ids"] == [sid]
+    assert body["ssh_preflight"][0]["ok"] is True
+    assert started
+    scan = server.store.get_scan(body["id"])
+    assert scan["config"]["ssh_servers"][0]["label"] == "node-a"
+
+
 def test_servers_api_accepts_password_auth(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "ROOT", tmp_path)
     monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
