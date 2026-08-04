@@ -232,6 +232,20 @@ try:
             net_rx += int(parts[0]); net_tx += int(parts[8])
 except Exception:
     pass
+def fmt_bytes(n):
+    n = float(n or 0)
+    gb = n / (1024 ** 3)
+    if gb >= 100:
+        return f'{gb:.0f}G'
+    if gb >= 10:
+        return f'{gb:.1f}G'
+    if gb >= 1:
+        return f'{gb:.2f}G'
+    mb = n / (1024 ** 2)
+    if mb >= 1:
+        return f'{mb:.0f}M'
+    kb = n / 1024
+    return f'{kb:.0f}K'
 print(json.dumps({
     'cpu_percent': round(cpu_pct, 1),
     'memory_percent': round(mem_pct, 1),
@@ -240,7 +254,8 @@ print(json.dumps({
     'load': f'{load1:.2f}',
     'load_1': load1, 'load_5': load5, 'load_15': load15,
     'procs': procs,
-    'net': f'{net_rx // 1024}k/{net_tx // 1024}k',
+    'net': f'{fmt_bytes(net_rx)}/{fmt_bytes(net_tx)}',
+    'net_rx': int(net_rx), 'net_tx': int(net_tx),
     'memory_used': int(mem_used), 'memory_total': int(mem_total),
     'disk_used': disk.used, 'disk_total': disk.total,
 }))
