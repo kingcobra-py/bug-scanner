@@ -179,6 +179,7 @@ class HttpClient:
         headers: Optional[dict[str, str]] = None,
         data: Any = None,
         json_body: Any = None,
+        files: Any = None,
         read_body: bool = True,
     ) -> tuple[str, int, dict[str, str], bytes, Optional[str]]:
         """Perform one HTTP exchange with a hard body-size cap.
@@ -186,13 +187,23 @@ class HttpClient:
         Returns ``(final_url, status_code, headers, body, encoding)``.
         """
         try:
-            with self._shared_client.stream(
-                method,
-                url,
-                headers=headers,
-                content=data,
-                json=json_body,
-            ) as resp:
+            request_kwargs: dict[str, Any] = {
+                "method": method,
+                "url": url,
+                "headers": headers,
+            }
+            if json_body is not None:
+                request_kwargs["json"] = json_body
+            elif files is not None:
+                request_kwargs["files"] = files
+                if data is not None:
+                    request_kwargs["data"] = data
+            elif isinstance(data, (bytes, bytearray)):
+                request_kwargs["content"] = data
+            elif data is not None:
+                request_kwargs["data"] = data
+
+            with self._shared_client.stream(**request_kwargs) as resp:
                 status = resp.status_code
                 resp_headers = {k.lower(): v for k, v in resp.headers.items()}
                 resp_url = str(resp.url)
@@ -235,6 +246,7 @@ class HttpClient:
         headers: Optional[dict[str, str]] = None,
         data: Any = None,
         json_body: Any = None,
+        files: Any = None,
         allow_redirects: bool = True,
         retry_on_403: bool = True,
         retries: Optional[int] = None,
@@ -260,6 +272,7 @@ class HttpClient:
                     headers=hdrs,
                     data=data,
                     json_body=json_body,
+                    files=files,
                     read_body=True,
                 )
                 hops = 0
@@ -318,6 +331,9 @@ class HttpClient:
 
     def get(self, url: str, **kwargs: Any) -> HttpResponse:
         return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs: Any) -> HttpResponse:
+        return self.request("POST", url, **kwargs)
 
     def _retry_403(self, method: str, url: str, headers: dict[str, str]) -> Optional[HttpResponse]:
         variants = [

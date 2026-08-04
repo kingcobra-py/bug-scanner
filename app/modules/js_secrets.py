@@ -94,7 +94,10 @@ class JsSecretsModule:
                 validated=bool(secrets),
             )
             findings.append(f)
-            ctx.progress.add_hit(secrets=len(secrets), module=self.name)
+            ctx.progress.add_hit(
+                secrets=len(secrets) + len(smtp),
+                module=self.name,
+            )
             if log:
                 log.hit(resp.url or url, f.confidence)
                 log.info(

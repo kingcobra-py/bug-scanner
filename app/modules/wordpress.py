@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from app.exploits.wp2shell.detector import Wp2ShellDetector
 from app.exploits.wp2shell.exploit import Wp2ShellExploit  # <-- NEW
-from app.modules.base import cms_body_extractions, emit_credential_findings, finding_from_hit, save_http_response
+from app.modules.base import cms_body_extractions, emit_credential_findings, finding_from_hit, save_http_response, append_exploit_secret_finding
 from app.modules.vulnerability_intel import executable_upload_paths, wordpress_exposure, wordpress_version
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
@@ -432,21 +432,15 @@ class WordPressModule:
                 ctx.progress.add_hit(module=self.name)
                 secrets = exploit.extract_secrets(ctx)
                 for category, lines in secrets.items():
-                    if lines:
-                        findings.append(
-                            finding_from_hit(
-                                module=self.name,
-                                ftype="secrets",
-                                severity="high",
-                                target=target,
-                                url=target.url,
-                                title=f"Secret extraction: {category} (wp2shell)",
-                                evidence="\n".join(lines[:20]),
-                                confidence=0.95,
-                                tags=["wordpress", "secrets", category, "active-exploit"],
-                                validated=True,
-                            )
-                        )
-                        ctx.progress.add_hit(secrets=len(lines), module=self.name)
+                    append_exploit_secret_finding(
+                        findings=findings,
+                        ctx=ctx,
+                        module=self.name,
+                        target=target,
+                        category=category,
+                        lines=lines,
+                        exploit_label="wp2shell",
+                        tags=["wordpress"],
+                    )
 
         return findings

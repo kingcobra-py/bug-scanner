@@ -141,6 +141,17 @@ def test_403_marked():
     httpd.shutdown()
 
 
+def test_post_method():
+    httpd = run_server()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    client = HttpClient(timeout=2.0, retries=0)
+    resp = client.post(f"{base}/ok", data=b"probe-body", headers={"Content-Type": "application/octet-stream"})
+    assert resp.status_code == 200
+    assert resp.text == "post-ok"
+    client.close()
+    httpd.shutdown()
+
+
 def test_shared_client_counts_real_requests_across_threads():
     httpd = run_server()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"

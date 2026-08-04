@@ -70,10 +70,10 @@ def filter_cms_smtp(item: dict[str, Any]) -> bool:
     host = str(value.get("host") or "").strip()
     user = str(value.get("user") or "").strip()
     password = str(value.get("pass") or "").strip()
-    if not host:
+    # Prefer complete credentials; host-only / user-only rows are noise.
+    if not password:
         return False
-    # Drop provider-host noise with no credentials.
-    if not user and not password and float(item.get("confidence") or 0) < 0.7:
+    if not host and not user:
         return False
     return True
 

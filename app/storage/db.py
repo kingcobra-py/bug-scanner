@@ -176,14 +176,65 @@ class ScanStore:
 
     def create_scan(self, scan_id: str, config: dict[str, Any], output_dir: str) -> None:
         with self._lock, Session(self.engine) as s:
-            row = ScanRow(
-                id=scan_id,
-                status="pending",
-                config_json=json.dumps(config),
-                output_dir=output_dir,
-            )
-            s.merge(row)
+            existing = s.get(ScanRow, scan_id)
+            if existing:
+                # Resume / restart of the same id must keep findings + progress.
+                # Engine re-create_scan() uses ScanConfig fields only — preserve
+                # dashboard metadata (SSH fleet assignment, etc.) already stored.
+                try:
+                    old = json.loads(existing.config_json or "{}")
+                except Exception:
+                    old = {}
+                if isinstance(old, dict):
+                    preserved = {
+                        key: value
+                        for key, value in old.items()
+                        if key not in config and key not in {"targets", "custom_paths"}
+                    }
+                    config = {**preserved, **config}
+                existing.config_json = json.dumps(config)
+                existing.output_dir = output_dir or existing.output_dir
+                existing.status = existing.status or "pending"
+                existing.archived = 0
+                existing.updated_at = datetime.now(timezone.utc)
+            else:
+                s.add(
+                    ScanRow(
+                        id=scan_id,
+                        status="pending",
+                        config_json=json.dumps(config),
+                        output_dir=output_dir,
+                    )
+                )
             s.commit()
+
+    def rebuild_scan_config(self, scan_id: str) -> Optional[dict[str, Any]]:
+        """Rebuild a ScanConfig-ready dict from a stopped scan's artifacts."""
+        row = self.get_scan(scan_id, compact=False)
+        if not row:
+            return None
+        config = dict(row.get("config") or {})
+        out_dir = Path(row.get("output_dir") or "")
+        if not out_dir:
+            return None
+        targets_file = out_dir / "targets.txt"
+        paths_file = out_dir / "custom_paths.txt"
+        config["scan_id"] = scan_id
+        config["targets"] = []
+        config["custom_paths"] = []
+        config["output_dir"] = str(out_dir.parent) if out_dir.name == scan_id else str(out_dir)
+        # engine uses output_dir / scan_id — store output_dir is usually the scan folder.
+        # Prefer parent as ScanConfig.output_dir when folder is already .../scans/<id>.
+        if out_dir.name == scan_id:
+            config["output_dir"] = str(out_dir.parent)
+        else:
+            config["output_dir"] = str(out_dir)
+        if targets_file.is_file():
+            config["targets_path"] = str(targets_file)
+        if paths_file.is_file():
+            config["wordlist_path"] = str(paths_file)
+        config.setdefault("target_count", int(config.get("target_count") or 0))
+        return config
 
     def update_status(self, scan_id: str, status: str) -> None:
         with self._lock, Session(self.engine) as s:
@@ -419,6 +470,99 @@ class ScanStore:
             offset=offset,
         )
         return items
+
+    def finding_stats(self, scan_id: str) -> dict[str, Any]:
+        """Cheap SQL aggregates for Results summary cards (no row materialization)."""
+        with Session(self.engine) as s:
+            total = int(
+                s.scalar(
+                    select(func.count()).select_from(FindingRow).where(FindingRow.scan_id == scan_id)
+                )
+                or 0
+            )
+            by_severity: dict[str, int] = {
+                str(sev or "info"): int(count)
+                for sev, count in s.execute(
+                    select(FindingRow.severity, func.count())
+                    .where(FindingRow.scan_id == scan_id)
+                    .group_by(FindingRow.severity)
+                ).all()
+            }
+            by_module: dict[str, int] = {
+                str(mod or "unknown"): int(count)
+                for mod, count in s.execute(
+                    select(FindingRow.module, func.count())
+                    .where(FindingRow.scan_id == scan_id)
+                    .group_by(FindingRow.module)
+                ).all()
+            }
+        return {"finding_count": total, "by_severity": by_severity, "by_module": by_module}
+
+    def get_secret_candidate_findings(self, scan_id: str) -> list[dict[str, Any]]:
+        """Load only findings that may contain extractable secrets/SMTP.
+
+        Large scans store millions of empty ``{"secrets": []}`` blobs. Pulling
+        every row into Python for Results made the tab take 1–2 minutes; JSON
+        filters keep this to the few thousand rows that actually matter.
+        """
+        sql = (
+            "SELECT id FROM findings WHERE scan_id = ? AND ("
+            "json_array_length(json_extract(extracted_json, '$.secrets')) > 0 "
+            "OR json_array_length(json_extract(extracted_json, '$.smtp')) > 0 "
+            "OR type = 'secrets'"
+            ")"
+        )
+        try:
+            with self.engine.connect() as conn:
+                ids = [row[0] for row in conn.exec_driver_sql(sql, (scan_id,)).fetchall()]
+        except Exception:
+            # Older SQLite without JSON1 — fall back to a bounded Python filter.
+            return self._secret_candidates_python_fallback(scan_id)
+
+        if not ids:
+            return []
+        with Session(self.engine) as s:
+            rows = s.scalars(select(FindingRow).where(FindingRow.id.in_(ids))).all()
+            return [self._finding_dict(r) for r in rows]
+
+    def _secret_candidates_python_fallback(self, scan_id: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        with Session(self.engine) as s:
+            rows = s.scalars(select(FindingRow).where(FindingRow.scan_id == scan_id)).all()
+            for row in rows:
+                if (row.type or "") == "secrets":
+                    out.append(self._finding_dict(row))
+                    continue
+                raw = row.extracted_json or ""
+                if len(raw) <= 2:
+                    continue
+                try:
+                    extracted = json.loads(raw)
+                except Exception:
+                    continue
+                if (extracted.get("secrets") or extracted.get("smtp")):
+                    out.append(self._finding_dict(row))
+        return out
+
+    def get_vuln_candidate_findings(self, scan_id: str) -> list[dict[str, Any]]:
+        """Findings that can contribute to the vulnerable-hosts panel.
+
+        Skips pure info/path noise that dominates huge scans when on-disk
+        ``vulns/`` indexes are unavailable.
+        """
+        modules = ("git", "config", "js", "wordpress", "joomla", "react", "methods")
+        severities = ("critical", "high", "medium")
+        with Session(self.engine) as s:
+            rows = s.scalars(
+                select(FindingRow).where(
+                    FindingRow.scan_id == scan_id,
+                    or_(
+                        FindingRow.severity.in_(severities),
+                        FindingRow.module.in_(modules),
+                    ),
+                )
+            ).all()
+            return [self._finding_dict(r) for r in rows]
 
     def get_finding(self, scan_id: str, finding_id: str) -> Optional[dict[str, Any]]:
         with Session(self.engine) as s:

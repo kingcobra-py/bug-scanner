@@ -106,6 +106,18 @@ class ProgressManager:
             snap, subs = self._dispatch_locked(force=True)
         self._fanout(snap, subs)
 
+    def seed_completed(self, done: int, failed: int = 0) -> None:
+        """Seed counters when resuming a scan from a durable checkpoint."""
+        with self._lock:
+            self._snap.done = max(int(done), 0)
+            self._snap.failed = max(int(failed), 0)
+            self._recompute_host_progress_locked()
+            if self._progress and self._overall_task is not None:
+                finished = self._snap.done + self._snap.failed
+                self._progress.update(self._overall_task, completed=finished)
+            snap, subs = self._dispatch_locked(force=True)
+        self._fanout(snap, subs)
+
     def set_total(self, total: int) -> None:
         with self._lock:
             self._snap.total = max(total, 0)

@@ -6,7 +6,7 @@ import json
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Protocol, runtime_checkable
 
 from app.extractors import extract_all
 from app.extractors.cms_extractions import cms_body_extractions
@@ -176,6 +176,151 @@ def save_method_responses(
 
 def body_extractions(ctx: ScanContext, url: str, body: str) -> dict:
     return extract_all(body, source_url=url, redact_values=ctx.config.redact_secrets)
+
+
+_NON_SECRET_ENV_KEYS = {
+    "path", "home", "pwd", "user", "shell", "shlvl", "term", "lang", "lc_all",
+    "hostname", "host", "port", "node_version", "yarn_version", "npm_config_user_agent",
+    "npm_config_cache", "colorterm", "editor", "pager", "tmpdir", "tmp", "temp",
+    "logname", "mail", "oldpwd", "underscore", "_", "ps1", "ps2", "ls_colors",
+    "xdg_runtime_dir", "xdg_session_id", "xdg_session_type", "display",
+    "ssh_connection", "ssh_client", "ssh_tty", "debian_frontend",
+}
+_CRED_KEY_TOKENS = (
+    "password", "passwd", "secret", "token", "apikey", "access_key", "private_key",
+    "aws_access", "aws_secret", "akia", "asia", "smtp", "mail_pass", "mail_user",
+    "database_url", "db_pass", "db_password", "credential", "bearer", "api_key",
+)
+
+
+def _looks_like_credential_line(value: str) -> bool:
+    """Reject bash-history timestamps and other raw dump noise."""
+    from app.core.result_secrets import is_noise_env_key
+
+    text = (value or "").replace("\r", "").strip()
+    if not text or len(text) < 6:
+        return False
+    if text.isdigit():
+        return False
+    if text.startswith("#") and text[1:].strip().isdigit():
+        return False
+    lowered = text.lower()
+    # JS / source noise from next_config dumps.
+    if any(token in lowered for token in ("process.env", "===", "=>", "const ", "let ", "function ")):
+        return False
+    if any(marker in lowered for marker in ("akia", "asia", "ghp_", "sk_live", "xox", "sg.")):
+        return True
+    if "=" not in text:
+        return False
+    key, rhs = text.split("=", 1)
+    key = key.strip().lower()
+    rhs = rhs.strip().strip("'\"")
+    if not key or key in _NON_SECRET_ENV_KEYS or is_noise_env_key(key):
+        return False
+    from app.extractors.validators import is_boolish_value, is_placeholder
+
+    if is_boolish_value(rhs) or is_placeholder(rhs):
+        return False
+    # Token match avoids ``pass`` matching ``private``.
+    if any(token in key for token in _CRED_KEY_TOKENS):
+        return True
+    if key.endswith(("_key", "_secret", "_token", "_password", "_passwd")):
+        return True
+    return False
+
+
+def exploit_lines_to_extracted(
+    category: str,
+    lines: list[Any],
+    *,
+    source_url: str = "",
+) -> dict[str, Any]:
+    """Normalize exploit extractor output into Results-compatible payloads.
+
+    Only keep already-parsed secret/smtp dicts (or credential-looking lines).
+    Raw bash_history / env dump lines are ignored — they inflate Results with
+    timestamps and shell noise.
+    """
+    # API endpoint dumps are not credentials — skip *_apis categories.
+    if category.endswith("_apis") or category in {"apis", "api"}:
+        return {}
+    secrets: list[dict[str, Any]] = []
+    smtp: list[dict[str, Any]] = []
+    kind_hint = (
+        category.replace("_secrets", "")
+        .replace("_smtp", "")
+        or "env"
+    )
+    prefer_smtp = category.endswith("_smtp") or kind_hint == "smtp"
+    api_kinds = {"absolute_api", "base_url", "fetch_call", "joomla_absolute_api"}
+    for item in lines or []:
+        if isinstance(item, dict):
+            kind = str(item.get("kind") or ("smtp" if prefer_smtp else kind_hint))
+            if kind in api_kinds:
+                continue
+            payload = {
+                **item,
+                "source_url": item.get("source_url") or source_url,
+            }
+            if kind == "smtp":
+                smtp.append(payload)
+            else:
+                secrets.append(payload)
+            continue
+        if isinstance(item, str) and _looks_like_credential_line(item):
+            secrets.append(
+                {
+                    "kind": kind_hint if kind_hint != "smtp" else "env",
+                    "value": item.strip().replace("\r", ""),
+                    "source_url": source_url,
+                }
+            )
+    extracted: dict[str, Any] = {}
+    if secrets:
+        extracted["secrets"] = secrets
+    if smtp:
+        extracted["smtp"] = smtp
+    return extracted
+
+
+def append_exploit_secret_finding(
+    *,
+    findings: list[Finding],
+    ctx: ScanContext,
+    module: str,
+    target: TargetContext,
+    category: str,
+    lines: list[Any],
+    exploit_label: str,
+    tags: list[str],
+) -> None:
+    extracted = exploit_lines_to_extracted(category, lines, source_url=target.url)
+    secret_count = len(extracted.get("secrets") or []) + len(extracted.get("smtp") or [])
+    if not secret_count:
+        return
+    preview: list[str] = []
+    for item in (extracted.get("secrets") or []) + (extracted.get("smtp") or []):
+        value = item.get("value")
+        if isinstance(value, dict):
+            preview.append(json.dumps(value, sort_keys=True))
+        else:
+            preview.append(str(value))
+    findings.append(
+        finding_from_hit(
+            module=module,
+            ftype="secrets",
+            severity="high",
+            target=target,
+            url=target.url,
+            title=f"Secret extraction: {category} ({exploit_label})",
+            evidence="\n".join(preview[:20]),
+            confidence=0.95,
+            extracted=extracted,
+            tags=[*tags, "secrets", category, "active-exploit"],
+            validated=True,
+        )
+    )
+    ctx.progress.add_hit(secrets=secret_count, module=module)
 
 
 def merge_extractions(*parts: dict) -> dict:

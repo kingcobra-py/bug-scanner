@@ -10,7 +10,11 @@ from typing import Match, Optional
 
 # --- Cloud / SaaS keys ---
 AWS_ACCESS_KEY = re.compile(r"\b((?:AKIA|ASIA|ABIA|ANPA)[0-9A-Z]{16})\b")
+# Quoted 40-char secrets (JS/JSON) and labeled env assignments.
 AWS_SECRET_KEY = re.compile(r"(?<=['\"])([A-Za-z0-9/+]{40})(?=['\"])")
+AWS_SECRET_ASSIGN = re.compile(
+    r"(?i)(?:AWS_SECRET_ACCESS_KEY|SECRET_ACCESS_KEY)\s*[:=]\s*['\"]?([A-Za-z0-9/+=]{40})['\"]?"
+)
 AWS_SES_HOST = re.compile(r"email-smtp\.[a-z0-9\-]+\.amazonaws\.com", re.I)
 
 AZURE_STORAGE = re.compile(
@@ -32,8 +36,10 @@ POSTMARK_TOKEN = re.compile(
     re.I | re.M,
 )
 
+# Live Stripe only — sk_test_ keys are intentionally not detected.
 STRIPE_LIVE = re.compile(r"\bsk_live_[0-9a-zA-Z]{24,}\b")
-STRIPE_TEST = re.compile(r"\bsk_test_[0-9a-zA-Z]{24,}\b")
+STRIPE_TEST = re.compile(r"\bsk_test_[0-9a-zA-Z]{24,}\b")  # kept for ignore/filter only
+SK_TEST_PREFIX = re.compile(r"^sk_test_", re.I)
 TWILIO_SID = re.compile(r"\b(AC[0-9a-fA-F]{32})\b")
 TWILIO_AUTH = re.compile(r"(?i)(?:TWILIO_AUTH_TOKEN|auth_token)\s*[:=]\s*['\"]?([0-9a-fA-F]{32})['\"]?")
 TWILIO_B64 = re.compile(r"\bQU[MN][A-Za-z0-9+/]{80,}={0,2}\b")
@@ -70,16 +76,19 @@ SMTP_URI = re.compile(
     r"(?i)smtps?://(?:([^:@/\s]+):([^@/\s]+)@)?([A-Za-z0-9.\-]+)(?::(\d+))?"
 )
 MAIL_HOST = re.compile(
-    r"(?im)(?:^|[\s\"'])(?:MAIL|SMTP)_(?:HOST|HOSTNAME|SERVER)\s*[:=]\s*[\"']?(?P<host>[^\s\"'#]+)"
+    r"(?im)(?:^|[\s\"'])(?:APPSETTING_)?(?:MAIL|SMTP|EMAIL)_(?:HOST|HOSTNAME|SERVER)\s*[:=]\s*[\"']?(?P<host>[^\s\"'#\r]+)"
 )
 MAIL_PORT = re.compile(
-    r"(?im)(?:^|[\s\"'])(?:MAIL|SMTP)_(?:PORT|PORT_NUMBER)\s*[:=]\s*[\"']?(?P<port>\d{2,5})"
+    r"(?im)(?:^|[\s\"'])(?:APPSETTING_)?(?:MAIL|SMTP|EMAIL)_(?:PORT|PORT_NUMBER)\s*[:=]\s*[\"']?(?P<port>\d{2,5})"
 )
 MAIL_USER = re.compile(
-    r"(?im)(?:^|[\s\"'])(?:MAIL|SMTP)_(?:USER|USERNAME|USER_NAME)\s*[:=]\s*[\"']?(?P<user>[^\s\"'#]+)"
+    r"(?im)(?:^|[\s\"'])(?:APPSETTING_)?(?:MAIL|SMTP|EMAIL)_(?:USER|USERNAME|USER_NAME|EMAIL|FROM)\s*[:=]\s*[\"']?(?P<user>[^\s\"'#\r]+)"
 )
 MAIL_PASS = re.compile(
-    r"(?im)(?:^|[\s\"'])(?:MAIL|SMTP)_(?:PASS|PASSWORD|PASSWD)\s*[:=]\s*[\"']?(?P<pass>[^\s\"'#]+)"
+    r"(?im)(?:^|[\s\"'])(?:APPSETTING_)?(?:MAIL|SMTP|EMAIL)_(?:PASS|PASSWORD|PASSWD|PASS_WORD)\s*[:=]\s*[\"']?(?P<pass>[^\s\"'#\r]+)"
+)
+MAIL_KV_LINE = re.compile(
+    r"(?im)^(?:export\s+)?(?:APPSETTING_)?(?P<prefix>SMTP|MAIL|EMAIL)_(?P<key>[A-Z0-9_]+)\s*=\s*[\"']?(?P<value>[^\s\"'#\r]+)"
 )
 SPRING_MAIL = re.compile(
     r"(?im)spring\.mail\.(host|port|username|password)\s*[:=]\s*[\"']?([^\s\"'#]+)"
@@ -129,12 +138,10 @@ PATTERN_PACKS: dict[str, list[tuple[str, re.Pattern]]] = {
     "brevo": [("brevo", BREVO_KEY)],
     "xsmtp": [("xsmtp", XSMTP_KEY)],
     "mailgun": [("mailgun", MAILGUN_KEY)],
-    "stripe": [("stripe_live", STRIPE_LIVE), ("stripe_test", STRIPE_TEST)],
+    "stripe": [("stripe_live", STRIPE_LIVE)],
     "slack": [("slack", SLACK_TOKEN)],
     "openai": [("openai", OPENAI_KEY)],
     "anthropic": [("anthropic", ANTHROPIC_KEY)],
-    "tencent": [("tencent", TENCENT_AK)],
-    "aliyun": [("aliyun", ALIYUN_AK)],
 }
 
 # Kinds we never want in Results (also used to hide legacy rows already stored).
@@ -143,6 +150,12 @@ IGNORED_SECRET_KINDS = frozenset({
     "google_api",
     "generic_api_key",
     "bearer",
+    "stripe_test",
+    "paystack",
+    "emailjs",
+    "sanity",
+    "tencent",
+    "aliyun",
 })
 
 

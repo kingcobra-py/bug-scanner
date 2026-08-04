@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from app.exploits.react2shell.detector import React2ShellDetector
 from app.exploits.react2shell.exploit import React2ShellExploit
-from app.modules.base import body_extractions, finding_from_hit, save_http_response
+from app.modules.base import append_exploit_secret_finding, body_extractions, finding_from_hit, save_http_response
 from app.modules.vulnerability_intel import package_versions, react2shell_exposure
 from app.storage.models import Finding, ScanContext, TargetContext
 from app.utils.normalize import join_url
@@ -278,21 +278,15 @@ class ReactModule:
                 ctx.progress.add_hit(module=self.name)
                 secrets = exploit.extract_secrets(ctx)
                 for category, lines in secrets.items():
-                    if lines:
-                        findings.append(
-                            finding_from_hit(
-                                module=self.name,
-                                ftype="secrets",
-                                severity="high",
-                                target=target,
-                                url=target.url,
-                                title=f"Secret extraction: {category} (React2Shell)",
-                                evidence="\n".join(lines[:20]),
-                                confidence=0.95,
-                                tags=["nextjs", "secrets", category, "active-exploit"],
-                                validated=True,
-                            )
-                        )
-                        ctx.progress.add_hit(secrets=len(lines), module=self.name)
+                    append_exploit_secret_finding(
+                        findings=findings,
+                        ctx=ctx,
+                        module=self.name,
+                        target=target,
+                        category=category,
+                        lines=lines,
+                        exploit_label="React2Shell",
+                        tags=["nextjs"],
+                    )
 
         return findings

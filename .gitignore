@@ -8,6 +8,7 @@ output/scans/*
 !output/scans/.gitkeep
 output/uploads/*
 !output/uploads/.gitkeep
+output/ssh_servers.json
 .pytest_cache/
 .mypy_cache/
 *.db

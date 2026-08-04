@@ -20,13 +20,56 @@ from app.extractors.validators import (
 from app.utils.dedupe import value_hash
 
 
+_NOISE_ENV_PREFIXES = (
+    "__NEXT_PRIVATE_",
+    "AWS_LAMBDA_",
+    "AWS_CONTAINER_",
+    "NPM_",
+    "KUBERNETES_",
+    "WEBSITE_",
+    "ECS_",
+)
+_NOISE_ENV_EXACT = {
+    "AWS_EXECUTION_ENV",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_APP_ENV",
+    "AWS_ROLE_ARN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_STS_REGIONAL_ENDPOINTS",
+    "HOSTNAME",
+    "NODE_VERSION",
+    "YARN_VERSION",
+    "PORT",
+    "HOME",
+    "PATH",
+    "PWD",
+    "SHLVL",
+    "NEXT_DEPLOYMENT_ID",
+}
+_SMTP_ENV_RE = re.compile(r"^(?:APPSETTING_)?(?:SMTP|MAIL|EMAIL)_", re.I)
+
+
 def _parse_env(text: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for m in P.ENV_LINE.finditer(text or ""):
-        k, v = m.group(1), m.group(2).strip()
+        k, v = m.group(1), m.group(2).strip().replace("\r", "").strip().strip("'\"")
         if k and v and not is_placeholder(v):
             out[k] = v
     return out
+
+
+def _is_noise_env_key(key: str) -> bool:
+    key_u = (key or "").strip()
+    if not key_u:
+        return True
+    if key_u in _NOISE_ENV_EXACT:
+        return True
+    if any(key_u.startswith(prefix) for prefix in _NOISE_ENV_PREFIXES):
+        return True
+    if key_u.startswith("NEXT_PUBLIC_") and "SECRET" not in key_u and "PRIVATE" not in key_u:
+        return True
+    return False
 
 
 def _parse_jsonish(text: str) -> dict[str, Any]:
@@ -76,17 +119,35 @@ def _looks_like_sentence_or_code(value: str) -> bool:
 
 
 _KV_MARKERS = (
-    "aws", "github", "gitlab", "stripe", "sendgrid", "brevo", "mailgun",
-    "postmark", "slack", "openai", "anthropic", "twilio", "azure", "tencent",
-    "aliyun", "smtp", "mail_", "mail-", "password", "passwd", "secret",
-    "private", "credential", "access_key", "secret_key",
+    "aws", "github", "gitlab", "stripe", "razorpay", "sendgrid", "brevo",
+    "mailgun", "postmark", "slack", "openai", "anthropic", "twilio", "azure",
+    "smtp", "mail_", "mail-",
+    "password", "passwd", "secret", "private", "credential", "access_key",
+    "secret_key",
+)
+
+
+_IGNORED_ENV_KEY_MARKERS = (
+    "nextauth", "emailjs", "sanity", "paystack", "msi_secret",
+    "tencent", "aliyun", "alibaba", "cloudbase", "yuanbao",
 )
 
 
 def _interesting_kv(key: str, value: str) -> bool:
     key_l = key.strip().lower()
-    value = (value or "").strip().strip("'\"")
+    if key_l.startswith("appsetting_"):
+        key_l = key_l[len("appsetting_") :]
+    value = (value or "").strip().replace("\r", "").strip().strip("'\"")
     if key_l in _NON_SECRET_KEYS:
+        return False
+    if _is_noise_env_key(key):
+        return False
+    if any(marker in key_l for marker in _IGNORED_ENV_KEY_MARKERS):
+        return False
+    if value.lower().startswith("sk_test_"):
+        return False
+    # SMTP/mail blocks are handled by extract_smtp — avoid duplicate env rows.
+    if _SMTP_ENV_RE.match(key):
         return False
     if key_l in GENERIC_ENV_KV_NAMES or key_l.startswith("keyword"):
         return False
@@ -141,7 +202,17 @@ def extract_secrets(text: str, source_url: str = "", redact_values: bool = True)
 
     # Parser pass: env + json
     env = _parse_env(text)
+    aws_access = env.get("AWS_ACCESS_KEY_ID") or env.get("AWS_ACCESS_KEY") or ""
+    aws_secret = env.get("AWS_SECRET_ACCESS_KEY") or env.get("AWS_SECRET_KEY") or ""
+    paired_access: set[str] = set()
+    if re.fullmatch(r"(?:AKIA|ASIA|ABIA|ANPA)[0-9A-Z]{16}", aws_access) and aws_secret:
+        add("aws_cred", f"{aws_access}:{aws_secret}", evidence="AWS_ACCESS_KEY_ID+AWS_SECRET_ACCESS_KEY", conf=0.95)
+        paired_access.add(aws_access)
+
     for k, v in env.items():
+        key_u = k.upper()
+        if key_u in {"AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_SESSION_TOKEN"}:
+            continue
         if _interesting_kv(k, v):
             add("env", f"{k}={v}", evidence=f"{k}=***")
 
@@ -151,11 +222,19 @@ def extract_secrets(text: str, source_url: str = "", redact_values: bool = True)
             if isinstance(v, (str, int, float)) and _interesting_kv(str(k), str(v)):
                 add("env", f"{k}={v}", evidence=f"{k}=***")
 
-    # Regex packs
+    # Regex packs — sk_test_ is never emitted.
+    seen_token_values: set[str] = set()
     for _, pack in P.PATTERN_PACKS.items():
         for kind, regex in pack:
             for m in regex.finditer(text):
                 val = P.first_group(m)
+                if not val:
+                    continue
+                if val.lower().startswith("sk_test_") or kind == "stripe_test":
+                    continue
+                if val in seen_token_values:
+                    continue
+                seen_token_values.add(val)
                 add(kind, val, evidence=P.context_window(text, m.start(), m.end()))
 
     # Azure connection string
@@ -192,13 +271,17 @@ def extract_secrets(text: str, source_url: str = "", redact_values: bool = True)
     # AWS access + nearby secret as one ``access:secret`` value.
     for am in P.AWS_ACCESS_KEY.finditer(text):
         ak = am.group(1)
-        window = text[max(0, am.start() - 300) : am.end() + 300]
-        secrets = P.AWS_SECRET_KEY.findall(window)
+        if ak in paired_access:
+            continue
+        window = text[max(0, am.start() - 500) : am.end() + 500]
+        secrets = P.AWS_SECRET_KEY.findall(window) + P.AWS_SECRET_ASSIGN.findall(window)
         paired = False
         for sk in secrets:
-            if re.search(r"[A-Z]", sk) and re.search(r"[0-9]", sk):
+            if re.search(r"[A-Za-z]", sk) and re.search(r"[0-9/+=]", sk):
                 add("aws_cred", f"{ak}:{sk}", evidence=P.context_window(text, am.start(), am.end()), conf=0.92)
+                paired_access.add(ak)
                 paired = True
+                break
         if not paired:
             add("aws_access_key", ak, evidence=P.context_window(text, am.start(), am.end()), conf=0.88)
 

@@ -24,6 +24,10 @@ PLACEHOLDER_PATTERNS = [
         r"^todo$",
         r"^fix$",
         r"^secret$",
+        r"^some[-_]?secret([-_]?key)?$",
+        r"^secret[-_]?key$",
+        r"^your[-_]?secret([-_]?key)?$",
+        r"^my[-_]?secret([-_]?key)?$",
         r"^apikey$",
         r"^api_key$",
         r"^token$",
@@ -36,6 +40,7 @@ PLACEHOLDER_PATTERNS = [
         r"^1234+$",
         r"^0{6,}$",
         r"^replace[_-]?me$",
+        r"^replace[_-]?me[_-].+",
         r"^insert[_-]?.*$",
         r"^<.*>$",
         r"^\[.*\]$",
@@ -49,8 +54,18 @@ PLACEHOLDER_PATTERNS = [
         r"^local[_-]?pass(word)?$",
         r"^dev[_-]?pass(word)?$",
         r"^default[_-]?pass(word)?$",
+        r"^true$",
+        r"^false$",
+        r"^yes$",
+        r"^no$",
+        r"^on$",
+        r"^off$",
     ]
 ]
+
+BOOLISH_VALUES = frozenset({
+    "true", "false", "yes", "no", "on", "off", "1", "0", "null", "undefined",
+})
 
 LOW_VALUE_HOSTS = {
     "example.com",
@@ -111,6 +126,10 @@ def looks_like_js_expression(value: str) -> bool:
     return False
 
 
+def is_boolish_value(value: str) -> bool:
+    return (value or "").strip().strip("'\"").lower() in BOOLISH_VALUES
+
+
 def is_useless_env_assignment(value: str) -> bool:
     """True for stored ``KEY=VALUE`` env rows that are JS/query noise."""
     raw = (value or "").strip()
@@ -120,6 +139,8 @@ def is_useless_env_assignment(value: str) -> bool:
     lhs_l = lhs.strip().lower()
     rhs_s = rhs.strip().strip("'\"")
     if lhs_l in GENERIC_ENV_KV_NAMES or lhs_l.startswith("keyword"):
+        return True
+    if is_boolish_value(rhs_s):
         return True
     if looks_like_js_expression(rhs_s) or is_placeholder(rhs_s):
         return True
@@ -135,6 +156,7 @@ def looks_like_secret(value: str, min_entropy: float = 3.0, min_len: int = 12) -
     # structured keys can be shorter entropy but strong format
     if re.match(r"^(AKIA|ASIA|ghp_|gho_|glpat-|SG\.|sk_live_|sk-ant-|xox)", v):
         return True
+    # sk_test_ intentionally excluded — test keys are not reported.
     return shannon_entropy(v) >= min_entropy
 
 
