@@ -633,6 +633,7 @@ def create_app() -> FastAPI:
             status="unknown",
         )
         # Probe once on create so the card shows Online/Offline immediately.
+        # SSH resolves via Amazon VPC DNS (private IP when peer is in same VPC).
         metrics = await asyncio.to_thread(collect_metrics, server)
         server.metrics = metrics
         server.status = "online" if metrics.get("online") else "offline"
@@ -692,6 +693,12 @@ def create_app() -> FastAPI:
         server.metrics = metrics
         server.status = "online" if metrics.get("online") else "offline"
         server.last_error = str(metrics.get("error") or "") if not result.get("ok") else ""
+        server.last_install = {
+            "ok": bool(result.get("ok")),
+            "message": str(result.get("message") or ""),
+            "exit_code": result.get("exit_code"),
+            "at": result.get("at") or "",
+        }
         ssh_store.upsert(server)
         return {"server": public_server_dict(server), **result}
 

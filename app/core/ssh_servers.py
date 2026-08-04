@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import random
+import re
+import socket
+import struct
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.request import Request, urlopen
 
 
 @dataclass
@@ -23,8 +31,13 @@ class SshServer:
     private_key: str = ""
     password: str = ""
     label: str = ""
+    # Kept for backward-compatible JSON only — not exposed in the UI.
+    connect_ip: str = ""
+    # Last IP that successfully completed an SSH probe (DNS-flap cache).
+    last_ok_ip: str = ""
     status: str = "unknown"  # online | offline | unknown
     last_error: str = ""
+    last_install: dict[str, Any] = field(default_factory=dict)
     metrics: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
@@ -34,6 +47,246 @@ class SshServer:
 
     def endpoint(self) -> str:
         return f"{self.host}:{self.port}"
+
+
+_SSH_SERVER_FIELDS = {f.name for f in fields(SshServer)}
+
+# Short-lived DNS cache — Route 53 Resolver soft-limits ~1024 pps/ENI.
+_DNS_CACHE: dict[str, tuple[float, list[str]]] = {}
+_DNS_CACHE_LOCK = threading.Lock()
+_DNS_CACHE_TTL = 30.0
+_VPC_DNS_CACHE: str = ""
+_VPC_DNS_LOCK = threading.Lock()
+
+
+def _server_from_row(row: dict[str, Any]) -> SshServer:
+    return SshServer(**{key: value for key, value in row.items() if key in _SSH_SERVER_FIELDS})
+
+
+def friendly_ssh_error(message: str) -> str:
+    """Rewrite common OpenSSH failures into operator-facing text."""
+    text = (message or "").strip()
+    low = text.lower()
+    if (
+        "could not resolve hostname" in low
+        or "name or service not known" in low
+        or "temporary failure in name resolution" in low
+    ):
+        return (
+            "Could not resolve hostname — controller DNS is overloaded. "
+            "Retry in a moment (SSH now queries Amazon VPC DNS directly)."
+        )
+    if "connection timed out" in low or text == "ssh timeout" or "timed out" in low:
+        return (
+            "SSH timed out on port 22. Per AWS docs, EC2 public DNS resolves to the "
+            "private IP only when the peer is in the same VPC. Put the host in this VPC "
+            "and allow TCP 22 from this controller's security group (or VPC CIDR)."
+        )
+    if "permission denied" in low:
+        return "SSH auth failed — check username / key / password."
+    if "connection refused" in low:
+        return "SSH connection refused — is sshd running on port 22?"
+    return text
+
+
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address((value or "").strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _is_private_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address((value or "").strip()).is_private
+    except ValueError:
+        return False
+
+
+def _imds_get(path: str, token: str = "", timeout: float = 1.5) -> str:
+    headers = {"X-aws-ec2-metadata-token": token} if token else {}
+    with urlopen(Request(f"http://169.254.169.254{path}", headers=headers), timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="ignore").strip()
+
+
+def amazon_vpc_dns_server() -> str:
+    """Amazon DNS is at VPC base + 2 (docs.aws.amazon.com VPC AmazonDNS)."""
+    global _VPC_DNS_CACHE
+    with _VPC_DNS_LOCK:
+        if _VPC_DNS_CACHE:
+            return _VPC_DNS_CACHE
+    candidates = ["172.31.0.2", "169.254.169.253"]
+    try:
+        req = Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        with urlopen(req, timeout=1.5) as resp:
+            token = resp.read().decode("utf-8", errors="ignore").strip()
+        mac = _imds_get("/latest/meta-data/mac", token).splitlines()[0].strip()
+        cidr = _imds_get(f"/latest/meta-data/network/interfaces/macs/{mac}/vpc-ipv4-cidr-block", token)
+        if cidr:
+            network = ipaddress.ip_network(cidr, strict=False)
+            # VPC DNS = network address + 2
+            dns = str(network.network_address + 2)
+            candidates.insert(0, dns)
+    except Exception:
+        pass
+    chosen = candidates[0]
+    with _VPC_DNS_LOCK:
+        _VPC_DNS_CACHE = chosen
+    return chosen
+
+
+def _dns_a_query(nameserver: str, name: str, timeout: float = 1.5) -> list[str]:
+    """Tiny UDP DNS A lookup — bypasses flaky systemd-resolved stub hangs."""
+    host = (name or "").strip().rstrip(".")
+    if not host or _is_ip(host):
+        return [host] if host else []
+    tid = random.randint(0, 65535)
+    labels = b"".join(bytes([len(part)]) + part.encode("utf-8") for part in host.split(".")) + b"\x00"
+    req = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0) + labels + struct.pack(">HH", 1, 1)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(req, (nameserver, 53))
+        data, _ = sock.recvfrom(4096)
+    finally:
+        sock.close()
+    if len(data) < 12:
+        return []
+    ancount = struct.unpack(">H", data[6:8])[0]
+    pos = 12
+    while pos < len(data) and data[pos]:
+        pos += data[pos] + 1
+    pos += 5  # null + type + class
+    ips: list[str] = []
+    for _ in range(ancount):
+        if pos >= len(data):
+            break
+        if data[pos] & 0xC0 == 0xC0:
+            pos += 2
+        else:
+            while pos < len(data) and data[pos]:
+                pos += data[pos] + 1
+            pos += 1
+        if pos + 10 > len(data):
+            break
+        rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[pos : pos + 10])
+        pos += 10
+        rdata = data[pos : pos + rdlen]
+        pos += rdlen
+        if rtype == 1 and rdlen == 4:
+            ips.append(socket.inet_ntoa(rdata))
+    return ips
+
+
+# ec2-A-B-C-D.compute-1.amazonaws.com or ec2-A-B-C-D.us-east-1.compute.amazonaws.com
+_EC2_PUBLIC_DNS_RE = re.compile(
+    r"^ec2-(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})\.[\w.-]+\.amazonaws\.com$",
+    re.I,
+)
+
+
+def public_ip_from_ec2_hostname(host: str) -> str:
+    """Decode public IPv4 embedded in ec2-A-B-C-D.…amazonaws.com hostnames."""
+    match = _EC2_PUBLIC_DNS_RE.match((host or "").strip())
+    if not match:
+        return ""
+    ip = ".".join(match.groups())
+    return ip if _is_ip(ip) else ""
+
+
+def resolve_ssh_targets(host: str) -> list[str]:
+    """Resolve SSH host via Amazon VPC DNS (split-horizon → private IP in-VPC).
+
+    AWS docs: public DNS resolves to the private IP from inside the instance's
+    network / same VPC; outside it resolves to the public IP.
+    """
+    host = (host or "").strip()
+    if not host:
+        return []
+    if _is_ip(host):
+        return [host]
+
+    now = time.monotonic()
+    with _DNS_CACHE_LOCK:
+        cached = _DNS_CACHE.get(host.lower())
+        if cached and cached[0] > now:
+            return list(cached[1])
+
+    ips: list[str] = []
+    for ns in (amazon_vpc_dns_server(), "169.254.169.253"):
+        for _ in range(2):
+            try:
+                for ip in _dns_a_query(ns, host):
+                    if ip not in ips:
+                        ips.append(ip)
+                if ips:
+                    break
+            except OSError:
+                continue
+        if ips:
+            break
+    if not ips:
+        for _ in range(2):
+            try:
+                for fam, _t, _p, _c, sockaddr in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM):
+                    if fam == socket.AF_INET:
+                        ip = sockaddr[0]
+                        if ip not in ips:
+                            ips.append(ip)
+                if ips:
+                    break
+            except OSError:
+                continue
+
+    pub = public_ip_from_ec2_hostname(host)
+    if pub and pub not in ips:
+        ips.append(pub)
+
+    # Prefer VPC/private addresses — public EIP is often unreachable from controller.
+    ips.sort(key=lambda ip: (0 if _is_private_ip(ip) else 1, ip))
+    with _DNS_CACHE_LOCK:
+        _DNS_CACHE[host.lower()] = (now + _DNS_CACHE_TTL, list(ips))
+    return ips
+
+
+def choose_connect_host(server: SshServer) -> tuple[str, list[str]]:
+    """Return (preferred_host, candidates) for SSH — private IPs first."""
+    candidates: list[str] = []
+    if (server.last_ok_ip or "").strip():
+        candidates.append(server.last_ok_ip.strip())
+    # Legacy connect_ip from older JSON — still honor if present, but UI no longer sets it.
+    if (server.connect_ip or "").strip():
+        ip = server.connect_ip.strip()
+        if ip not in candidates:
+            candidates.insert(0, ip)
+    for ip in resolve_ssh_targets(server.host):
+        if ip not in candidates:
+            candidates.append(ip)
+    if not candidates:
+        return server.host, [server.host]
+    ordered = sorted(
+        candidates,
+        key=lambda ip: (
+            0 if ip == (server.last_ok_ip or "").strip() and _is_private_ip(ip) else 1,
+            0 if _is_private_ip(ip) else 1,
+            0 if ip == (server.connect_ip or "").strip() else 1,
+            ip,
+        ),
+    )
+    return ordered[0], ordered
+
+
+def tcp_check(host: str, port: int, timeout: float = 4.0) -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 class SshServerStore:
@@ -51,15 +304,19 @@ class SshServerStore:
             return []
 
     def _write(self, rows: list[dict[str, Any]]) -> None:
-        self.path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        # Atomic replace so a crash mid-write never wipes the fleet.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
 
     def list(self) -> list[SshServer]:
-        return [SshServer(**row) for row in self._read()]
+        return [_server_from_row(row) for row in self._read()]
 
     def get(self, server_id: str) -> Optional[SshServer]:
         for row in self._read():
             if row.get("id") == server_id:
-                return SshServer(**row)
+                return _server_from_row(row)
         return None
 
     def upsert(self, server: SshServer) -> SshServer:
@@ -121,60 +378,101 @@ def ssh_run(
     Prefer ``script=`` for multi-line bash; it is fed to ``bash -s`` on stdin
     so quoting/newlines stay intact.
 
-    Supports private-key auth (default) and password auth via ``SSH_ASKPASS``.
+    Connects via Amazon VPC DNS candidates (private IP first) and caches the
+    last working IP so DNS flaps under scan load do not break SSH.
     """
     keyfile = None
     askpass = None
     try:
-        cmd = [
-            "ssh",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=8",
-            "-o", "ServerAliveInterval=5",
-            "-p", str(int(server.port or 22)),
-        ]
         env = os.environ.copy()
         use_password = (server.auth_type or "").lower() == "password" and bool(server.password)
+        auth_opts: list[str] = []
         if use_password:
             askpass = _write_askpass()
             env["BB_SSH_PASS"] = server.password
             env["SSH_ASKPASS"] = askpass
             env["SSH_ASKPASS_REQUIRE"] = "force"
-            # SSH_ASKPASS requires DISPLAY to be set even for headless use.
             env.setdefault("DISPLAY", ":0")
-            cmd.extend([
+            auth_opts = [
                 "-o", "PreferredAuthentications=password,keyboard-interactive",
                 "-o", "PubkeyAuthentication=no",
                 "-o", "NumberOfPasswordPrompts=1",
                 "-o", "KbdInteractiveAuthentication=yes",
-            ])
+            ]
         else:
-            cmd.extend(["-o", "BatchMode=yes"])
+            auth_opts = ["-o", "BatchMode=yes"]
             if server.private_key.strip():
                 keyfile = _write_keyfile(server.private_key)
-                cmd.extend(["-i", keyfile])
+                auth_opts.extend(["-i", keyfile])
             elif not server.private_key.strip() and (server.auth_type or "key") == "key":
                 return 1, "", "private key is required for key auth"
-        cmd.append(f"{server.username}@{server.host}")
-        if script:
-            cmd.append("bash -s")
-        else:
-            cmd.append(remote_command or "true")
-        proc = subprocess.run(
-            cmd,
-            input=script or None,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            env=env,
-            start_new_session=True,
-        )
-        return proc.returncode, proc.stdout or "", proc.stderr or ""
-    except subprocess.TimeoutExpired as exc:
-        return 124, exc.stdout or "", exc.stderr or "ssh timeout"
+
+        _preferred, candidates = choose_connect_host(server)
+        port = int(server.port or 22)
+        reachable = [ip for ip in candidates if tcp_check(ip, port, timeout=2.5)]
+        try_hosts = reachable or candidates
+        last_rc, last_out, last_err = 1, "", "ssh failed"
+        per_host_timeout = max(8.0, min(float(timeout), 20.0))
+        for idx, target in enumerate(try_hosts):
+            remaining = float(timeout) - (idx * 3.0)
+            if remaining < 6.0 and idx > 0:
+                break
+            cmd = [
+                "ssh",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ConnectTimeout=8",
+                "-o", "ServerAliveInterval=5",
+                "-o", "ConnectionAttempts=1",
+                "-o", f"HostKeyAlias={server.host}",
+                "-p", str(port),
+                *auth_opts,
+                f"{server.username}@{target}",
+            ]
+            if script:
+                cmd.append("bash -s")
+            else:
+                cmd.append(remote_command or "true")
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=script or None,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(per_host_timeout, remaining if remaining > 0 else per_host_timeout),
+                    check=False,
+                    env=env,
+                    start_new_session=True,
+                )
+            except subprocess.TimeoutExpired as exc:
+                last_rc, last_out, last_err = 124, exc.stdout or "", friendly_ssh_error(exc.stderr or "ssh timeout")
+                continue
+            last_rc = proc.returncode
+            last_out = proc.stdout or ""
+            last_err = friendly_ssh_error(proc.stderr or "") if proc.returncode else (proc.stderr or "")
+            if proc.returncode == 0:
+                if _is_ip(target):
+                    server.last_ok_ip = target
+                return proc.returncode, last_out, last_err
+        if last_rc != 0:
+            resolved = ", ".join(candidates[:4]) or "none"
+            only_public = candidates and not any(_is_private_ip(ip) for ip in candidates)
+            if only_public:
+                hint = (
+                    f" Amazon VPC DNS returned only public IP(s): {resolved}. "
+                    "That means this host is not in the controller's VPC (AWS split-horizon). "
+                    "Launch the 2nd instance in the same VPC and allow TCP 22 from this "
+                    "controller's security group."
+                )
+            else:
+                hint = (
+                    f" Tried: {resolved}. Allow TCP 22 from this controller's security group "
+                    "(or VPC CIDR) on the target instance."
+                )
+            if hint not in last_err:
+                last_err = (last_err + hint).strip()
+        return last_rc, last_out, last_err
     except Exception as exc:
-        return 1, "", str(exc)
+        return 1, "", friendly_ssh_error(str(exc))
     finally:
         for path in (keyfile, askpass):
             if path:
@@ -268,7 +566,7 @@ def collect_metrics(server: SshServer) -> dict[str, Any]:
     if rc != 0:
         return {
             "online": False,
-            "error": (err or out or f"ssh exit {rc}").strip()[:300],
+            "error": friendly_ssh_error(err or out or f"ssh exit {rc}")[:300],
             "cpu_percent": 0,
             "memory_percent": 0,
             "disk_percent": 0,
@@ -324,13 +622,19 @@ echo OK
 
 def install_deps(server: SshServer) -> dict[str, Any]:
     rc, out, err = ssh_run(server, script=_INSTALL_SCRIPT, timeout=300)
-    ok = rc == 0 and "OK" in out
+    ok = rc == 0 and "OK" in (out or "")
+    message = (
+        "Dependencies installed on remote host (/opt/bb-scanner venv + packages)."
+        if ok
+        else friendly_ssh_error(err or out or "install failed")[:400]
+    )
     return {
         "ok": ok,
         "exit_code": rc,
-        "stdout": out[-4000:],
-        "stderr": err[-2000:],
-        "message": "Dependencies installed" if ok else (err or out or "install failed")[:400],
+        "stdout": (out or "")[-4000:],
+        "stderr": (err or "")[-2000:],
+        "message": message,
+        "at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -347,7 +651,7 @@ def preflight_server(server: SshServer) -> dict[str, Any]:
     ok = online and echo_ok
     error = ""
     if not ok:
-        error = (err or metrics.get("error") or out or "ssh preflight failed").strip()[:300]
+        error = friendly_ssh_error(err or metrics.get("error") or out or "ssh preflight failed")[:300]
     return {
         "id": server.id,
         "host": server.host,
@@ -410,6 +714,8 @@ def public_server_dict(server: SshServer) -> dict[str, Any]:
     data["has_key"] = bool(server.private_key.strip())
     data["has_password"] = bool(server.password)
     data["endpoint"] = server.endpoint()
+    # Hide legacy connect_ip from API responses — UI no longer uses it.
+    data.pop("connect_ip", None)
     return data
 
 
