@@ -902,13 +902,6 @@ td { padding: .65rem .55rem; border-top: 1px solid rgba(125,211,252,.08); color:
 .ssh-actions .btn-danger { background: #b91c1c; color: #fff; border: 1px solid rgba(254,202,202,.2); }
 .ssh-actions .btn-danger:hover { filter: brightness(1.08); }
 .ssh-error { color: #fca5a5; font-size: .68rem; min-height: .9rem; }
-.ssh-connect-ip { margin: .35rem 0 .45rem; }
-.ssh-connect-ip label {
-  display: block; color: var(--muted2); text-transform: uppercase;
-  letter-spacing: .06em; font-size: .6rem; margin-bottom: .3rem;
-}
-.ssh-connect-row { display: grid; grid-template-columns: 1fr auto auto; gap: .4rem; }
-.ssh-connect-row .input { font-size: .75rem; padding: .4rem .55rem; }
 .ssh-install {
   font-size: .68rem;
   line-height: 1.35;

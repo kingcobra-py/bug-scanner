@@ -11,8 +11,9 @@ import socket
 import struct
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,10 +31,9 @@ class SshServer:
     private_key: str = ""
     password: str = ""
     label: str = ""
-    # Optional IP used for the TCP/SSH connection (prefer VPC private IP).
-    # Display/label can keep the public DNS name in ``host``.
+    # Kept for backward-compatible JSON only — not exposed in the UI.
     connect_ip: str = ""
-    # Last IP that successfully completed an SSH probe.
+    # Last IP that successfully completed an SSH probe (DNS-flap cache).
     last_ok_ip: str = ""
     status: str = "unknown"  # online | offline | unknown
     last_error: str = ""
@@ -51,6 +51,13 @@ class SshServer:
 
 _SSH_SERVER_FIELDS = {f.name for f in fields(SshServer)}
 
+# Short-lived DNS cache — Route 53 Resolver soft-limits ~1024 pps/ENI.
+_DNS_CACHE: dict[str, tuple[float, list[str]]] = {}
+_DNS_CACHE_LOCK = threading.Lock()
+_DNS_CACHE_TTL = 30.0
+_VPC_DNS_CACHE: str = ""
+_VPC_DNS_LOCK = threading.Lock()
+
 
 def _server_from_row(row: dict[str, Any]) -> SshServer:
     return SshServer(**{key: value for key, value in row.items() if key in _SSH_SERVER_FIELDS})
@@ -60,16 +67,20 @@ def friendly_ssh_error(message: str) -> str:
     """Rewrite common OpenSSH failures into operator-facing text."""
     text = (message or "").strip()
     low = text.lower()
-    if "could not resolve hostname" in low or "name or service not known" in low or "temporary failure in name resolution" in low:
+    if (
+        "could not resolve hostname" in low
+        or "name or service not known" in low
+        or "temporary failure in name resolution" in low
+    ):
         return (
-            "Could not resolve hostname — controller DNS is flaky under load. "
-            "Set Connect IP to the EC2 private IP (Network tab) and retry."
+            "Could not resolve hostname — controller DNS is overloaded. "
+            "Retry in a moment (SSH now queries Amazon VPC DNS directly)."
         )
     if "connection timed out" in low or text == "ssh timeout" or "timed out" in low:
         return (
-            "SSH timed out from this controller on port 22. Public EC2 DNS often "
-            "resolves to a public IP that this controller cannot reach. Set "
-            "Connect IP to the instance private IP and allow TCP 22 from this controller."
+            "SSH timed out on port 22. Per AWS docs, EC2 public DNS resolves to the "
+            "private IP only when the peer is in the same VPC. Put the host in this VPC "
+            "and allow TCP 22 from this controller's security group (or VPC CIDR)."
         )
     if "permission denied" in low:
         return "SSH auth failed — check username / key / password."
@@ -93,8 +104,44 @@ def _is_private_ip(value: str) -> bool:
         return False
 
 
+def _imds_get(path: str, token: str = "", timeout: float = 1.5) -> str:
+    headers = {"X-aws-ec2-metadata-token": token} if token else {}
+    with urlopen(Request(f"http://169.254.169.254{path}", headers=headers), timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="ignore").strip()
+
+
+def amazon_vpc_dns_server() -> str:
+    """Amazon DNS is at VPC base + 2 (docs.aws.amazon.com VPC AmazonDNS)."""
+    global _VPC_DNS_CACHE
+    with _VPC_DNS_LOCK:
+        if _VPC_DNS_CACHE:
+            return _VPC_DNS_CACHE
+    candidates = ["172.31.0.2", "169.254.169.253"]
+    try:
+        req = Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        with urlopen(req, timeout=1.5) as resp:
+            token = resp.read().decode("utf-8", errors="ignore").strip()
+        mac = _imds_get("/latest/meta-data/mac", token).splitlines()[0].strip()
+        cidr = _imds_get(f"/latest/meta-data/network/interfaces/macs/{mac}/vpc-ipv4-cidr-block", token)
+        if cidr:
+            network = ipaddress.ip_network(cidr, strict=False)
+            # VPC DNS = network address + 2
+            dns = str(network.network_address + 2)
+            candidates.insert(0, dns)
+    except Exception:
+        pass
+    chosen = candidates[0]
+    with _VPC_DNS_LOCK:
+        _VPC_DNS_CACHE = chosen
+    return chosen
+
+
 def _dns_a_query(nameserver: str, name: str, timeout: float = 1.5) -> list[str]:
-    """Tiny UDP DNS A lookup — avoids flaky systemd-resolved stub hangs."""
+    """Tiny UDP DNS A lookup — bypasses flaky systemd-resolved stub hangs."""
     host = (name or "").strip().rstrip(".")
     if not host or _is_ip(host):
         return [host] if host else []
@@ -112,7 +159,6 @@ def _dns_a_query(nameserver: str, name: str, timeout: float = 1.5) -> list[str]:
         return []
     ancount = struct.unpack(">H", data[6:8])[0]
     pos = 12
-    # skip question
     while pos < len(data) and data[pos]:
         pos += data[pos] + 1
     pos += 5  # null + type + class
@@ -137,43 +183,6 @@ def _dns_a_query(nameserver: str, name: str, timeout: float = 1.5) -> list[str]:
     return ips
 
 
-def resolve_ssh_targets(host: str) -> list[str]:
-    """Resolve SSH host to candidate IPs (private addresses first)."""
-    host = (host or "").strip()
-    if not host:
-        return []
-    if _is_ip(host):
-        return [host]
-    ips: list[str] = []
-    for ns in ("172.31.0.2", "127.0.0.53"):
-        for _ in range(2):
-            try:
-                for ip in _dns_a_query(ns, host):
-                    if ip not in ips:
-                        ips.append(ip)
-                if ips:
-                    break
-            except OSError:
-                continue
-        if ips:
-            break
-    if not ips:
-        for _ in range(3):
-            try:
-                for fam, _t, _p, _c, sockaddr in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM):
-                    if fam == socket.AF_INET:
-                        ip = sockaddr[0]
-                        if ip not in ips:
-                            ips.append(ip)
-                if ips:
-                    break
-            except OSError:
-                continue
-    # Prefer VPC/private addresses — public EIP is often unreachable from controller.
-    ips.sort(key=lambda ip: (0 if _is_private_ip(ip) else 1, ip))
-    return ips
-
-
 # ec2-A-B-C-D.compute-1.amazonaws.com or ec2-A-B-C-D.us-east-1.compute.amazonaws.com
 _EC2_PUBLIC_DNS_RE = re.compile(
     r"^ec2-(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})\.[\w.-]+\.amazonaws\.com$",
@@ -190,29 +199,85 @@ def public_ip_from_ec2_hostname(host: str) -> str:
     return ip if _is_ip(ip) else ""
 
 
+def resolve_ssh_targets(host: str) -> list[str]:
+    """Resolve SSH host via Amazon VPC DNS (split-horizon → private IP in-VPC).
+
+    AWS docs: public DNS resolves to the private IP from inside the instance's
+    network / same VPC; outside it resolves to the public IP.
+    """
+    host = (host or "").strip()
+    if not host:
+        return []
+    if _is_ip(host):
+        return [host]
+
+    now = time.monotonic()
+    with _DNS_CACHE_LOCK:
+        cached = _DNS_CACHE.get(host.lower())
+        if cached and cached[0] > now:
+            return list(cached[1])
+
+    ips: list[str] = []
+    for ns in (amazon_vpc_dns_server(), "169.254.169.253"):
+        for _ in range(2):
+            try:
+                for ip in _dns_a_query(ns, host):
+                    if ip not in ips:
+                        ips.append(ip)
+                if ips:
+                    break
+            except OSError:
+                continue
+        if ips:
+            break
+    if not ips:
+        for _ in range(2):
+            try:
+                for fam, _t, _p, _c, sockaddr in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM):
+                    if fam == socket.AF_INET:
+                        ip = sockaddr[0]
+                        if ip not in ips:
+                            ips.append(ip)
+                if ips:
+                    break
+            except OSError:
+                continue
+
+    pub = public_ip_from_ec2_hostname(host)
+    if pub and pub not in ips:
+        ips.append(pub)
+
+    # Prefer VPC/private addresses — public EIP is often unreachable from controller.
+    ips.sort(key=lambda ip: (0 if _is_private_ip(ip) else 1, ip))
+    with _DNS_CACHE_LOCK:
+        _DNS_CACHE[host.lower()] = (now + _DNS_CACHE_TTL, list(ips))
+    return ips
+
+
 def choose_connect_host(server: SshServer) -> tuple[str, list[str]]:
-    """Return (connect_host, candidates) for SSH."""
-    if (server.connect_ip or "").strip():
-        ip = server.connect_ip.strip()
-        return ip, [ip]
+    """Return (preferred_host, candidates) for SSH — private IPs first."""
     candidates: list[str] = []
     if (server.last_ok_ip or "").strip():
         candidates.append(server.last_ok_ip.strip())
+    # Legacy connect_ip from older JSON — still honor if present, but UI no longer sets it.
+    if (server.connect_ip or "").strip():
+        ip = server.connect_ip.strip()
+        if ip not in candidates:
+            candidates.insert(0, ip)
     for ip in resolve_ssh_targets(server.host):
         if ip not in candidates:
             candidates.append(ip)
-    pub = public_ip_from_ec2_hostname(server.host)
-    if pub and pub not in candidates:
-        candidates.append(pub)
     if not candidates:
-        # Last resort: let OpenSSH try the raw hostname.
         return server.host, [server.host]
-    # Prefer private IPs, but keep last_ok_ip first when present.
-    head = candidates[0]
-    rest = sorted(candidates[1:], key=lambda ip: (0 if _is_private_ip(ip) else 1, ip))
-    ordered = [head] + [ip for ip in rest if ip != head]
-    if not _is_private_ip(head):
-        ordered = sorted(candidates, key=lambda ip: (0 if _is_private_ip(ip) else 1, ip))
+    ordered = sorted(
+        candidates,
+        key=lambda ip: (
+            0 if ip == (server.last_ok_ip or "").strip() and _is_private_ip(ip) else 1,
+            0 if _is_private_ip(ip) else 1,
+            0 if ip == (server.connect_ip or "").strip() else 1,
+            ip,
+        ),
+    )
     return ordered[0], ordered
 
 
@@ -222,248 +287,6 @@ def tcp_check(host: str, port: int, timeout: float = 4.0) -> bool:
             return True
     except OSError:
         return False
-
-
-def _controller_vpc_cidr() -> str:
-    """Best-effort VPC CIDR from IMDS (falls back to common EC2 default)."""
-    try:
-        req = Request(
-            "http://169.254.169.254/latest/api/token",
-            method="PUT",
-            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
-        )
-        with urlopen(req, timeout=1.5) as resp:
-            token = resp.read().decode("utf-8", errors="ignore").strip()
-        headers = {"X-aws-ec2-metadata-token": token} if token else {}
-        with urlopen(Request("http://169.254.169.254/latest/meta-data/network/interfaces/macs/", headers=headers), timeout=1.5) as resp:
-            mac = resp.read().decode("utf-8", errors="ignore").splitlines()[0].strip()
-        with urlopen(
-            Request(
-                f"http://169.254.169.254/latest/meta-data/network/interfaces/macs/{mac}vpc-ipv4-cidr-block",
-                headers=headers,
-            ),
-            timeout=1.5,
-        ) as resp:
-            cidr = resp.read().decode("utf-8", errors="ignore").strip()
-            if cidr:
-                return cidr
-    except Exception:
-        pass
-    return "172.31.0.0/16"
-
-
-def _remote_identity_ips(server: SshServer, target_ip: str) -> dict[str, str]:
-    """SSH to target and read private/public IPs from the instance."""
-    remote = (
-        "priv=$(hostname -I 2>/dev/null | awk '{print $1}'); "
-        "pub=''; "
-        "if [ -n \"$(curl -s -m 1 -X PUT http://169.254.169.254/latest/api/token "
-        "-H 'X-aws-ec2-metadata-token-ttl-seconds: 30' 2>/dev/null)\" ]; then "
-        "T=$(curl -s -m 1 -X PUT http://169.254.169.254/latest/api/token "
-        "-H 'X-aws-ec2-metadata-token-ttl-seconds: 30'); "
-        "pub=$(curl -s -m 1 -H \"X-aws-ec2-metadata-token: $T\" "
-        "http://169.254.169.254/latest/meta-data/public-ipv4); "
-        "ph=$(curl -s -m 1 -H \"X-aws-ec2-metadata-token: $T\" "
-        "http://169.254.169.254/latest/meta-data/public-hostname); "
-        "else pub=$(curl -s -m 1 http://169.254.169.254/latest/meta-data/public-ipv4); "
-        "ph=$(curl -s -m 1 http://169.254.169.254/latest/meta-data/public-hostname); fi; "
-        "echo PRIV:$priv; echo PUB:$pub; echo PH:$ph"
-    )
-    # Temporarily force this candidate only.
-    saved_connect = server.connect_ip
-    server.connect_ip = target_ip
-    try:
-        rc, out, _err = ssh_run(server, remote, timeout=18)
-    finally:
-        server.connect_ip = saved_connect
-    if rc != 0:
-        return {}
-    data: dict[str, str] = {}
-    for line in (out or "").splitlines():
-        if line.startswith("PRIV:"):
-            data["private_ip"] = line.split(":", 1)[1].strip()
-        elif line.startswith("PUB:"):
-            data["public_ip"] = line.split(":", 1)[1].strip()
-        elif line.startswith("PH:"):
-            data["public_hostname"] = line.split(":", 1)[1].strip()
-    return data
-
-
-def _ec2_api_private_ip(host: str, public_ip: str) -> str:
-    """Optional boto3 lookup when AWS credentials/instance role exist."""
-    try:
-        import boto3  # type: ignore
-    except Exception:
-        return ""
-    try:
-        client = boto3.client("ec2")
-        filters = []
-        if public_ip:
-            filters = [{"Name": "ip-address", "Values": [public_ip]}]
-        elif host:
-            filters = [{"Name": "dns-name", "Values": [host]}]
-        if not filters:
-            return ""
-        resp = client.describe_instances(Filters=filters)
-        for reservation in resp.get("Reservations") or []:
-            for instance in reservation.get("Instances") or []:
-                priv = (instance.get("PrivateIpAddress") or "").strip()
-                if priv:
-                    return priv
-    except Exception:
-        return ""
-    return ""
-
-
-def _vpc_key_probe_private_ip(server: SshServer, want_public_ip: str, *, budget_sec: float = 55.0) -> str:
-    """Find the instance on the VPC by SSH key + public IP/hostname match."""
-    if (server.auth_type or "key") == "password" or not (server.private_key or "").strip():
-        return ""
-    try:
-        network = ipaddress.ip_network(_controller_vpc_cidr(), strict=False)
-    except ValueError:
-        return ""
-    hosts = [str(ip) for ip in network.hosts()]
-    port = int(server.port or 22)
-    start = datetime.now(timezone.utc).timestamp()
-
-    # Phase 1: fast TCP/22 sweep of the VPC.
-    open_ips: list[str] = []
-    with ThreadPoolExecutor(max_workers=350) as pool:
-        futures = {pool.submit(tcp_check, ip, port, 0.15): ip for ip in hosts}
-        for fut in as_completed(futures):
-            if datetime.now(timezone.utc).timestamp() - start > budget_sec * 0.7:
-                break
-            try:
-                if fut.result():
-                    open_ips.append(futures[fut])
-            except Exception:
-                continue
-        for fut in futures:
-            fut.cancel()
-
-    want_host = (server.host or "").strip().lower()
-    # Phase 2: SSH identity check only on open ports.
-    for ip in open_ips:
-        if datetime.now(timezone.utc).timestamp() - start > budget_sec:
-            break
-        try:
-            ident = _remote_identity_ips(server, ip)
-        except Exception:
-            continue
-        priv = (ident.get("private_ip") or "").strip()
-        pub = (ident.get("public_ip") or "").strip()
-        ph = (ident.get("public_hostname") or "").strip().lower()
-        if want_public_ip and (pub == want_public_ip or ph == want_host):
-            return priv or ip
-        if not want_public_ip and (ph == want_host or priv):
-            return priv or ip
-    return ""
-
-
-def auto_detect_connect_ip(server: SshServer, *, deep: bool = False) -> dict[str, Any]:
-    """Detect a working private connect IP for this server.
-
-    Fast path: DNS private answers, hostname-decoded public IP + SSH identity.
-    Deep path: optional AWS API + bounded VPC key probe.
-    """
-    host = (server.host or "").strip()
-    want_public = public_ip_from_ec2_hostname(host)
-    methods: list[str] = []
-
-    # Already have a working private connect IP.
-    if (server.connect_ip or "").strip() and _is_private_ip(server.connect_ip):
-        if tcp_check(server.connect_ip.strip(), int(server.port or 22), timeout=2.0):
-            return {
-                "ok": True,
-                "connect_ip": server.connect_ip.strip(),
-                "method": "existing_connect_ip",
-                "message": f"Using existing Connect IP {server.connect_ip.strip()}",
-            }
-
-    # 1) DNS / hostname candidates
-    _pref, candidates = choose_connect_host(server)
-    for ip in candidates:
-        if _is_private_ip(ip):
-            methods.append(f"dns_private:{ip}")
-            server.connect_ip = ip
-            server.last_ok_ip = ip
-            return {
-                "ok": True,
-                "connect_ip": ip,
-                "method": "dns_private",
-                "message": f"Detected private IP {ip} via DNS",
-                "candidates": candidates[:8],
-            }
-
-    # 2) SSH to any reachable candidate and read metadata private IP
-    for ip in candidates:
-        if not tcp_check(ip, int(server.port or 22), timeout=2.5):
-            continue
-        ident = _remote_identity_ips(server, ip)
-        priv = (ident.get("private_ip") or "").strip()
-        pub = (ident.get("public_ip") or "").strip()
-        if priv and _is_private_ip(priv):
-            if want_public and pub and pub != want_public:
-                continue
-            server.connect_ip = priv
-            server.last_ok_ip = priv
-            return {
-                "ok": True,
-                "connect_ip": priv,
-                "method": "ssh_metadata",
-                "message": f"Detected private IP {priv} via SSH metadata",
-                "candidates": candidates[:8],
-            }
-        if _is_private_ip(ip):
-            server.connect_ip = ip
-            server.last_ok_ip = ip
-            return {
-                "ok": True,
-                "connect_ip": ip,
-                "method": "ssh_private_candidate",
-                "message": f"Connected via private IP {ip}",
-                "candidates": candidates[:8],
-            }
-
-    # 3) AWS API (optional)
-    api_ip = _ec2_api_private_ip(host, want_public)
-    if api_ip:
-        server.connect_ip = api_ip
-        return {
-            "ok": True,
-            "connect_ip": api_ip,
-            "method": "ec2_api",
-            "message": f"Detected private IP {api_ip} via EC2 API",
-            "candidates": candidates[:8],
-        }
-
-    # 4) Deep VPC probe with this server's key, match public IP/hostname
-    if deep:
-        probed = _vpc_key_probe_private_ip(server, want_public, budget_sec=50.0)
-        if probed:
-            server.connect_ip = probed
-            server.last_ok_ip = probed
-            return {
-                "ok": True,
-                "connect_ip": probed,
-                "method": "vpc_key_probe",
-                "message": f"Detected private IP {probed} by scanning VPC with your SSH key",
-                "candidates": candidates[:8],
-            }
-
-    return {
-        "ok": False,
-        "connect_ip": "",
-        "method": "none",
-        "message": (
-            "Could not auto-detect private IP. This controller cannot reach the "
-            "public IP on port 22 right now, and VPC DNS did not return a private "
-            "address. Open SG TCP 22 from this controller, or paste the private IP."
-        ),
-        "candidates": candidates[:8],
-        "public_ip": want_public,
-    }
 
 
 class SshServerStore:
@@ -481,7 +304,11 @@ class SshServerStore:
             return []
 
     def _write(self, rows: list[dict[str, Any]]) -> None:
-        self.path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        # Atomic replace so a crash mid-write never wipes the fleet.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
 
     def list(self) -> list[SshServer]:
         return [_server_from_row(row) for row in self._read()]
@@ -551,12 +378,8 @@ def ssh_run(
     Prefer ``script=`` for multi-line bash; it is fed to ``bash -s`` on stdin
     so quoting/newlines stay intact.
 
-    Supports private-key auth (default) and password auth via ``SSH_ASKPASS``.
-
-    Connection target preference:
-    1. ``connect_ip`` (explicit private IP)
-    2. ``last_ok_ip``
-    3. DNS candidates with private IPs first
+    Connects via Amazon VPC DNS candidates (private IP first) and caches the
+    last working IP so DNS flaps under scan load do not break SSH.
     """
     keyfile = None
     askpass = None
@@ -569,7 +392,6 @@ def ssh_run(
             env["BB_SSH_PASS"] = server.password
             env["SSH_ASKPASS"] = askpass
             env["SSH_ASKPASS_REQUIRE"] = "force"
-            # SSH_ASKPASS requires DISPLAY to be set even for headless use.
             env.setdefault("DISPLAY", ":0")
             auth_opts = [
                 "-o", "PreferredAuthentications=password,keyboard-interactive",
@@ -587,13 +409,11 @@ def ssh_run(
 
         _preferred, candidates = choose_connect_host(server)
         port = int(server.port or 22)
-        # Drop candidates that fail a quick TCP probe when we have alternatives.
-        reachable = [ip for ip in candidates if tcp_check(ip, port, timeout=3.0)]
+        reachable = [ip for ip in candidates if tcp_check(ip, port, timeout=2.5)]
         try_hosts = reachable or candidates
         last_rc, last_out, last_err = 1, "", "ssh failed"
         per_host_timeout = max(8.0, min(float(timeout), 20.0))
         for idx, target in enumerate(try_hosts):
-            # Budget remaining wall time across candidates.
             remaining = float(timeout) - (idx * 3.0)
             if remaining < 6.0 and idx > 0:
                 break
@@ -630,18 +450,24 @@ def ssh_run(
             last_out = proc.stdout or ""
             last_err = friendly_ssh_error(proc.stderr or "") if proc.returncode else (proc.stderr or "")
             if proc.returncode == 0:
-                # Remember working IP for later probes (survives DNS flapping).
                 if _is_ip(target):
                     server.last_ok_ip = target
-                    if not (server.connect_ip or "").strip() and _is_private_ip(target):
-                        server.connect_ip = target
                 return proc.returncode, last_out, last_err
-        if last_rc != 0 and not (server.connect_ip or "").strip():
+        if last_rc != 0:
             resolved = ", ".join(candidates[:4]) or "none"
-            hint = (
-                f" Tried: {resolved}. Set Connect IP to the EC2 private IP from the "
-                "AWS console Network tab."
-            )
+            only_public = candidates and not any(_is_private_ip(ip) for ip in candidates)
+            if only_public:
+                hint = (
+                    f" Amazon VPC DNS returned only public IP(s): {resolved}. "
+                    "That means this host is not in the controller's VPC (AWS split-horizon). "
+                    "Launch the 2nd instance in the same VPC and allow TCP 22 from this "
+                    "controller's security group."
+                )
+            else:
+                hint = (
+                    f" Tried: {resolved}. Allow TCP 22 from this controller's security group "
+                    "(or VPC CIDR) on the target instance."
+                )
             if hint not in last_err:
                 last_err = (last_err + hint).strip()
         return last_rc, last_out, last_err
@@ -888,6 +714,8 @@ def public_server_dict(server: SshServer) -> dict[str, Any]:
     data["has_key"] = bool(server.private_key.strip())
     data["has_password"] = bool(server.password)
     data["endpoint"] = server.endpoint()
+    # Hide legacy connect_ip from API responses — UI no longer uses it.
+    data.pop("connect_ip", None)
     return data
 
 

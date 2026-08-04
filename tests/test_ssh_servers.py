@@ -269,18 +269,17 @@ def test_store_preserves_last_install(tmp_path):
     assert "Dependencies installed" in got.last_install["message"]
 
 
-def test_choose_connect_host_prefers_connect_ip():
+def test_choose_connect_host_prefers_private_last_ok():
     from app.core.ssh_servers import choose_connect_host
 
     server = SshServer(
         id="n1",
         host="ec2-44-212-73-124.compute-1.amazonaws.com",
-        connect_ip="172.31.89.224",
-        last_ok_ip="44.212.73.124",
+        last_ok_ip="172.31.89.224",
     )
     host, candidates = choose_connect_host(server)
     assert host == "172.31.89.224"
-    assert candidates == ["172.31.89.224"]
+    assert "172.31.89.224" in candidates
 
 
 def test_private_ip_helper():
@@ -304,3 +303,11 @@ def test_choose_connect_host_includes_decoded_public_ip():
     server = SshServer(id="n2", host="ec2-10-0-0-5.compute-1.amazonaws.com")
     _host, candidates = choose_connect_host(server)
     assert "10.0.0.5" in candidates
+
+
+def test_friendly_ssh_error_mentions_same_vpc():
+    from app.core.ssh_servers import friendly_ssh_error
+
+    msg = friendly_ssh_error("ssh timeout").lower()
+    assert "same vpc" in msg
+    assert "connect ip" not in msg
