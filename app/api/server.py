@@ -239,19 +239,29 @@ manager = ConnectionManager()
 _loop: Optional[asyncio.AbstractEventLoop] = None
 _RESULTS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _RESULTS_CACHE_LOCK = threading.Lock()
-_RESULTS_CACHE_TTL_SEC = 30.0
+_RESULTS_CACHE_TTL_SEC = 180.0
+# Serve an expired payload while a background rebuild runs so Results does not
+# block the UI for another full aggregation after TTL.
+_RESULTS_STALE_GRACE_SEC = 900.0
+_RESULTS_REFRESHING: set[str] = set()
 
 
-def _results_cache_get(cache_key: str) -> Optional[dict[str, Any]]:
+def _results_cache_get(
+    cache_key: str, *, allow_stale: bool = False
+) -> tuple[Optional[dict[str, Any]], bool]:
+    """Return ``(payload, is_stale)``. Fresh hits set ``is_stale=False``."""
     with _RESULTS_CACHE_LOCK:
         item = _RESULTS_CACHE.get(cache_key)
         if not item:
-            return None
+            return None, False
         expires_at, payload = item
-        if expires_at < time.monotonic():
-            _RESULTS_CACHE.pop(cache_key, None)
-            return None
-        return payload
+        now = time.monotonic()
+        if expires_at >= now:
+            return payload, False
+        if allow_stale and (now - expires_at) <= _RESULTS_STALE_GRACE_SEC:
+            return payload, True
+        _RESULTS_CACHE.pop(cache_key, None)
+        return None, False
 
 
 def _results_cache_set(cache_key: str, payload: dict[str, Any]) -> None:
@@ -923,80 +933,68 @@ def create_app() -> FastAPI:
             "targets_text": "\n".join(targets),
         }
 
-    def _build_results_payload(
-        scan_id: str,
-        *,
-        provider: Optional[str] = None,
-        include_findings: bool = False,
-        hosts_page: int = 1,
-        hosts_page_size: int = 20,
-    ) -> dict[str, Any]:
-        """Heavy Results aggregation — must not run on the asyncio event loop."""
-        row = store.get_scan(scan_id, compact=True)
-        if not row:
-            raise KeyError("scan not found")
-        findings = dedupe_findings(store.get_findings(scan_id))
-        by_severity: dict[str, int] = {}
-        by_module: dict[str, int] = {}
+    def _raw_secrets_from_finding(f: dict[str, Any]) -> list[dict[str, Any]]:
         raw_secrets: list[dict[str, Any]] = []
+        extracted = f.get("extracted") or {}
+        source_url = f.get("url") or ""
+        mod = f.get("module") or "unknown"
+        for secret in extracted.get("secrets") or []:
+            raw_secrets.append(
+                {
+                    "kind": secret.get("kind") or "secret",
+                    "value": secret.get("value"),
+                    "source_url": secret.get("source_url") or source_url,
+                    "sources": [secret.get("source_url") or source_url],
+                    "occurrences": 1,
+                    "module": mod,
+                    "title": f.get("title") or "",
+                    "finding_id": f.get("id") or "",
+                }
+            )
+        for smtp_item in extracted.get("smtp") or []:
+            raw_secrets.append(
+                {
+                    "kind": smtp_item.get("kind") or "smtp",
+                    "value": smtp_item.get("value"),
+                    "source_url": smtp_item.get("source_url") or source_url,
+                    "sources": [smtp_item.get("source_url") or source_url],
+                    "occurrences": 1,
+                    "module": mod,
+                    "title": f.get("title") or "",
+                    "finding_id": f.get("id") or "",
+                }
+            )
+        if not (extracted.get("secrets") or extracted.get("smtp")):
+            # Legacy active-exploit findings stored dump lines in evidence
+            # only. Keep credential-looking lines; skip bash timestamps.
+            from app.modules.base import _looks_like_credential_line
+
+            ftype = str(f.get("type") or "")
+            if ftype == "secrets" and f.get("evidence"):
+                for line in str(f.get("evidence") or "").splitlines():
+                    if not _looks_like_credential_line(line):
+                        continue
+                    raw_secrets.append(
+                        {
+                            "kind": "exploit",
+                            "value": line.strip(),
+                            "source_url": source_url,
+                            "sources": [source_url] if source_url else [],
+                            "occurrences": 1,
+                            "module": mod,
+                            "title": f.get("title") or "",
+                            "finding_id": f.get("id") or "",
+                        }
+                    )
+        return raw_secrets
+
+    def _host_map_from_findings(findings: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         host_map: dict[str, dict[str, Any]] = {}
         for f in findings:
-            sev = f.get("severity") or "info"
-            mod = f.get("module") or "unknown"
-            by_severity[sev] = by_severity.get(sev, 0) + 1
-            by_module[mod] = by_module.get(mod, 0) + 1
-            extracted = f.get("extracted") or {}
-            source_url = f.get("url") or ""
-            for secret in extracted.get("secrets") or []:
-                raw_secrets.append(
-                    {
-                        "kind": secret.get("kind") or "secret",
-                        "value": secret.get("value"),
-                        "source_url": secret.get("source_url") or source_url,
-                        "sources": [secret.get("source_url") or source_url],
-                        "occurrences": 1,
-                        "module": mod,
-                        "title": f.get("title") or "",
-                        "finding_id": f.get("id") or "",
-                    }
-                )
-            for smtp_item in extracted.get("smtp") or []:
-                raw_secrets.append(
-                    {
-                        "kind": smtp_item.get("kind") or "smtp",
-                        "value": smtp_item.get("value"),
-                        "source_url": smtp_item.get("source_url") or source_url,
-                        "sources": [smtp_item.get("source_url") or source_url],
-                        "occurrences": 1,
-                        "module": mod,
-                        "title": f.get("title") or "",
-                        "finding_id": f.get("id") or "",
-                    }
-                )
-            if not (extracted.get("secrets") or extracted.get("smtp")):
-                # Legacy active-exploit findings stored dump lines in evidence
-                # only. Keep credential-looking lines; skip bash timestamps.
-                from app.modules.base import _looks_like_credential_line
-
-                ftype = str(f.get("type") or "")
-                if ftype == "secrets" and f.get("evidence"):
-                    for line in str(f.get("evidence") or "").splitlines():
-                        if not _looks_like_credential_line(line):
-                            continue
-                        raw_secrets.append(
-                            {
-                                "kind": "exploit",
-                                "value": line.strip(),
-                                "source_url": source_url,
-                                "sources": [source_url] if source_url else [],
-                                "occurrences": 1,
-                                "module": mod,
-                                "title": f.get("title") or "",
-                                "finding_id": f.get("id") or "",
-                            }
-                        )
             if not is_vuln_worthy(f):
                 continue
+            sev = f.get("severity") or "info"
+            mod = f.get("module") or "unknown"
             cats = classify_finding(f)
             host = host_from_finding(f)
             method = detection_method(f, cats)
@@ -1027,6 +1025,96 @@ def create_app() -> FastAPI:
                     "id": f.get("id"),
                 }
             )
+        return host_map
+
+    def _host_map_from_vuln_indexes(out_dir: Path) -> Optional[dict[str, dict[str, Any]]]:
+        """Build host map from on-disk vulns indexes when present (thousands of rows)."""
+        vulns_dir = out_dir / "vulns"
+        if not vulns_dir.is_dir():
+            return None
+        index_paths = sorted(vulns_dir.rglob("index.jsonl"))
+        if not index_paths:
+            return None
+        host_map: dict[str, dict[str, Any]] = {}
+        saw_row = False
+        for path in index_paths:
+            try:
+                with path.open("r", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            f = json.loads(line)
+                        except Exception:
+                            continue
+                        if not isinstance(f, dict):
+                            continue
+                        saw_row = True
+                        sev = f.get("severity") or "info"
+                        mod = f.get("module") or "unknown"
+                        cats = f.get("categories") or classify_finding(f)
+                        if not isinstance(cats, list):
+                            cats = classify_finding(f)
+                        host = f.get("host") or host_from_finding(f)
+                        method = f.get("method") or detection_method(f, cats)
+                        bucket = host_map.setdefault(
+                            host,
+                            {
+                                "host": host,
+                                "methods": set(),
+                                "modules": set(),
+                                "severities": set(),
+                                "finding_count": 0,
+                                "findings": [],
+                            },
+                        )
+                        bucket["methods"].add(method)
+                        bucket["modules"].add(mod)
+                        bucket["severities"].add(sev)
+                        bucket["finding_count"] += 1
+                        bucket["findings"].append(
+                            {
+                                "method": method,
+                                "module": mod,
+                                "severity": sev,
+                                "title": f.get("title"),
+                                "url": f.get("url"),
+                                "categories": cats,
+                                "confidence": f.get("confidence"),
+                                "id": f.get("id"),
+                            }
+                        )
+            except OSError:
+                continue
+        return host_map if saw_row else None
+
+    def _build_results_payload(
+        scan_id: str,
+        *,
+        provider: Optional[str] = None,
+        include_findings: bool = False,
+        hosts_page: int = 1,
+        hosts_page_size: int = 20,
+    ) -> dict[str, Any]:
+        """Results aggregation — must not run on the asyncio event loop.
+
+        Avoids loading every finding row. Million-row scans previously spent
+        60–90s+ materializing SQLite into Python just to show a 60KB summary.
+        """
+        row = store.get_scan(scan_id, compact=True)
+        if not row:
+            raise KeyError("scan not found")
+
+        stats = store.finding_stats(scan_id)
+        by_severity = stats["by_severity"]
+        by_module = stats["by_module"]
+        finding_count = int(stats["finding_count"])
+
+        secret_findings = dedupe_findings(store.get_secret_candidate_findings(scan_id))
+        raw_secrets: list[dict[str, Any]] = []
+        for f in secret_findings:
+            raw_secrets.extend(_raw_secrets_from_finding(f))
 
         secrets = normalize_result_secrets(raw_secrets)
         # Provider counts must reflect the post-normalized secret list
@@ -1048,6 +1136,14 @@ def create_app() -> FastAPI:
         secrets = cleaned
         if provider:
             secrets = [item for item in secrets if item.get("provider") == provider]
+
+        out_dir = Path(row.get("output_dir") or (ROOT / "output" / "scans" / scan_id))
+        host_map = _host_map_from_vuln_indexes(out_dir)
+        if host_map is None:
+            # Small jobs / missing artifacts: scan vuln-candidate rows only.
+            host_map = _host_map_from_findings(
+                dedupe_findings(store.get_vuln_candidate_findings(scan_id))
+            )
 
         vulnerable_hosts = []
         for host, bucket in sorted(host_map.items()):
@@ -1075,7 +1171,6 @@ def create_app() -> FastAPI:
         # and regenerating dozens of per-category files on each read made
         # filtering feel slow; artifact generation belongs to the live
         # scan persistence path and the explicit /vulns endpoint instead.
-        out_dir = Path(row.get("output_dir") or (ROOT / "output" / "scans" / scan_id))
         vuln_files: dict[str, Any] = {}
         summary_path = out_dir / "vulns" / "summary.json"
         if summary_path.is_file():
@@ -1089,7 +1184,7 @@ def create_app() -> FastAPI:
 
         payload = {
             "scan": row,
-            "finding_count": len(findings),
+            "finding_count": finding_count,
             "by_severity": by_severity,
             "by_module": by_module,
             "secrets": secrets,
@@ -1107,6 +1202,7 @@ def create_app() -> FastAPI:
         # Findings are loaded via paginated /findings. Including them here
         # duplicated large payloads on every Results poll.
         if include_findings:
+            page_items, _ = store.query_findings(scan_id, limit=100, offset=0)
             payload["findings"] = [
                 {
                     "id": finding.get("id"),
@@ -1118,9 +1214,41 @@ def create_app() -> FastAPI:
                     "timestamp": finding.get("timestamp"),
                     "validated": finding.get("validated"),
                 }
-                for finding in findings[:100]
+                for finding in page_items
             ]
         return payload
+
+    def _schedule_results_refresh(
+        cache_key: str,
+        scan_id: str,
+        *,
+        provider: Optional[str],
+        include_findings: bool,
+        hosts_page: int,
+        hosts_page_size: int,
+    ) -> None:
+        with _RESULTS_CACHE_LOCK:
+            if cache_key in _RESULTS_REFRESHING:
+                return
+            _RESULTS_REFRESHING.add(cache_key)
+
+        def _worker() -> None:
+            try:
+                payload = _build_results_payload(
+                    scan_id,
+                    provider=provider,
+                    include_findings=include_findings,
+                    hosts_page=hosts_page,
+                    hosts_page_size=hosts_page_size,
+                )
+                _results_cache_set(cache_key, payload)
+            except Exception:
+                log.exception("background results refresh failed for %s", scan_id)
+            finally:
+                with _RESULTS_CACHE_LOCK:
+                    _RESULTS_REFRESHING.discard(cache_key)
+
+        threading.Thread(target=_worker, name=f"results-refresh-{scan_id[:8]}", daemon=True).start()
 
     @app.get("/api/scans/{scan_id}/results")
     async def get_results(
@@ -1134,8 +1262,18 @@ def create_app() -> FastAPI:
             f"{scan_id}|{provider or ''}|{int(include_findings)}|"
             f"{int(hosts_page or 1)}|{int(hosts_page_size or 20)}"
         )
-        cached = _results_cache_get(cache_key)
-        if cached is not None:
+        cached, stale = _results_cache_get(cache_key, allow_stale=True)
+        if cached is not None and not stale:
+            return cached
+        if cached is not None and stale:
+            _schedule_results_refresh(
+                cache_key,
+                scan_id,
+                provider=provider,
+                include_findings=include_findings,
+                hosts_page=hosts_page,
+                hosts_page_size=hosts_page_size,
+            )
             return cached
         try:
             payload = await asyncio.to_thread(

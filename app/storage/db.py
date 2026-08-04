@@ -471,6 +471,99 @@ class ScanStore:
         )
         return items
 
+    def finding_stats(self, scan_id: str) -> dict[str, Any]:
+        """Cheap SQL aggregates for Results summary cards (no row materialization)."""
+        with Session(self.engine) as s:
+            total = int(
+                s.scalar(
+                    select(func.count()).select_from(FindingRow).where(FindingRow.scan_id == scan_id)
+                )
+                or 0
+            )
+            by_severity: dict[str, int] = {
+                str(sev or "info"): int(count)
+                for sev, count in s.execute(
+                    select(FindingRow.severity, func.count())
+                    .where(FindingRow.scan_id == scan_id)
+                    .group_by(FindingRow.severity)
+                ).all()
+            }
+            by_module: dict[str, int] = {
+                str(mod or "unknown"): int(count)
+                for mod, count in s.execute(
+                    select(FindingRow.module, func.count())
+                    .where(FindingRow.scan_id == scan_id)
+                    .group_by(FindingRow.module)
+                ).all()
+            }
+        return {"finding_count": total, "by_severity": by_severity, "by_module": by_module}
+
+    def get_secret_candidate_findings(self, scan_id: str) -> list[dict[str, Any]]:
+        """Load only findings that may contain extractable secrets/SMTP.
+
+        Large scans store millions of empty ``{"secrets": []}`` blobs. Pulling
+        every row into Python for Results made the tab take 1–2 minutes; JSON
+        filters keep this to the few thousand rows that actually matter.
+        """
+        sql = (
+            "SELECT id FROM findings WHERE scan_id = ? AND ("
+            "json_array_length(json_extract(extracted_json, '$.secrets')) > 0 "
+            "OR json_array_length(json_extract(extracted_json, '$.smtp')) > 0 "
+            "OR type = 'secrets'"
+            ")"
+        )
+        try:
+            with self.engine.connect() as conn:
+                ids = [row[0] for row in conn.exec_driver_sql(sql, (scan_id,)).fetchall()]
+        except Exception:
+            # Older SQLite without JSON1 — fall back to a bounded Python filter.
+            return self._secret_candidates_python_fallback(scan_id)
+
+        if not ids:
+            return []
+        with Session(self.engine) as s:
+            rows = s.scalars(select(FindingRow).where(FindingRow.id.in_(ids))).all()
+            return [self._finding_dict(r) for r in rows]
+
+    def _secret_candidates_python_fallback(self, scan_id: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        with Session(self.engine) as s:
+            rows = s.scalars(select(FindingRow).where(FindingRow.scan_id == scan_id)).all()
+            for row in rows:
+                if (row.type or "") == "secrets":
+                    out.append(self._finding_dict(row))
+                    continue
+                raw = row.extracted_json or ""
+                if len(raw) <= 2:
+                    continue
+                try:
+                    extracted = json.loads(raw)
+                except Exception:
+                    continue
+                if (extracted.get("secrets") or extracted.get("smtp")):
+                    out.append(self._finding_dict(row))
+        return out
+
+    def get_vuln_candidate_findings(self, scan_id: str) -> list[dict[str, Any]]:
+        """Findings that can contribute to the vulnerable-hosts panel.
+
+        Skips pure info/path noise that dominates huge scans when on-disk
+        ``vulns/`` indexes are unavailable.
+        """
+        modules = ("git", "config", "js", "wordpress", "joomla", "react", "methods")
+        severities = ("critical", "high", "medium")
+        with Session(self.engine) as s:
+            rows = s.scalars(
+                select(FindingRow).where(
+                    FindingRow.scan_id == scan_id,
+                    or_(
+                        FindingRow.severity.in_(severities),
+                        FindingRow.module.in_(modules),
+                    ),
+                )
+            ).all()
+            return [self._finding_dict(r) for r in rows]
+
     def get_finding(self, scan_id: str, finding_id: str) -> Optional[dict[str, Any]]:
         with Session(self.engine) as s:
             row = s.get(FindingRow, finding_id)

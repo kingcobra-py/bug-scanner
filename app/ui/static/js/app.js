@@ -892,7 +892,7 @@ async function reloadResults(force = false) {
   state.resultsRefreshPending = true;
   if (!cached && $("resultSummary")) {
     $("resultSummary").innerHTML =
-      '<div class="text-slate-400 text-sm">Loading results… large running scans can take 1–2 minutes. Keep this tab open.</div>';
+      '<div class="text-slate-400 text-sm">Loading results…</div>';
   }
   try {
     const results = await api(
