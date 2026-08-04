@@ -39,7 +39,53 @@ def test_public_server_dict_redacts_secrets():
     assert public["private_key"] == "***"
     assert public["password"] == "***"
     assert public["has_key"] is True
+    assert public["has_password"] is True
     assert public["endpoint"] == "h.example:22"
+
+
+def test_servers_api_accepts_password_auth(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(server, "ssh_store", SshServerStore(tmp_path / "ssh.json"))
+    monkeypatch.setattr(
+        server,
+        "collect_metrics",
+        lambda srv: {
+            "online": True,
+            "error": "",
+            "cpu_percent": 1,
+            "memory_percent": 2,
+            "disk_percent": 3,
+            "cores": 2,
+            "load": "0.1",
+            "procs": 10,
+            "net": "1k/1k",
+        },
+    )
+    client = TestClient(create_app())
+    missing = client.post(
+        "/api/servers",
+        json={"host": "h.example", "auth_type": "password", "username": "root"},
+    )
+    assert missing.status_code == 400
+    created = client.post(
+        "/api/servers",
+        json={
+            "host": "h.example",
+            "auth_type": "password",
+            "username": "root",
+            "password": "s3cret",
+        },
+    )
+    assert created.status_code == 200
+    body = created.json()
+    assert body["auth_type"] == "password"
+    assert body["password"] == "***"
+    assert body["has_password"] is True
+    assert body["has_key"] is False
+    stored = server.ssh_store.get(body["id"])
+    assert stored.password == "s3cret"
+    assert stored.private_key == ""
 
 
 def test_servers_api_crud_and_metrics(tmp_path, monkeypatch):

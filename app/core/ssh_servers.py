@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import uuid
@@ -98,6 +99,16 @@ def _write_keyfile(private_key: str) -> str:
     return tmp.name
 
 
+def _write_askpass() -> str:
+    """Tiny helper so OpenSSH can read a password non-interactively."""
+    tmp = tempfile.NamedTemporaryFile("w", delete=False, prefix="bb-ssh-askpass-", suffix=".sh")
+    tmp.write("#!/bin/sh\nprintf '%s\\n' \"$BB_SSH_PASS\"\n")
+    tmp.flush()
+    tmp.close()
+    Path(tmp.name).chmod(0o700)
+    return tmp.name
+
+
 def ssh_run(
     server: SshServer,
     remote_command: str = "",
@@ -109,20 +120,41 @@ def ssh_run(
 
     Prefer ``script=`` for multi-line bash; it is fed to ``bash -s`` on stdin
     so quoting/newlines stay intact.
+
+    Supports private-key auth (default) and password auth via ``SSH_ASKPASS``.
     """
     keyfile = None
+    askpass = None
     try:
         cmd = [
             "ssh",
-            "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=8",
             "-o", "ServerAliveInterval=5",
             "-p", str(int(server.port or 22)),
         ]
-        if server.auth_type == "key" and server.private_key.strip():
-            keyfile = _write_keyfile(server.private_key)
-            cmd.extend(["-i", keyfile])
+        env = os.environ.copy()
+        use_password = (server.auth_type or "").lower() == "password" and bool(server.password)
+        if use_password:
+            askpass = _write_askpass()
+            env["BB_SSH_PASS"] = server.password
+            env["SSH_ASKPASS"] = askpass
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            # SSH_ASKPASS requires DISPLAY to be set even for headless use.
+            env.setdefault("DISPLAY", ":0")
+            cmd.extend([
+                "-o", "PreferredAuthentications=password,keyboard-interactive",
+                "-o", "PubkeyAuthentication=no",
+                "-o", "NumberOfPasswordPrompts=1",
+                "-o", "KbdInteractiveAuthentication=yes",
+            ])
+        else:
+            cmd.extend(["-o", "BatchMode=yes"])
+            if server.private_key.strip():
+                keyfile = _write_keyfile(server.private_key)
+                cmd.extend(["-i", keyfile])
+            elif not server.private_key.strip() and (server.auth_type or "key") == "key":
+                return 1, "", "private key is required for key auth"
         cmd.append(f"{server.username}@{server.host}")
         if script:
             cmd.append("bash -s")
@@ -135,6 +167,8 @@ def ssh_run(
             text=True,
             timeout=timeout,
             check=False,
+            env=env,
+            start_new_session=True,
         )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
     except subprocess.TimeoutExpired as exc:
@@ -142,11 +176,12 @@ def ssh_run(
     except Exception as exc:
         return 1, "", str(exc)
     finally:
-        if keyfile:
-            try:
-                Path(keyfile).unlink(missing_ok=True)
-            except Exception:
-                pass
+        for path in (keyfile, askpass):
+            if path:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 _METRIC_SCRIPT = r"""
@@ -286,12 +321,13 @@ def install_deps(server: SshServer) -> dict[str, Any]:
 
 def public_server_dict(server: SshServer) -> dict[str, Any]:
     data = asdict(server)
-    # Never send private key material back to the browser after create.
+    # Never send private key / password material back to the browser after create.
     if data.get("private_key"):
         data["private_key"] = "***"
     if data.get("password"):
         data["password"] = "***"
     data["has_key"] = bool(server.private_key.strip())
+    data["has_password"] = bool(server.password)
     data["endpoint"] = server.endpoint()
     return data
 

@@ -573,16 +573,21 @@ def create_app() -> FastAPI:
         host = (body.host or "").strip()
         if not host:
             raise HTTPException(status_code=400, detail="host is required")
-        if body.auth_type == "key" and not (body.private_key or "").strip():
+        auth_type = "password" if (body.auth_type or "").lower() == "password" else "key"
+        private_key = (body.private_key or "").strip()
+        password = body.password or ""
+        if auth_type == "key" and not private_key:
             raise HTTPException(status_code=400, detail="private_key is required for key auth")
+        if auth_type == "password" and not password:
+            raise HTTPException(status_code=400, detail="password is required for password auth")
         server = SshServer(
             id=new_server_id(),
             host=host,
             port=max(1, min(int(body.port or 22), 65535)),
             username=(body.username or "ubuntu").strip() or "ubuntu",
-            auth_type="key" if body.auth_type != "password" else "password",
-            private_key=body.private_key or "",
-            password=body.password or "",
+            auth_type=auth_type,
+            private_key=private_key if auth_type == "key" else "",
+            password=password if auth_type == "password" else "",
             label=(body.label or "").strip()[:120],
             status="unknown",
         )

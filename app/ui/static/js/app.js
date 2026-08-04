@@ -6,6 +6,7 @@ const state = {
   jobs: [],
   allScans: [],
   servers: [],
+  sshAuthType: "key",
   scanId: null,
   provider: "",
   results: null,
@@ -699,12 +700,30 @@ function renderServers() {
   });
 }
 
+function setSshAuthType(authType) {
+  state.sshAuthType = authType === "password" ? "password" : "key";
+  document.querySelectorAll("[data-ssh-auth]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.sshAuth === state.sshAuthType);
+  });
+  $("sshKeyFields")?.classList.toggle("hidden", state.sshAuthType !== "key");
+  $("sshPasswordFields")?.classList.toggle("hidden", state.sshAuthType !== "password");
+}
+
 async function addServer(event) {
   if (event?.preventDefault) event.preventDefault();
   const host = $("sshHost")?.value.trim();
   const privateKey = $("sshKey")?.value.trim();
-  if (!host || !privateKey) {
-    $("serverError").textContent = "Host and private key are required.";
+  const password = $("sshPassword")?.value || "";
+  if (!host) {
+    $("serverError").textContent = "Host is required.";
+    return;
+  }
+  if (state.sshAuthType === "key" && !privateKey) {
+    $("serverError").textContent = "Private key is required for key auth.";
+    return;
+  }
+  if (state.sshAuthType === "password" && !password) {
+    $("serverError").textContent = "Password is required for password auth.";
     return;
   }
   const button = $("addServerBtn");
@@ -720,13 +739,15 @@ async function addServer(event) {
         port: Number($("sshPort").value || 22),
         username: ($("sshUser").value || "ubuntu").trim() || "ubuntu",
         label: ($("sshLabel").value || "").trim(),
-        auth_type: "key",
-        private_key: privateKey,
+        auth_type: state.sshAuthType,
+        private_key: state.sshAuthType === "key" ? privateKey : "",
+        password: state.sshAuthType === "password" ? password : "",
       }),
     });
     $("serverForm").reset();
     $("sshPort").value = "22";
     $("sshUser").value = "ubuntu";
+    setSshAuthType("key");
     await refreshServers();
   } catch (error) {
     $("serverError").textContent = error.message;
@@ -1041,6 +1062,10 @@ function bindEvents() {
   on("refreshServers", "onclick", () => refreshServers(true));
   on("serverForm", "onsubmit", addServer);
   on("addServerBtn", "onclick", addServer);
+  document.querySelectorAll("[data-ssh-auth]").forEach((button) => {
+    button.onclick = () => setSshAuthType(button.dataset.sshAuth);
+  });
+  setSshAuthType(state.sshAuthType);
   const secretsBox = $("secretsBox");
   if (secretsBox) {
     secretsBox.addEventListener("click", async (event) => {

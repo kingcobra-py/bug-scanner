@@ -104,14 +104,28 @@
                 <div><label class="label">Username</label><input id="sshUser" class="input" value="ubuntu" /></div>
               </div>
               <div><label class="label">Label (optional)</label><input id="sshLabel" class="input" placeholder="Scanner node A" /></div>
-              <div><label class="label">Private key (PEM)</label><textarea id="sshKey" class="input h-28 font-mono text-xs" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" required></textarea></div>
+              <div>
+                <label class="label">Authentication</label>
+                <div class="grid grid-cols-2 gap-2 mt-1">
+                  <button type="button" class="kind-option active" data-ssh-auth="key"><b>Private key</b><small>PEM / OpenSSH key</small></button>
+                  <button type="button" class="kind-option" data-ssh-auth="password"><b>Password</b><small>Username + password</small></button>
+                </div>
+              </div>
+              <div id="sshKeyFields">
+                <label class="label">Private key (PEM)</label>
+                <textarea id="sshKey" class="input h-28 font-mono text-xs" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+              </div>
+              <div id="sshPasswordFields" class="hidden">
+                <label class="label">Password</label>
+                <input id="sshPassword" type="password" class="input" placeholder="SSH login password" autocomplete="new-password" />
+              </div>
               <div id="serverError" class="text-sm text-red-300 min-h-5"></div>
               <button id="addServerBtn" type="submit" class="btn-primary w-full">Add server</button>
             </form>
           </div>
           <div class="lg:col-span-8">
             <div id="serversGrid" class="grid md:grid-cols-2 gap-4"></div>
-            <div id="serversEmpty" class="empty-state hidden"><b>No SSH servers yet</b><span>Add a host with its private key to monitor performance and install dependencies.</span></div>
+            <div id="serversEmpty" class="empty-state hidden"><b>No SSH servers yet</b><span>Add a host with a private key or password to monitor performance and install dependencies.</span></div>
           </div>
         </div>
       </section>
