@@ -174,8 +174,9 @@ def resolve_ssh_targets(host: str) -> list[str]:
     return ips
 
 
+# ec2-A-B-C-D.compute-1.amazonaws.com or ec2-A-B-C-D.us-east-1.compute.amazonaws.com
 _EC2_PUBLIC_DNS_RE = re.compile(
-    r"^ec2-(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})\.(?:[\w-]+\.)?compute\.amazonaws\.com$",
+    r"^ec2-(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})\.[\w.-]+\.amazonaws\.com$",
     re.I,
 )
 
