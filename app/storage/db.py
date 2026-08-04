@@ -179,6 +179,19 @@ class ScanStore:
             existing = s.get(ScanRow, scan_id)
             if existing:
                 # Resume / restart of the same id must keep findings + progress.
+                # Engine re-create_scan() uses ScanConfig fields only — preserve
+                # dashboard metadata (SSH fleet assignment, etc.) already stored.
+                try:
+                    old = json.loads(existing.config_json or "{}")
+                except Exception:
+                    old = {}
+                if isinstance(old, dict):
+                    preserved = {
+                        key: value
+                        for key, value in old.items()
+                        if key not in config and key not in {"targets", "custom_paths"}
+                    }
+                    config = {**preserved, **config}
                 existing.config_json = json.dumps(config)
                 existing.output_dir = output_dir or existing.output_dir
                 existing.status = existing.status or "pending"
