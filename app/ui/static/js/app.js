@@ -674,6 +674,13 @@ function serverCard(server) {
         <div class="ssh-meta-box"><span>Username</span><b>${esc(server.username || "ubuntu")}</b></div>
         <div class="ssh-meta-box"><span>Auth</span><b><span class="ssh-key-icon">⌁</span> ${esc(authLabel)}</b></div>
       </div>
+      <div class="ssh-connect-ip">
+        <label>Connect IP</label>
+        <div class="ssh-connect-row">
+          <input class="input ssh-connect-input" data-id="${esc(server.id)}" value="${esc(server.connect_ip || server.last_ok_ip || "")}" placeholder="172.31.x.x private IP" />
+          <button class="btn-ghost server-action" data-id="${esc(server.id)}" data-action="save-ip">Save IP</button>
+        </div>
+      </div>
       <div class="ssh-bars">
         <div class="ssh-bar-row"><span>CPU</span><div class="ssh-bar-track"><div class="ssh-bar-fill" style="width:${cpu}%"></div></div><b>${cpu.toFixed(0)}%</b></div>
         <div class="ssh-bar-row"><span>Memory</span><div class="ssh-bar-track"><div class="ssh-bar-fill mem" style="width:${mem}%"></div></div><b>${mem.toFixed(0)}%</b></div>
@@ -716,10 +723,29 @@ function renderServers() {
         }
         return;
       }
+      if (action === "save-ip") {
+        const input = grid.querySelector(`.ssh-connect-input[data-id="${CSS.escape(id)}"]`);
+        const connectIp = (input?.value || "").trim();
+        button.disabled = true;
+        button.textContent = "Saving…";
+        try {
+          await api(`/api/servers/${encodeURIComponent(id)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ connect_ip: connectIp }),
+          });
+          await refreshServers();
+        } catch (error) {
+          alert(error.message);
+          button.disabled = false;
+          button.textContent = "Save IP";
+        }
+        return;
+      }
       if (action === "install") {
         const card = state.servers.find((item) => item.id === id);
         if (card && card.status !== "online" && card.metrics?.online !== true) {
-          alert("Host is Offline. Fix SSH/DNS first (card must show Online), then Install Deps again.");
+          alert("Host is Offline. Set Connect IP to the EC2 private IP, click Save IP, wait for Online, then Install Deps.");
           return;
         }
         if (!confirm("Install Python dependencies on this remote host under /opt/bb-scanner?")) return;
@@ -778,6 +804,7 @@ async function addServer(event) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         host,
+        connect_ip: ($("sshConnectIp")?.value || "").trim(),
         port: Number($("sshPort").value || 22),
         username: ($("sshUser").value || "ubuntu").trim() || "ubuntu",
         label: ($("sshLabel").value || "").trim(),

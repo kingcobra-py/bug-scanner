@@ -327,6 +327,7 @@ class SshServerCreate(BaseModel):
     private_key: str = ""
     password: str = ""
     label: str = ""
+    connect_ip: str = ""
 
 
 class ChunkUploadInit(BaseModel):
@@ -621,6 +622,16 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="private_key is required for key auth")
         if auth_type == "password" and not password:
             raise HTTPException(status_code=400, detail="password is required for password auth")
+        connect_ip = (body.connect_ip or "").strip()
+        # If host is already an IP, also use it as the connect target.
+        if not connect_ip:
+            try:
+                import ipaddress
+
+                ipaddress.ip_address(host)
+                connect_ip = host
+            except ValueError:
+                connect_ip = ""
         server = SshServer(
             id=new_server_id(),
             host=host,
@@ -630,6 +641,7 @@ def create_app() -> FastAPI:
             private_key=private_key if auth_type == "key" else "",
             password=password if auth_type == "password" else "",
             label=(body.label or "").strip()[:120],
+            connect_ip=connect_ip,
             status="unknown",
         )
         # Probe once on create so the card shows Online/Offline immediately.
@@ -700,6 +712,31 @@ def create_app() -> FastAPI:
         }
         ssh_store.upsert(server)
         return {"server": public_server_dict(server), **result}
+
+    class SshServerConnectIpUpdate(BaseModel):
+        connect_ip: str = ""
+
+    @app.patch("/api/servers/{server_id}")
+    async def patch_server(server_id: str, body: SshServerConnectIpUpdate) -> dict[str, Any]:
+        """Update connect IP (private IP) and re-probe without recreating the server."""
+        server = ssh_store.get(server_id)
+        if not server:
+            raise HTTPException(status_code=404, detail="server not found")
+        connect_ip = (body.connect_ip or "").strip()
+        if connect_ip:
+            try:
+                import ipaddress
+
+                ipaddress.ip_address(connect_ip)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="connect_ip must be a valid IP") from exc
+        server.connect_ip = connect_ip
+        metrics = await asyncio.to_thread(collect_metrics, server)
+        server.metrics = metrics
+        server.status = "online" if metrics.get("online") else "offline"
+        server.last_error = str(metrics.get("error") or "")
+        ssh_store.upsert(server)
+        return public_server_dict(server)
 
     @app.get("/api/scans/{scan_id}/findings")
     async def get_findings(

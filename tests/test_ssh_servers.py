@@ -267,3 +267,24 @@ def test_store_preserves_last_install(tmp_path):
     got = store.get("n1")
     assert got.last_install["ok"] is True
     assert "Dependencies installed" in got.last_install["message"]
+
+
+def test_choose_connect_host_prefers_connect_ip():
+    from app.core.ssh_servers import choose_connect_host
+
+    server = SshServer(
+        id="n1",
+        host="ec2-44-212-73-124.compute-1.amazonaws.com",
+        connect_ip="172.31.89.224",
+        last_ok_ip="44.212.73.124",
+    )
+    host, candidates = choose_connect_host(server)
+    assert host == "172.31.89.224"
+    assert candidates == ["172.31.89.224"]
+
+
+def test_private_ip_helper():
+    from app.core.ssh_servers import _is_private_ip
+
+    assert _is_private_ip("172.31.67.5") is True
+    assert _is_private_ip("44.212.73.124") is False
