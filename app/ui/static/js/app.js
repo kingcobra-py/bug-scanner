@@ -640,6 +640,16 @@ function metricPct(metrics, key) {
   return Math.max(0, Math.min(100, value));
 }
 
+function serverInstallLine(server) {
+  const install = server.last_install || {};
+  if (!install.at && install.ok == null) return "";
+  const when = formatHitTime(install.at);
+  if (install.ok) {
+    return `<div class="ssh-install ok" title="${esc(install.message || "")}">Deps installed · ${esc(when)}</div>`;
+  }
+  return `<div class="ssh-install fail" title="${esc(install.message || "")}">Deps install failed · ${esc(when)}${install.message ? ` — ${esc(String(install.message).slice(0, 140))}` : ""}</div>`;
+}
+
 function serverCard(server) {
   const metrics = server.metrics || {};
   const online = server.status === "online" || metrics.online === true;
@@ -647,6 +657,7 @@ function serverCard(server) {
   const mem = metricPct(metrics, "memory_percent");
   const disk = metricPct(metrics, "disk_percent");
   const authLabel = server.auth_type === "password" ? "Password" : "Key";
+  const err = server.last_error || metrics.error || "";
   return `
     <article class="ssh-card" data-id="${esc(server.id)}">
       <div class="ssh-card-head">
@@ -674,9 +685,10 @@ function serverCard(server) {
         <div class="ssh-mini"><span>Procs</span><b>${esc(metrics.procs ?? "-")}</b></div>
         <div class="ssh-mini"><span>Net</span><b>${esc(metrics.net ?? "-")}</b></div>
       </div>
-      <div class="ssh-error">${esc(server.last_error || metrics.error || "")}</div>
+      ${serverInstallLine(server)}
+      <div class="ssh-error">${esc(err)}</div>
       <div class="ssh-actions">
-        <button class="btn-ghost server-action" data-id="${esc(server.id)}" data-action="install">⇩ Install Deps</button>
+        <button class="btn-ghost server-action" data-id="${esc(server.id)}" data-action="install" ${online ? "" : "title=\"Host must be Online first\""}>⇩ Install Deps</button>
         <button class="btn-danger server-action" data-id="${esc(server.id)}" data-action="remove">Remove</button>
       </div>
     </article>`;
@@ -705,15 +717,22 @@ function renderServers() {
         return;
       }
       if (action === "install") {
+        const card = state.servers.find((item) => item.id === id);
+        if (card && card.status !== "online" && card.metrics?.online !== true) {
+          alert("Host is Offline. Fix SSH/DNS first (card must show Online), then Install Deps again.");
+          return;
+        }
         if (!confirm("Install Python dependencies on this remote host under /opt/bb-scanner?")) return;
         button.disabled = true;
         button.textContent = "Installing…";
         try {
           const result = await api(`/api/servers/${encodeURIComponent(id)}/install-deps`, { method: "POST" });
           if (!result.ok) throw new Error(result.message || "Install failed");
+          alert(result.message || "Dependencies installed.");
+          button.textContent = "Installed ✓";
           await refreshServers();
         } catch (error) {
-          alert(error.message);
+          alert(error.message || "Install failed");
           button.disabled = false;
           button.textContent = "Install Deps";
           await refreshServers();

@@ -242,3 +242,28 @@ def test_servers_api_crud_and_metrics(tmp_path, monkeypatch):
     deleted = client.delete(f"/api/servers/{server_id}")
     assert deleted.status_code == 200
     assert client.get("/api/servers").json() == []
+
+
+def test_friendly_ssh_error_messages():
+    from app.core.ssh_servers import friendly_ssh_error
+
+    assert "resolve hostname" in friendly_ssh_error(
+        "ssh: Could not resolve hostname ec2-x: Temporary failure in name resolution"
+    ).lower()
+    assert "timed out" in friendly_ssh_error("ssh timeout").lower()
+    assert "auth failed" in friendly_ssh_error("Permission denied (publickey).").lower()
+
+
+def test_store_preserves_last_install(tmp_path):
+    store = SshServerStore(tmp_path / "ssh_servers.json")
+    store.upsert(
+        SshServer(
+            id="n1",
+            host="h.example",
+            private_key="KEY",
+            last_install={"ok": True, "message": "Dependencies installed", "at": "2026-08-04T22:00:00+00:00"},
+        )
+    )
+    got = store.get("n1")
+    assert got.last_install["ok"] is True
+    assert "Dependencies installed" in got.last_install["message"]
