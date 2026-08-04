@@ -288,3 +288,19 @@ def test_private_ip_helper():
 
     assert _is_private_ip("172.31.67.5") is True
     assert _is_private_ip("44.212.73.124") is False
+
+
+def test_public_ip_from_ec2_hostname():
+    from app.core.ssh_servers import public_ip_from_ec2_hostname
+
+    assert public_ip_from_ec2_hostname("ec2-44-212-73-124.compute-1.amazonaws.com") == "44.212.73.124"
+    assert public_ip_from_ec2_hostname("ec2-44-212-73-124.us-east-1.compute.amazonaws.com") == "44.212.73.124"
+    assert public_ip_from_ec2_hostname("example.com") == ""
+
+
+def test_choose_connect_host_includes_decoded_public_ip():
+    from app.core.ssh_servers import choose_connect_host
+
+    server = SshServer(id="n2", host="ec2-10-0-0-5.compute-1.amazonaws.com")
+    _host, candidates = choose_connect_host(server)
+    assert "10.0.0.5" in candidates

@@ -907,7 +907,7 @@ td { padding: .65rem .55rem; border-top: 1px solid rgba(125,211,252,.08); color:
   display: block; color: var(--muted2); text-transform: uppercase;
   letter-spacing: .06em; font-size: .6rem; margin-bottom: .3rem;
 }
-.ssh-connect-row { display: grid; grid-template-columns: 1fr auto; gap: .4rem; }
+.ssh-connect-row { display: grid; grid-template-columns: 1fr auto auto; gap: .4rem; }
 .ssh-connect-row .input { font-size: .75rem; padding: .4rem .55rem; }
 .ssh-install {
   font-size: .68rem;

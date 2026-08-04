@@ -644,6 +644,13 @@ def create_app() -> FastAPI:
             connect_ip=connect_ip,
             status="unknown",
         )
+        # Auto-detect private Connect IP when operator didn't provide one.
+        if not server.connect_ip:
+            from app.core.ssh_servers import auto_detect_connect_ip
+
+            detected = await asyncio.to_thread(auto_detect_connect_ip, server, deep=False)
+            if detected.get("ok") and detected.get("connect_ip"):
+                server.connect_ip = str(detected["connect_ip"])
         # Probe once on create so the card shows Online/Offline immediately.
         metrics = await asyncio.to_thread(collect_metrics, server)
         server.metrics = metrics
@@ -737,6 +744,24 @@ def create_app() -> FastAPI:
         server.last_error = str(metrics.get("error") or "")
         ssh_store.upsert(server)
         return public_server_dict(server)
+
+    @app.post("/api/servers/{server_id}/detect-ip")
+    async def detect_server_ip(server_id: str) -> dict[str, Any]:
+        """Auto-detect private Connect IP (DNS / SSH metadata / VPC key probe)."""
+        from app.core.ssh_servers import auto_detect_connect_ip
+
+        server = ssh_store.get(server_id)
+        if not server:
+            raise HTTPException(status_code=404, detail="server not found")
+        detected = await asyncio.to_thread(auto_detect_connect_ip, server, deep=True)
+        if detected.get("ok") and detected.get("connect_ip"):
+            server.connect_ip = str(detected["connect_ip"])
+        metrics = await asyncio.to_thread(collect_metrics, server)
+        server.metrics = metrics
+        server.status = "online" if metrics.get("online") else "offline"
+        server.last_error = "" if detected.get("ok") else str(detected.get("message") or metrics.get("error") or "")
+        ssh_store.upsert(server)
+        return {"server": public_server_dict(server), **detected}
 
     @app.get("/api/scans/{scan_id}/findings")
     async def get_findings(

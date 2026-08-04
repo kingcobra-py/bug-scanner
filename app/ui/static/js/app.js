@@ -675,10 +675,11 @@ function serverCard(server) {
         <div class="ssh-meta-box"><span>Auth</span><b><span class="ssh-key-icon">⌁</span> ${esc(authLabel)}</b></div>
       </div>
       <div class="ssh-connect-ip">
-        <label>Connect IP</label>
+        <label>Connect IP (auto-detect available)</label>
         <div class="ssh-connect-row">
           <input class="input ssh-connect-input" data-id="${esc(server.id)}" value="${esc(server.connect_ip || server.last_ok_ip || "")}" placeholder="172.31.x.x private IP" />
-          <button class="btn-ghost server-action" data-id="${esc(server.id)}" data-action="save-ip">Save IP</button>
+          <button class="btn-ghost server-action" data-id="${esc(server.id)}" data-action="detect-ip" title="Auto-detect private IP">Detect</button>
+          <button class="btn-ghost server-action" data-id="${esc(server.id)}" data-action="save-ip">Save</button>
         </div>
       </div>
       <div class="ssh-bars">
@@ -723,6 +724,22 @@ function renderServers() {
         }
         return;
       }
+      if (action === "detect-ip") {
+        button.disabled = true;
+        button.textContent = "Detecting…";
+        try {
+          const result = await api(`/api/servers/${encodeURIComponent(id)}/detect-ip`, { method: "POST" });
+          if (!result.ok) throw new Error(result.message || "Detect failed");
+          alert(result.message || `Detected ${result.connect_ip}`);
+          await refreshServers();
+        } catch (error) {
+          alert(error.message || "Could not detect private IP");
+          button.disabled = false;
+          button.textContent = "Detect";
+          await refreshServers();
+        }
+        return;
+      }
       if (action === "save-ip") {
         const input = grid.querySelector(`.ssh-connect-input[data-id="${CSS.escape(id)}"]`);
         const connectIp = (input?.value || "").trim();
@@ -738,7 +755,7 @@ function renderServers() {
         } catch (error) {
           alert(error.message);
           button.disabled = false;
-          button.textContent = "Save IP";
+          button.textContent = "Save";
         }
         return;
       }
