@@ -33,6 +33,7 @@
       <div class="max-w-[1500px] mx-auto px-5 flex gap-1">
         <button class="nav-tab active" data-tab="uploads"><span>⇧</span> Uploads</button>
         <button class="nav-tab" data-tab="jobs"><span>◫</span> Jobs <b id="runningBadge" class="nav-badge hidden">0</b></button>
+        <button class="nav-tab" data-tab="servers"><span>▣</span> SSH Servers</button>
         <button class="nav-tab" data-tab="results"><span>⌁</span> Results</button>
         <button class="nav-tab" data-tab="logs"><span>›_</span> Logs</button>
       </div>
@@ -85,6 +86,34 @@
         <div id="jobsOverview" class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5"></div>
         <div id="jobsGrid" class="grid xl:grid-cols-2 gap-4"></div>
         <div id="jobsEmpty" class="empty-state hidden"><b>No jobs yet</b><span>Upload a targets file, then create your first scan job.</span></div>
+      </section>
+
+      <section id="tab-servers" class="tab-view hidden">
+        <div class="page-heading">
+          <div><h1>SSH Servers</h1><p>Add and monitor remote hosts for multi-server scanning.</p></div>
+          <button id="refreshServers" class="icon-btn" title="Refresh metrics">↻</button>
+        </div>
+        <div class="grid lg:grid-cols-12 gap-5">
+          <div class="panel lg:col-span-4 p-6">
+            <div class="eyebrow">NEW SERVER</div>
+            <h2 class="text-xl font-semibold mt-1">Add SSH host</h2>
+            <form id="serverForm" class="mt-4 space-y-3">
+              <div><label class="label">Host / IP</label><input id="sshHost" class="input" placeholder="ec2-xx-xx-xx-xx.compute-1.amazonaws.com" required /></div>
+              <div class="grid grid-cols-2 gap-3">
+                <div><label class="label">Port</label><input id="sshPort" type="number" class="input" value="22" min="1" max="65535" /></div>
+                <div><label class="label">Username</label><input id="sshUser" class="input" value="ubuntu" /></div>
+              </div>
+              <div><label class="label">Label (optional)</label><input id="sshLabel" class="input" placeholder="Scanner node A" /></div>
+              <div><label class="label">Private key (PEM)</label><textarea id="sshKey" class="input h-28 font-mono text-xs" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" required></textarea></div>
+              <div id="serverError" class="text-sm text-red-300 min-h-5"></div>
+              <button id="addServerBtn" type="submit" class="btn-primary w-full">Add server</button>
+            </form>
+          </div>
+          <div class="lg:col-span-8">
+            <div id="serversGrid" class="grid md:grid-cols-2 gap-4"></div>
+            <div id="serversEmpty" class="empty-state hidden"><b>No SSH servers yet</b><span>Add a host with its private key to monitor performance and install dependencies.</span></div>
+          </div>
+        </div>
       </section>
 
       <section id="tab-results" class="tab-view hidden">
@@ -172,6 +201,11 @@
             <input id="exploitCommand" class="input" value="id" placeholder="id" autocomplete="off" />
             <label class="check-option mt-2"><input id="exploitAll" type="checkbox" checked /> Run exploits even when fingerprint is uncertain</label>
           </div>
+        </div>
+        <div>
+          <label class="label">SSH servers (optional)</label>
+          <div id="jobServers" class="server-picker"></div>
+          <p class="text-[11px] text-slate-500 mt-1">Associate fleet hosts with this job. Manage hosts under SSH Servers.</p>
         </div>
         <label class="label">Authorization / scope notes</label>
         <textarea id="scope" class="input h-20" placeholder="Program name, scope reference, operator notes"></textarea>

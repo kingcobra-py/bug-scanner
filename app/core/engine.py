@@ -130,6 +130,8 @@ class ScanEngine:
         return bool(thread and thread.is_alive() and scan_id in self._stop_events)
 
     def start_async(self, config: ScanConfig) -> str:
+        if self.is_active(config.scan_id):
+            raise RuntimeError(f"scan {config.scan_id} is already running")
         t = threading.Thread(target=self.run, args=(config,), daemon=True, name=f"scan-{config.scan_id}")
         with self._lock:
             if config.worker_processes > 1:
@@ -261,10 +263,24 @@ class ScanEngine:
         )
 
         try:
+            from app.core.checkpoint import CheckpointWriter, load_completed_indices, write_meta
+
             target_count = config.target_count or len(config.targets)
-            logger.info("streaming targets=%d", target_count)
+            skip_indices = load_completed_indices(out_dir)
+            already_done = len(skip_indices)
+            write_meta(out_dir, target_count=target_count, resumed=bool(skip_indices))
+            logger.info(
+                "streaming targets=%d checkpoint_done=%d remaining≈%d",
+                target_count,
+                already_done,
+                max(int(target_count) - already_done, 0),
+            )
             # Host-level progress: one Done unit = one domain/IP fully finished.
+            # Seed completed count so resume does not look like 0% again.
             progress.start(max(int(target_count), 1))
+            if already_done:
+                progress.seed_completed(min(already_done, max(int(target_count), 1)))
+            checkpoint = CheckpointWriter(out_dir)
             if config.wordlist_path:
                 config.custom_paths = list(dict.fromkeys([
                     *config.custom_paths,
@@ -279,7 +295,7 @@ class ScanEngine:
                 # contain millions of lines; submitting them all freezes/OOMs.
                 max_inflight = max(config.threads * 3, config.threads)
                 self._drain_pipeline(
-                    targets=iter(self._ingest_targets(config)),
+                    targets=iter(self._ingest_targets(config, skip_indices=skip_indices)),
                     modules=modules,
                     ctx=ctx,
                     pool=pool,
@@ -290,6 +306,7 @@ class ScanEngine:
                         scan_id, findings, out_dir, persisted_ids
                     ),
                     logger=logger,
+                    on_index_done=checkpoint.mark,
                 )
             finally:
                 pool.shutdown(wait=not stop_event.is_set(), cancel_futures=stop_event.is_set())
@@ -393,9 +410,14 @@ class ScanEngine:
         self.store.update_status(scan_id, "stopping" if stop_event.is_set() else "running")
 
         target_count = config.target_count or len(config.targets)
+        from app.core.checkpoint import load_completed_indices, write_meta
+
+        skip_indices = load_completed_indices(out_dir)
+        already_done = len(skip_indices)
+        write_meta(out_dir, target_count=target_count, resumed=bool(skip_indices), processes=num_workers)
         logger.info(
-            "scan start id=%s targets=%d processes=%d threads_per_process=%d",
-            scan_id, target_count, num_workers, threads_per_process,
+            "scan start id=%s targets=%d processes=%d threads_per_process=%d checkpoint_done=%d",
+            scan_id, target_count, num_workers, threads_per_process, already_done,
         )
 
         processes: list[multiprocessing.Process] = []
@@ -617,21 +639,24 @@ class ScanEngine:
             art.join(timeout=10.0)
         return _persist_aggregate(force=True)
 
-    def _ingest_targets(self, config: ScanConfig) -> Iterator[str]:
-        """Yield normalized targets lazily; memory stays flat for huge uploads."""
-        for target in config.targets:
-            normalized = normalize_target((target or "").strip())
-            if normalized:
-                yield normalized
-        if config.targets_path:
-            for target in iter_target_lines(config.targets_path):
-                normalized = normalize_target(target)
-                if normalized:
-                    yield normalized
+    def _ingest_targets(
+        self,
+        config: ScanConfig,
+        *,
+        skip_indices: Optional[set[int]] = None,
+    ) -> Iterator[tuple[int, str]]:
+        """Yield ``(absolute_index, url)`` lazily; skip completed checkpoint indices."""
+        from app.core.checkpoint import iter_indexed_targets
+
+        yield from iter_indexed_targets(
+            config.targets,
+            config.targets_path,
+            skip=skip_indices or set(),
+        )
 
     def _drain_pipeline(
         self,
-        targets: Iterator[str],
+        targets: Iterator[Any],
         modules: list[Any],
         ctx: ScanContext,
         pool: ThreadPoolExecutor,
@@ -640,24 +665,32 @@ class ScanEngine:
         on_finding: Optional[Callable[[Finding], None]],
         on_target_done: Callable[[list[Finding]], None],
         logger,
+        *,
+        on_index_done: Optional[Callable[[int], None]] = None,
     ) -> None:
         """Feed a bounded window of targets through the pipeline pool.
 
         Shared by the single-process run() loop and each multi-process
         worker, so both modes exercise exactly the same submission/backoff
         logic instead of two copies that could silently drift apart.
+
+        ``targets`` may yield bare URLs or ``(absolute_index, url)`` pairs.
         """
-        inflight: dict[Future, str] = {}
+        inflight: dict[Future, tuple[Optional[int], str]] = {}
         exhausted = False
         while (inflight or not exhausted) and not stop_event.is_set():
             while len(inflight) < max_inflight and not exhausted and not stop_event.is_set():
                 try:
-                    turl = next(targets)
+                    item = next(targets)
                 except StopIteration:
                     exhausted = True
                     break
+                if isinstance(item, tuple) and len(item) == 2:
+                    idx, turl = int(item[0]), str(item[1])
+                else:
+                    idx, turl = None, str(item)
                 future = pool.submit(self._run_target_pipeline, turl, modules, ctx, on_finding, logger)
-                inflight[future] = turl
+                inflight[future] = (idx, turl)
             if not inflight:
                 continue
             # Timed wait so a Stop request is not blocked behind a single
@@ -669,10 +702,18 @@ class ScanEngine:
                     fut.cancel()
                 break
             for future in done:
-                turl = inflight.pop(future)
+                idx, turl = inflight.pop(future)
                 try:
                     on_target_done(future.result())
+                    if idx is not None and on_index_done:
+                        on_index_done(idx)
                 except Exception as e:
+                    # Still checkpoint so resume does not retry forever.
+                    if idx is not None and on_index_done:
+                        try:
+                            on_index_done(idx)
+                        except Exception:
+                            pass
                     # ``_run_target_pipeline`` already counted this host via
                     # ``complete_target`` before re-raising.
                     logger.error("target failed %s: %s", turl, e)

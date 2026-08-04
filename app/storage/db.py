@@ -176,14 +176,52 @@ class ScanStore:
 
     def create_scan(self, scan_id: str, config: dict[str, Any], output_dir: str) -> None:
         with self._lock, Session(self.engine) as s:
-            row = ScanRow(
-                id=scan_id,
-                status="pending",
-                config_json=json.dumps(config),
-                output_dir=output_dir,
-            )
-            s.merge(row)
+            existing = s.get(ScanRow, scan_id)
+            if existing:
+                # Resume / restart of the same id must keep findings + progress.
+                existing.config_json = json.dumps(config)
+                existing.output_dir = output_dir or existing.output_dir
+                existing.status = existing.status or "pending"
+                existing.archived = 0
+                existing.updated_at = datetime.now(timezone.utc)
+            else:
+                s.add(
+                    ScanRow(
+                        id=scan_id,
+                        status="pending",
+                        config_json=json.dumps(config),
+                        output_dir=output_dir,
+                    )
+                )
             s.commit()
+
+    def rebuild_scan_config(self, scan_id: str) -> Optional[dict[str, Any]]:
+        """Rebuild a ScanConfig-ready dict from a stopped scan's artifacts."""
+        row = self.get_scan(scan_id, compact=False)
+        if not row:
+            return None
+        config = dict(row.get("config") or {})
+        out_dir = Path(row.get("output_dir") or "")
+        if not out_dir:
+            return None
+        targets_file = out_dir / "targets.txt"
+        paths_file = out_dir / "custom_paths.txt"
+        config["scan_id"] = scan_id
+        config["targets"] = []
+        config["custom_paths"] = []
+        config["output_dir"] = str(out_dir.parent) if out_dir.name == scan_id else str(out_dir)
+        # engine uses output_dir / scan_id — store output_dir is usually the scan folder.
+        # Prefer parent as ScanConfig.output_dir when folder is already .../scans/<id>.
+        if out_dir.name == scan_id:
+            config["output_dir"] = str(out_dir.parent)
+        else:
+            config["output_dir"] = str(out_dir)
+        if targets_file.is_file():
+            config["targets_path"] = str(targets_file)
+        if paths_file.is_file():
+            config["wordlist_path"] = str(paths_file)
+        config.setdefault("target_count", int(config.get("target_count") or 0))
+        return config
 
     def update_status(self, scan_id: str, status: str) -> None:
         with self._lock, Session(self.engine) as s:

@@ -37,29 +37,34 @@ from app.utils.logger import add_log_subscriber, get_scan_logger, remove_log_sub
 from app.utils.normalize import normalize_target
 
 
-def iter_sharded_targets(config: ScanConfig, worker_id: int, num_workers: int) -> Iterator[str]:
+def iter_sharded_targets(
+    config: ScanConfig,
+    worker_id: int,
+    num_workers: int,
+    *,
+    skip_indices: set[int] | None = None,
+) -> Iterator[tuple[int, str]]:
     """Deterministic static sharding by stream position.
 
     Every worker iterates the exact same source (inline list, then the
     streamed targets_path file) independently and keeps only the Nth
-    items assigned to it. This needs zero coordination between workers:
-    the union of all shards is exactly the original target list, with no
-    duplicates and no gaps, as long as every worker uses the same
-    num_workers value (which they all receive from the same ScanConfig).
+    items assigned to it. Yields ``(absolute_index, url)`` so callers can
+    checkpoint completions for resume-after-reboot.
     """
+    skip = skip_indices or set()
     index = 0
     for target in config.targets:
         normalized = normalize_target((target or "").strip())
         if normalized:
-            if index % num_workers == worker_id:
-                yield normalized
+            if index % num_workers == worker_id and index not in skip:
+                yield index, normalized
             index += 1
     if config.targets_path:
         for target in iter_target_lines(config.targets_path):
             normalized = normalize_target(target)
             if normalized:
-                if index % num_workers == worker_id:
-                    yield normalized
+                if index % num_workers == worker_id and index not in skip:
+                    yield index, normalized
                 index += 1
 
 
@@ -173,10 +178,18 @@ def run_worker(
     )
 
     try:
+        from app.core.checkpoint import CheckpointWriter, load_completed_indices
+
         # Host-level progress for this shard (ceil split of the target list).
         target_count = int(config.target_count or len(config.targets) or 0)
         shard_hosts = max((target_count + num_workers - 1) // num_workers, 1)
+        skip_indices = load_completed_indices(out_dir)
+        # Approximate how many of this shard were already finished.
+        shard_done = sum(1 for idx in skip_indices if idx % num_workers == worker_id)
         progress.start(shard_hosts)
+        if shard_done:
+            progress.seed_completed(min(shard_done, shard_hosts))
+        checkpoint = CheckpointWriter(out_dir)
 
         from concurrent.futures import ThreadPoolExecutor
 
@@ -184,7 +197,9 @@ def run_worker(
         try:
             max_inflight = max(threads_per_process * 3, threads_per_process)
             engine._drain_pipeline(
-                targets=iter_sharded_targets(config, worker_id, num_workers),
+                targets=iter_sharded_targets(
+                    config, worker_id, num_workers, skip_indices=skip_indices
+                ),
                 modules=modules,
                 ctx=ctx,
                 pool=pool,
@@ -193,6 +208,7 @@ def run_worker(
                 on_finding=_live_finding,
                 on_target_done=_on_target_done,
                 logger=logger,
+                on_index_done=checkpoint.mark,
             )
         finally:
             # Closing the shared client first aborts in-flight socket reads so

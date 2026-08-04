@@ -12,7 +12,10 @@ def test_shards_partition_inline_targets_without_overlap(tmp_path):
     config = ScanConfig(targets=targets, output_dir=str(tmp_path))
     num_workers = 5
 
-    shards = [set(iter_sharded_targets(config, worker_id, num_workers)) for worker_id in range(num_workers)]
+    shards = [
+        {url for _idx, url in iter_sharded_targets(config, worker_id, num_workers)}
+        for worker_id in range(num_workers)
+    ]
 
     union: set[str] = set()
     for shard in shards:
@@ -38,11 +41,18 @@ def test_shards_partition_streamed_file(tmp_path):
 
     combined: set[str] = set()
     for shard in shards:
-        combined.update(shard)
+        combined.update(url for _idx, url in shard)
     assert combined == {f"http://target-{i}.example" for i in range(233)}
 
 
 def test_single_worker_shard_covers_everything(tmp_path):
     config = ScanConfig(targets=["a.example", "b.example"], output_dir=str(tmp_path))
     shard = list(iter_sharded_targets(config, worker_id=0, num_workers=1))
-    assert shard == ["https://a.example", "https://b.example"]
+    assert shard == [(0, "https://a.example"), (1, "https://b.example")]
+
+
+def test_sharded_skip_indices_for_resume(tmp_path):
+    config = ScanConfig(targets=["a.example", "b.example", "c.example", "d.example"], output_dir=str(tmp_path))
+    skip = {0, 2}
+    shard = list(iter_sharded_targets(config, 0, 1, skip_indices=skip))
+    assert shard == [(1, "https://b.example"), (3, "https://d.example")]

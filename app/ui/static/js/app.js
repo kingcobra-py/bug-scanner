@@ -5,6 +5,7 @@ const state = {
   uploads: [],
   jobs: [],
   allScans: [],
+  servers: [],
   scanId: null,
   provider: "",
   results: null,
@@ -12,6 +13,7 @@ const state = {
   ws: null,
   pingTimer: null,
   jobsRefreshPending: false,
+  serversRefreshPending: false,
   resultsRefreshPending: false,
   resultsRequestScan: null,
   resultsController: null,
@@ -102,6 +104,7 @@ function showTab(name) {
   document.querySelectorAll(".nav-tab").forEach((el) => el.classList.toggle("active", el.dataset.tab === name));
   if (name === "uploads") refreshUploads();
   if (name === "jobs") refreshJobs();
+  if (name === "servers") refreshServers();
   if (name === "results") reloadResults();
   if (name === "logs") reloadLogs();
 }
@@ -351,7 +354,7 @@ function populateUploadSelects() {
 }
 
 async function openJobModal() {
-  await refreshUploads();
+  await Promise.all([refreshUploads(), refreshServers()]);
   if (!state.uploads.some((item) => item.kind === "targets" && item.exists !== false)) {
     showTab("uploads");
     $("uploadMessage").innerHTML = '<span class="text-amber-300">Upload a targets file before creating a job.</span>';
@@ -361,6 +364,7 @@ async function openJobModal() {
   setExploitsEnabled(false);
   if ($("exploitCommand")) $("exploitCommand").value = "id";
   if ($("exploitAll")) $("exploitAll").checked = true;
+  renderJobServerPicker();
   $("jobModal").classList.add("open");
 }
 
@@ -407,6 +411,7 @@ async function startJob(event) {
     exploit_all: exploitsEnabled() && Boolean($("exploitAll")?.checked),
     redact_secrets: false,
     scope_notes: $("scope").value,
+    ssh_server_ids: selectedServerIds(),
   };
   if (!body.modules.length) {
     $("jobError").textContent = "Enable at least one scan module.";
@@ -496,6 +501,21 @@ function renderJobs() {
         } catch (error) {
           alert(error.message);
         }
+      } else if (action === "resume") {
+        if (!confirm("Resume this job from its last checkpoint?")) return;
+        button.disabled = true;
+        button.textContent = "Resuming…";
+        try {
+          const response = await api(`/api/scans/${encodeURIComponent(id)}/resume`, { method: "POST" });
+          const job = state.jobs.find((item) => item.id === id);
+          if (job) job.status = response.status || "running";
+          selectScan(id, true);
+          await refreshJobs();
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = "Resume";
+          alert(error.message);
+        }
       } else {
         if (!confirm("Remove this job from Jobs? Its results, findings, and artifacts will be preserved.")) return;
         button.disabled = true;
@@ -521,12 +541,16 @@ function jobCard(job) {
   const modules = config.modules || [];
   const canStop = ["running", "pending"].includes(job.status);
   const isStopping = job.status === "stopping";
+  const total = Number(progress.total || config.target_count || 0);
+  const finished = Number(progress.done || 0) + Number(progress.failed || 0);
+  const canResume = ["stopped", "failed"].includes(job.status) && (!total || finished < total);
   const isStoppedEarly = job.status === "stopped" && pct > 0 && pct < 100;
   const statusLabel = isStoppedEarly ? `stopped @ ${pct.toFixed(1)}%` : job.status;
+  const serverCount = Array.isArray(config.ssh_server_ids) ? config.ssh_server_ids.length : 0;
   return `
     <article class="job-card ${esc(job.status)}">
       <div class="job-card-head">
-        <div class="min-w-0"><div class="job-title truncate">${esc(name)}</div><div class="job-id">${esc(job.id)} · ${formatNumber(config.target_count ?? (config.targets || []).length)} targets${Number(config.worker_processes) > 1 ? ` · ${config.worker_processes} processes` : ""} · ${esc(formatHitTime(job.updated_at || job.created_at))}</div></div>
+        <div class="min-w-0"><div class="job-title truncate">${esc(name)}</div><div class="job-id">${esc(job.id)} · ${formatNumber(config.target_count ?? (config.targets || []).length)} targets${Number(config.worker_processes) > 1 ? ` · ${config.worker_processes} processes` : ""}${serverCount ? ` · ${serverCount} SSH` : ""} · ${esc(formatHitTime(job.updated_at || job.created_at))}</div></div>
         <span class="status-badge ${esc(job.status)}" title="${esc(job.status)}">${esc(statusLabel)}</span>
       </div>
       <div class="flex justify-between text-[11px] text-slate-500 mt-4 mb-1.5"><span>${pct.toFixed(1)}%</span><span>ETA ${formatEta(progress.eta_seconds)}</span></div>
@@ -540,7 +564,8 @@ function jobCard(job) {
       </div>
       <div class="text-[11px] text-slate-500 truncate mt-3">${esc(progress.current_module || "idle")} ${progress.current_target ? `@ ${esc(progress.current_target)}` : ""}</div>
       <div class="module-pills">${modules.map((name) => `<span>${esc(name)}</span>`).join("")}</div>
-      <div class="flex gap-2 justify-end mt-4">
+      <div class="flex gap-2 justify-end mt-4 flex-wrap">
+        ${canResume ? `<button class="btn-primary job-action" data-id="${esc(job.id)}" data-action="resume">Resume</button>` : ""}
         ${isStopping
           ? '<button class="btn-ghost" disabled>Stopping…</button>'
           : `<button class="btn-destructive job-action" data-id="${esc(job.id)}" data-action="${canStop ? "stop" : "delete"}">${canStop ? "Stop" : "Delete"}</button>`}
@@ -548,6 +573,167 @@ function jobCard(job) {
         <button class="btn-ghost view-results" data-id="${esc(job.id)}">Results →</button>
       </div>
     </article>`;
+}
+
+function selectedServerIds() {
+  return [...document.querySelectorAll("#jobServers input[type=checkbox]:checked")].map((el) => el.value);
+}
+
+function renderJobServerPicker() {
+  const box = $("jobServers");
+  if (!box) return;
+  if (!state.servers.length) {
+    box.innerHTML = "";
+    return;
+  }
+  box.innerHTML = state.servers.map((server) => `
+    <label>
+      <input type="checkbox" value="${esc(server.id)}" />
+      <span>${esc(server.label || server.host)} <small class="text-slate-500">${esc(server.endpoint || `${server.host}:${server.port}`)}</small></span>
+    </label>`).join("");
+}
+
+async function refreshServers(forceMetrics = false) {
+  if (state.serversRefreshPending) return;
+  state.serversRefreshPending = true;
+  try {
+    state.servers = forceMetrics
+      ? await api("/api/servers/refresh", { method: "POST" })
+      : await api("/api/servers");
+    renderServers();
+    renderJobServerPicker();
+  } catch (error) {
+    const grid = $("serversGrid");
+    if (grid) grid.innerHTML = `<div class="text-red-300">${esc(error.message)}</div>`;
+  } finally {
+    state.serversRefreshPending = false;
+  }
+}
+
+function metricPct(metrics, key) {
+  const value = Number(metrics?.[key] || 0);
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, value));
+}
+
+function serverCard(server) {
+  const metrics = server.metrics || {};
+  const online = server.status === "online" || metrics.online === true;
+  const cpu = metricPct(metrics, "cpu_percent");
+  const mem = metricPct(metrics, "memory_percent");
+  const disk = metricPct(metrics, "disk_percent");
+  const authLabel = server.auth_type === "password" ? "Password" : "Key";
+  return `
+    <article class="ssh-card" data-id="${esc(server.id)}">
+      <div class="ssh-card-head">
+        <div class="ssh-card-title">
+          <div class="ssh-rack" aria-hidden="true">▮</div>
+          <div class="min-w-0">
+            <div class="ssh-host">${esc(server.label || server.host)}</div>
+            <div class="ssh-endpoint">${esc(server.endpoint || `${server.host}:${server.port}`)}</div>
+          </div>
+        </div>
+        <span class="status-badge ${online ? "online" : "offline"}">${online ? "Online" : "Offline"}</span>
+      </div>
+      <div class="ssh-meta">
+        <div class="ssh-meta-box"><span>Username</span><b>${esc(server.username || "ubuntu")}</b></div>
+        <div class="ssh-meta-box"><span>Auth</span><b><span class="ssh-key-icon">⌁</span> ${esc(authLabel)}</b></div>
+      </div>
+      <div class="ssh-bars">
+        <div class="ssh-bar-row"><span>CPU</span><div class="ssh-bar-track"><div class="ssh-bar-fill" style="width:${cpu}%"></div></div><b>${cpu.toFixed(0)}%</b></div>
+        <div class="ssh-bar-row"><span>Memory</span><div class="ssh-bar-track"><div class="ssh-bar-fill mem" style="width:${mem}%"></div></div><b>${mem.toFixed(0)}%</b></div>
+        <div class="ssh-bar-row"><span>Disk</span><div class="ssh-bar-track"><div class="ssh-bar-fill disk" style="width:${disk}%"></div></div><b>${disk.toFixed(0)}%</b></div>
+      </div>
+      <div class="ssh-mini-grid">
+        <div class="ssh-mini"><span>Cores</span><b>${esc(metrics.cores ?? "-")}</b></div>
+        <div class="ssh-mini"><span>Load</span><b>${esc(metrics.load ?? "-")}</b></div>
+        <div class="ssh-mini"><span>Procs</span><b>${esc(metrics.procs ?? "-")}</b></div>
+        <div class="ssh-mini"><span>Net</span><b>${esc(metrics.net ?? "-")}</b></div>
+      </div>
+      <div class="ssh-error">${esc(server.last_error || metrics.error || "")}</div>
+      <div class="ssh-actions">
+        <button class="btn-ghost server-action" data-id="${esc(server.id)}" data-action="install">⇩ Install Deps</button>
+        <button class="btn-danger server-action" data-id="${esc(server.id)}" data-action="remove">Remove</button>
+      </div>
+    </article>`;
+}
+
+function renderServers() {
+  const grid = $("serversGrid");
+  const empty = $("serversEmpty");
+  if (!grid || !empty) return;
+  empty.classList.toggle("hidden", Boolean(state.servers.length));
+  grid.innerHTML = state.servers.map(serverCard).join("");
+  grid.querySelectorAll(".server-action").forEach((button) => {
+    button.onclick = async () => {
+      const id = button.dataset.id;
+      const action = button.dataset.action;
+      if (action === "remove") {
+        if (!confirm("Remove this SSH server from the fleet?")) return;
+        button.disabled = true;
+        try {
+          await api(`/api/servers/${encodeURIComponent(id)}`, { method: "DELETE" });
+          await refreshServers();
+        } catch (error) {
+          button.disabled = false;
+          alert(error.message);
+        }
+        return;
+      }
+      if (action === "install") {
+        if (!confirm("Install Python dependencies on this remote host under /opt/bb-scanner?")) return;
+        button.disabled = true;
+        button.textContent = "Installing…";
+        try {
+          const result = await api(`/api/servers/${encodeURIComponent(id)}/install-deps`, { method: "POST" });
+          if (!result.ok) throw new Error(result.message || "Install failed");
+          await refreshServers();
+        } catch (error) {
+          alert(error.message);
+          button.disabled = false;
+          button.textContent = "Install Deps";
+          await refreshServers();
+        }
+      }
+    };
+  });
+}
+
+async function addServer(event) {
+  if (event?.preventDefault) event.preventDefault();
+  const host = $("sshHost")?.value.trim();
+  const privateKey = $("sshKey")?.value.trim();
+  if (!host || !privateKey) {
+    $("serverError").textContent = "Host and private key are required.";
+    return;
+  }
+  const button = $("addServerBtn");
+  button.disabled = true;
+  button.textContent = "Adding…";
+  $("serverError").textContent = "";
+  try {
+    await api("/api/servers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        host,
+        port: Number($("sshPort").value || 22),
+        username: ($("sshUser").value || "ubuntu").trim() || "ubuntu",
+        label: ($("sshLabel").value || "").trim(),
+        auth_type: "key",
+        private_key: privateKey,
+      }),
+    });
+    $("serverForm").reset();
+    $("sshPort").value = "22";
+    $("sshUser").value = "ubuntu";
+    await refreshServers();
+  } catch (error) {
+    $("serverError").textContent = error.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = "Add server";
+  }
 }
 
 function syncScanSelectors() {
@@ -852,6 +1038,9 @@ function bindEvents() {
   on("exportCsv", "onclick", () => exportFormat("csv"));
   on("exportVulns", "onclick", () => exportFormat("vulns_csv"));
   on("exportHosts", "onclick", () => exportFormat("hosts"));
+  on("refreshServers", "onclick", () => refreshServers(true));
+  on("serverForm", "onsubmit", addServer);
+  on("addServerBtn", "onclick", addServer);
   const secretsBox = $("secretsBox");
   if (secretsBox) {
     secretsBox.addEventListener("click", async (event) => {
@@ -875,12 +1064,15 @@ async function init() {
     console.error("UI bootstrap failed", error);
   }
   try {
-    await Promise.all([refreshUploads(), refreshJobs()]);
+    await Promise.all([refreshUploads(), refreshJobs(), refreshServers()]);
   } catch (error) {
     console.error("Initial data load failed", error);
   }
   if (state.scanId) connectWs(state.scanId);
   setInterval(refreshJobs, 4000);
+  setInterval(() => {
+    if (state.tab === "servers") refreshServers(true);
+  }, 15000);
   setInterval(() => {
     if (state.tab === "logs") reloadLogs();
   }, 3000);

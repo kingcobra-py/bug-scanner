@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
 import threading
 import time
+from dataclasses import fields
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,6 +23,14 @@ from pydantic import BaseModel, Field
 from app.core.engine import ScanEngine
 from app.core.providers import provider_for_kind, provider_metadata
 from app.core.result_secrets import is_noise_env_key, normalize_result_secrets
+from app.core.ssh_servers import (
+    SshServer,
+    SshServerStore,
+    collect_metrics,
+    install_deps,
+    new_server_id,
+    public_server_dict,
+)
 from app.extractors.patterns import IGNORED_SECRET_KINDS
 from app.core.uploads import (
     DIRECT_UPLOAD_BYTES,
@@ -42,9 +52,11 @@ from app.utils.dedupe import dedupe_findings, value_hash
 ROOT = Path(__file__).resolve().parents[2]
 UI_DIR = ROOT / "app" / "ui"
 UPLOAD_DIR = ROOT / "output" / "uploads"
+log = logging.getLogger("bb.api")
 
 store = ScanStore(ROOT / "output" / "scans" / "scanner.db")
 engine = ScanEngine(store=store, enable_cli_progress=False)
+ssh_store = SshServerStore(ROOT / "output" / "ssh_servers.json")
 LOG_LINE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[(?P<level>[A-Z]+)\]\s+\[(?P<module>[^\]]+)\]\s*(?P<message>.*)$"
 )
@@ -293,12 +305,63 @@ class ScanCreate(BaseModel):
     exploit_enabled: bool = False
     exploit_command: str = "id"
     exploit_all: bool = False
+    ssh_server_ids: list[str] = Field(default_factory=list)
+
+
+class SshServerCreate(BaseModel):
+    host: str
+    port: int = 22
+    username: str = "ubuntu"
+    auth_type: str = "key"
+    private_key: str = ""
+    password: str = ""
+    label: str = ""
 
 
 class ChunkUploadInit(BaseModel):
     filename: str
     kind: str = "targets"
     total_size: int
+
+
+def _scan_config_from_dict(data: dict[str, Any]) -> ScanConfig:
+    known = {f.name for f in fields(ScanConfig)}
+    payload = {k: v for k, v in data.items() if k in known}
+    payload.setdefault("targets", [])
+    payload.setdefault("custom_paths", [])
+    return ScanConfig(**payload)
+
+
+def _resume_scan(scan_id: str) -> dict[str, Any]:
+    """Rebuild config from disk artifacts and continue from checkpoint."""
+    if engine.is_active(scan_id):
+        raise HTTPException(status_code=409, detail="scan is already running")
+    row = store.get_scan(scan_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="scan not found")
+    status = row.get("status") or ""
+    if status == "completed":
+        raise HTTPException(status_code=400, detail="scan already completed")
+    if status in {"pending", "running", "stopping"} and engine.is_active(scan_id):
+        raise HTTPException(status_code=409, detail="scan is already running")
+    progress = row.get("progress") or {}
+    total = int(progress.get("total") or (row.get("config") or {}).get("target_count") or 0)
+    done = int(progress.get("done") or 0) + int(progress.get("failed") or 0)
+    if total and done >= total and status == "completed":
+        raise HTTPException(status_code=400, detail="scan already completed")
+    cfg_dict = store.rebuild_scan_config(scan_id)
+    if not cfg_dict:
+        raise HTTPException(status_code=400, detail="could not rebuild scan config")
+    if not cfg_dict.get("targets_path") and not cfg_dict.get("targets"):
+        raise HTTPException(status_code=400, detail="missing targets snapshot for resume")
+    cfg = _scan_config_from_dict(cfg_dict)
+    cfg.scan_id = scan_id
+    store.update_status(scan_id, "pending")
+    try:
+        engine.start_async(cfg)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"id": scan_id, "status": "running", "resumed": True}
 
 
 def create_app() -> FastAPI:
@@ -313,17 +376,34 @@ def create_app() -> FastAPI:
     async def _startup() -> None:
         global _loop
         _loop = asyncio.get_running_loop()
-        # Worker threads do not survive a service restart. Reconcile stale
-        # persisted rows so they can be deleted and never look unstoppable.
+        # Worker threads do not survive a service restart. Mark orphans stopped,
+        # then auto-resume incomplete ones from their durable checkpoints so a
+        # reboot does not force operators to start from target 0 again.
+        orphan_ids: list[str] = []
         for scan in store.list_scans(limit=1000, compact=True):
             if scan.get("status") in {"pending", "running", "stopping"} and not engine.is_active(scan["id"]):
                 store.update_status(scan["id"], "stopped")
+                orphan_ids.append(scan["id"])
         # One-time shrink of legacy summary_json rows that still embed the full
         # target list (those alone made /api/scans compact responses >1MB).
         try:
             store.slim_stored_summaries()
         except Exception:
             pass
+        for scan_id in orphan_ids:
+            row = store.get_scan(scan_id, compact=True) or {}
+            progress = row.get("progress") or {}
+            total = int(progress.get("total") or (row.get("config") or {}).get("target_count") or 0)
+            finished = int(progress.get("done") or 0) + int(progress.get("failed") or 0)
+            if total and finished >= total:
+                continue
+            try:
+                await asyncio.to_thread(_resume_scan, scan_id)
+                log.info("Auto-resumed interrupted scan %s after restart", scan_id)
+            except HTTPException as exc:
+                log.warning("Could not auto-resume scan %s: %s", scan_id, exc.detail)
+            except Exception as exc:
+                log.warning("Could not auto-resume scan %s: %s", scan_id, exc)
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -405,6 +485,7 @@ def create_app() -> FastAPI:
             exploit_all=bool(body.exploit_all),
             output_dir=str(ROOT / "output" / "scans"),
         )
+        ssh_server_ids = [sid for sid in (body.ssh_server_ids or []) if isinstance(sid, str) and sid.strip()]
         out_dir = Path(cfg.output_dir) / cfg.scan_id
         out_dir.mkdir(parents=True, exist_ok=True)
         # Hard-link large uploads into the scan directory in O(1). The job no
@@ -454,6 +535,7 @@ def create_app() -> FastAPI:
                 "scan_id": cfg.scan_id,
                 "target_count": cfg.target_count,
                 "custom_path_count": cfg.custom_path_count,
+                "ssh_server_ids": ssh_server_ids,
             },
             str(out_dir),
         )
@@ -477,6 +559,95 @@ def create_app() -> FastAPI:
     async def get_scan(scan_id: str) -> dict[str, Any]:
         row = store.get_scan(scan_id)
         return row or {"error": "not found"}
+
+    @app.post("/api/scans/{scan_id}/resume")
+    async def resume_scan(scan_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(_resume_scan, scan_id)
+
+    @app.get("/api/servers")
+    async def list_servers() -> list[dict[str, Any]]:
+        return [public_server_dict(s) for s in ssh_store.list()]
+
+    @app.post("/api/servers")
+    async def create_server(body: SshServerCreate) -> dict[str, Any]:
+        host = (body.host or "").strip()
+        if not host:
+            raise HTTPException(status_code=400, detail="host is required")
+        if body.auth_type == "key" and not (body.private_key or "").strip():
+            raise HTTPException(status_code=400, detail="private_key is required for key auth")
+        server = SshServer(
+            id=new_server_id(),
+            host=host,
+            port=max(1, min(int(body.port or 22), 65535)),
+            username=(body.username or "ubuntu").strip() or "ubuntu",
+            auth_type="key" if body.auth_type != "password" else "password",
+            private_key=body.private_key or "",
+            password=body.password or "",
+            label=(body.label or "").strip()[:120],
+            status="unknown",
+        )
+        # Probe once on create so the card shows Online/Offline immediately.
+        metrics = await asyncio.to_thread(collect_metrics, server)
+        server.metrics = metrics
+        server.status = "online" if metrics.get("online") else "offline"
+        server.last_error = str(metrics.get("error") or "")
+        ssh_store.upsert(server)
+        return public_server_dict(server)
+
+    @app.get("/api/servers/{server_id}")
+    async def get_server(server_id: str) -> dict[str, Any]:
+        server = ssh_store.get(server_id)
+        if not server:
+            raise HTTPException(status_code=404, detail="server not found")
+        return public_server_dict(server)
+
+    @app.delete("/api/servers/{server_id}")
+    async def delete_server(server_id: str) -> dict[str, Any]:
+        if not ssh_store.delete(server_id):
+            raise HTTPException(status_code=404, detail="server not found")
+        return {"deleted": True, "id": server_id}
+
+    @app.post("/api/servers/{server_id}/metrics")
+    async def refresh_server_metrics(server_id: str) -> dict[str, Any]:
+        server = ssh_store.get(server_id)
+        if not server:
+            raise HTTPException(status_code=404, detail="server not found")
+        metrics = await asyncio.to_thread(collect_metrics, server)
+        server.metrics = metrics
+        server.status = "online" if metrics.get("online") else "offline"
+        server.last_error = str(metrics.get("error") or "")
+        ssh_store.upsert(server)
+        return public_server_dict(server)
+
+    @app.post("/api/servers/refresh")
+    async def refresh_all_server_metrics() -> list[dict[str, Any]]:
+        servers = ssh_store.list()
+
+        def _refresh_one(server: SshServer) -> SshServer:
+            metrics = collect_metrics(server)
+            server.metrics = metrics
+            server.status = "online" if metrics.get("online") else "offline"
+            server.last_error = str(metrics.get("error") or "")
+            return ssh_store.upsert(server)
+
+        refreshed = await asyncio.gather(*[
+            asyncio.to_thread(_refresh_one, server) for server in servers
+        ])
+        return [public_server_dict(s) for s in refreshed]
+
+    @app.post("/api/servers/{server_id}/install-deps")
+    async def install_server_deps(server_id: str) -> dict[str, Any]:
+        server = ssh_store.get(server_id)
+        if not server:
+            raise HTTPException(status_code=404, detail="server not found")
+        result = await asyncio.to_thread(install_deps, server)
+        # Refresh metrics after install so Online/Offline stays current.
+        metrics = await asyncio.to_thread(collect_metrics, server)
+        server.metrics = metrics
+        server.status = "online" if metrics.get("online") else "offline"
+        server.last_error = str(metrics.get("error") or "") if not result.get("ok") else ""
+        ssh_store.upsert(server)
+        return {"server": public_server_dict(server), **result}
 
     @app.get("/api/scans/{scan_id}/findings")
     async def get_findings(
