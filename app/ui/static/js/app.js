@@ -16,6 +16,7 @@ const state = {
   resultsRequestScan: null,
   resultsController: null,
   resultsCache: new Map(),
+  resultsCacheAt: new Map(),
   logsRefreshPending: false,
   resultReloadTimer: null,
 };
@@ -623,8 +624,10 @@ function connectWs(id) {
 }
 
 function scheduleResultsReload() {
+  // Large running scans take a long time to aggregate Results. Debounce hard
+  // so finding spam does not abort/restart the in-flight request.
   if (state.resultReloadTimer) clearTimeout(state.resultReloadTimer);
-  state.resultReloadTimer = setTimeout(reloadResults, 500);
+  state.resultReloadTimer = setTimeout(() => reloadResults(false), 60000);
 }
 
 function applyResultsPayload(results) {
@@ -643,12 +646,24 @@ async function reloadResults(force = false) {
   const job = state.allScans.find((item) => item.id === scanId);
   const active = ["running", "pending", "stopping"].includes(job?.status);
   if (cached && !force && !active) return;
+  // Active scans: keep showing cache and refresh at most once per minute.
+  if (cached && !force && active) {
+    const age = Date.now() - Number(state.resultsCacheAt.get(scanId) || 0);
+    if (age < 60000) return;
+  }
+  // Never abort an in-flight Results request for the same scan — that is what
+  // made the UI report "Failed to fetch" on multi-GB jobs.
   if (state.resultsRefreshPending && state.resultsRequestScan === scanId) return;
+  if (state.resultsController && state.resultsRequestScan === scanId) return;
   if (state.resultsController) state.resultsController.abort();
   const controller = new AbortController();
   state.resultsController = controller;
   state.resultsRequestScan = scanId;
   state.resultsRefreshPending = true;
+  if (!cached && $("resultSummary")) {
+    $("resultSummary").innerHTML =
+      '<div class="text-slate-400 text-sm">Loading results… large running scans can take 1–2 minutes. Keep this tab open.</div>';
+  }
   try {
     const results = await api(
       `/api/scans/${encodeURIComponent(scanId)}/results`,
@@ -656,6 +671,7 @@ async function reloadResults(force = false) {
     );
     if (state.scanId !== scanId) return;
     state.resultsCache.set(scanId, results);
+    state.resultsCacheAt.set(scanId, Date.now());
     applyResultsPayload(results);
   } catch (error) {
     if (error?.name !== "AbortError" && state.scanId === scanId && !cached) {
@@ -782,6 +798,7 @@ async function purgeSelectedJob() {
   try {
     await api(`/api/scans/${encodeURIComponent(scanId)}/purge`, { method: "DELETE" });
     state.resultsCache.delete(scanId);
+    state.resultsCacheAt.delete(scanId);
     state.results = null;
     state.scanId = null;
     await refreshJobs();
@@ -866,8 +883,11 @@ async function init() {
   setInterval(refreshJobs, 4000);
   setInterval(() => {
     if (state.tab === "logs") reloadLogs();
-    if (state.tab === "results") reloadResults();
   }, 3000);
+  // Results for huge scans is expensive — poll slowly and rely on cache/WS debounce.
+  setInterval(() => {
+    if (state.tab === "results") reloadResults(false);
+  }, 30000);
 }
 
 init();

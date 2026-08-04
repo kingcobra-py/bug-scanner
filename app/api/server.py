@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -223,6 +224,31 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 _loop: Optional[asyncio.AbstractEventLoop] = None
+_RESULTS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_RESULTS_CACHE_LOCK = threading.Lock()
+_RESULTS_CACHE_TTL_SEC = 30.0
+
+
+def _results_cache_get(cache_key: str) -> Optional[dict[str, Any]]:
+    with _RESULTS_CACHE_LOCK:
+        item = _RESULTS_CACHE.get(cache_key)
+        if not item:
+            return None
+        expires_at, payload = item
+        if expires_at < time.monotonic():
+            _RESULTS_CACHE.pop(cache_key, None)
+            return None
+        return payload
+
+
+def _results_cache_set(cache_key: str, payload: dict[str, Any]) -> None:
+    with _RESULTS_CACHE_LOCK:
+        _RESULTS_CACHE[cache_key] = (time.monotonic() + _RESULTS_CACHE_TTL_SEC, payload)
+        # Bound memory if many scans are viewed.
+        if len(_RESULTS_CACHE) > 32:
+            oldest = sorted(_RESULTS_CACHE.items(), key=lambda kv: kv[1][0])[:8]
+            for key, _ in oldest:
+                _RESULTS_CACHE.pop(key, None)
 
 
 def _broadcast_threadsafe(message: dict[str, Any]) -> None:
@@ -690,23 +716,22 @@ def create_app() -> FastAPI:
             "targets_text": "\n".join(targets),
         }
 
-    @app.get("/api/scans/{scan_id}/results")
-    async def get_results(
+    def _build_results_payload(
         scan_id: str,
+        *,
         provider: Optional[str] = None,
         include_findings: bool = False,
         hosts_page: int = 1,
         hosts_page_size: int = 20,
     ) -> dict[str, Any]:
+        """Heavy Results aggregation — must not run on the asyncio event loop."""
         row = store.get_scan(scan_id, compact=True)
         if not row:
-            raise HTTPException(status_code=404, detail="scan not found")
+            raise KeyError("scan not found")
         findings = dedupe_findings(store.get_findings(scan_id))
         by_severity: dict[str, int] = {}
         by_module: dict[str, int] = {}
-        secrets: list[dict[str, Any]] = []
         raw_secrets: list[dict[str, Any]] = []
-        provider_counts: dict[str, int] = {}
         host_map: dict[str, dict[str, Any]] = {}
         for f in findings:
             sev = f.get("severity") or "info"
@@ -799,7 +824,7 @@ def create_app() -> FastAPI:
         secrets = normalize_result_secrets(raw_secrets)
         # Provider counts must reflect the post-normalized secret list
         # (paired AWS rows collapse two kinds into one).
-        provider_counts = {}
+        provider_counts: dict[str, int] = {}
         cleaned: list[dict[str, Any]] = []
         for item in secrets:
             kind = str(item.get("kind") or "")
@@ -888,6 +913,35 @@ def create_app() -> FastAPI:
                 }
                 for finding in findings[:100]
             ]
+        return payload
+
+    @app.get("/api/scans/{scan_id}/results")
+    async def get_results(
+        scan_id: str,
+        provider: Optional[str] = None,
+        include_findings: bool = False,
+        hosts_page: int = 1,
+        hosts_page_size: int = 20,
+    ) -> dict[str, Any]:
+        cache_key = (
+            f"{scan_id}|{provider or ''}|{int(include_findings)}|"
+            f"{int(hosts_page or 1)}|{int(hosts_page_size or 20)}"
+        )
+        cached = _results_cache_get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            payload = await asyncio.to_thread(
+                _build_results_payload,
+                scan_id,
+                provider=provider,
+                include_findings=include_findings,
+                hosts_page=hosts_page,
+                hosts_page_size=hosts_page_size,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="scan not found") from None
+        _results_cache_set(cache_key, payload)
         return payload
 
     @app.get("/api/scans/{scan_id}/vulns")
