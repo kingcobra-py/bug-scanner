@@ -868,6 +868,7 @@ function applyResultsPayload(results) {
 async function reloadResults(force = false) {
   if (!state.scanId) {
     $("resultSummary").innerHTML = '<div class="text-slate-500 text-sm">Select a job first.</div>';
+    renderResultModules({});
     return;
   }
   const scanId = state.scanId;
@@ -916,14 +917,38 @@ async function reloadResults(force = false) {
   }
 }
 
+function renderResultModules(byModule) {
+  const box = $("resultModules");
+  if (!box) return;
+  const entries = Object.entries(byModule || {})
+    .filter(([, count]) => Number(count) > 0)
+    .sort((a, b) => Number(b[1]) - Number(a[1]));
+  if (!entries.length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = `
+    <div class="result-modules-label">Hits by module</div>
+    <div class="result-module-hits">
+      ${entries.map(([name, count]) => `
+        <span class="result-module-chip" title="${esc(name)}: ${formatNumber(count)} hits">
+          <span class="result-module-name">${esc(name)}</span>
+          <b>${formatNumber(count)}</b>
+        </span>`).join("")}
+    </div>`;
+}
+
 function renderResults() {
   const data = state.results || {};
   const severity = data.by_severity || {};
   $("resultSummary").innerHTML = `
-    <div class="stat-card"><span>Unique findings</span><b>${formatNumber(data.finding_count)}</b></div>
+    <div class="stat-card"><span>Hits</span><b>${formatNumber(data.finding_count)}</b></div>
     <div class="stat-card"><span>Critical</span><b class="sev-critical">${formatNumber(severity.critical)}</b></div>
     <div class="stat-card"><span>High</span><b class="sev-high">${formatNumber(severity.high)}</b></div>
     <div class="stat-card"><span>Unique secrets</span><b>${formatNumber((data.secrets || []).length)}</b></div>`;
+  renderResultModules(data.by_module || {});
   renderProviderFilters(data.providers || []);
   const filteredSecrets = (data.secrets || []).filter((s) => !state.provider || s.provider === state.provider);
   renderSecrets(filteredSecrets);
