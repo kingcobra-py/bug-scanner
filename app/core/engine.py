@@ -917,13 +917,21 @@ class ScanEngine:
         ordered = list(modules)
         random.shuffle(ordered)
 
-        def _on_finding_wrapped(finding: Finding) -> None:
+        def _on_finding_wrapped(finding: Finding, module_log=None) -> None:
             try:
                 ctx.progress.note_vulnerable_host(
                     getattr(finding, "target", "") or getattr(finding, "url", "") or target.url
                 )
             except Exception:
                 pass
+            # git/js/config already call log.hit(); CMS/react did not, so Logs
+            # looked like only those modules were alive. Mirror INFO hits here.
+            mod_name = (getattr(finding, "module", "") or "").lower()
+            if module_log and mod_name in {"wordpress", "joomla", "react", "methods"}:
+                try:
+                    module_log.hit(getattr(finding, "url", "") or target.url, float(getattr(finding, "confidence", 0) or 0))
+                except Exception:
+                    pass
             if on_finding:
                 on_finding(finding)
 
@@ -938,7 +946,7 @@ class ScanEngine:
             local_ctx.logger = mlog
             mlog.debug("module start on %s", target.url)
             try:
-                with stream_findings(_on_finding_wrapped):
+                with stream_findings(lambda f, _log=mlog: _on_finding_wrapped(f, _log)):
                     findings = mod.run(target, local_ctx) or []
                 out.extend(findings)
                 # share findings for later modules (method tester uses endpoints)
